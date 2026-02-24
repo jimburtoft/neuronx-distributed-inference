@@ -911,7 +911,11 @@ class NeuronBaseModel(nn.Module):
         tile_q_indices = self.set_none_if_empty(tile_q_indices)
         tile_block_tables = self.set_none_if_empty(tile_block_tables)
         tile_masks = self.set_none_if_empty(tile_masks)
-        inputs_embeds = self.set_none_if_empty(inputs_embeds)
+        # Do NOT call set_none_if_empty on inputs_embeds here.
+        # When tracing with inputs_embeds support, the tensor must flow through
+        # as-is (zeros during tracing, real data at runtime) so that torch.where
+        # in get_model_output can select between token embeddings and provided embeddings.
+        # inputs_embeds = self.set_none_if_empty(inputs_embeds)
         kv_cache = self.set_none_if_empty(kv_cache)
         active_mask = self.set_none_if_empty(active_mask)
         rotary_position_id = self.set_none_if_empty(rotary_position_id)
@@ -1554,12 +1558,24 @@ class NeuronBaseModel(nn.Module):
             # Check V cache's seqlen because K cache may be transposed.
             past_key_values_length = past_key_values[0][1].shape[2]
 
-        if inputs_embeds is None:
-            inputs_embeds = (
-                self.embed_tokens(input_ids)
-                if not is_lora_module(self.embed_tokens)
-                else self.embed_tokens(input_ids, adapter_ids=adapter_ids)
-            )
+        # Always compute token embeddings from input_ids.
+        # When pre-computed inputs_embeds are provided (prompt_embeds),
+        # use torch.where to select them instead of the token embeddings.
+        # This ensures both code paths exist in the traced/compiled graph.
+        token_embeds = (
+            self.embed_tokens(input_ids)
+            if not is_lora_module(self.embed_tokens)
+            else self.embed_tokens(input_ids, adapter_ids=adapter_ids)
+        )
+        if inputs_embeds is not None:
+            # inputs_embeds is provided: select between pre-computed and token embeddings.
+            # Use a flag based on whether inputs_embeds has non-zero content.
+            # During tracing, inputs_embeds is zeros → use token_embeds.
+            # At runtime with real embeddings → use inputs_embeds.
+            has_embeds = (inputs_embeds.sum() != 0).reshape(1, 1, 1)
+            inputs_embeds = torch.where(has_embeds, inputs_embeds, token_embeds)
+        else:
+            inputs_embeds = token_embeds
 
         if (vision_embeddings is not None) and (vision_mask is not None):
             if vision_embeddings.dtype != self.config.neuron_config.torch_dtype:
@@ -4283,24 +4299,52 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
                     *llava_args,
                 )
             else:
-                outputs = self.base_model(
-                    input_ids,
-                    attention_mask,
-                    position_ids,
-                    seq_ids,
-                    sampling_params,
-                    torch.empty(0),
-                    torch.empty(0),
-                    torch.empty(0),
-                    torch.empty(0),
-                    torch.empty(0),
-                    torch.empty(0),
-                    slot_mapping,
-                    block_table,
-                    num_queries,
-                    computed_context_lens,
-                    *llava_args,
-                )
+                if inputs_embeds is not None:
+                    # When inputs_embeds is provided in prefix caching mode,
+                    # pass it at position 18 in NeuronBaseModel.forward().
+                    # Positions 0-14 are filled as normal; positions 15-17
+                    # (tile_q_indices, tile_block_tables, tile_masks) get empty
+                    # tensors, then inputs_embeds at position 18.
+                    empties_for_tiles = [torch.empty(0) for _ in range(3)]
+                    outputs = self.base_model(
+                        input_ids,
+                        attention_mask,
+                        position_ids,
+                        seq_ids,
+                        sampling_params,
+                        torch.empty(0),
+                        torch.empty(0),
+                        torch.empty(0),
+                        torch.empty(0),
+                        torch.empty(0),
+                        torch.empty(0),
+                        slot_mapping,
+                        block_table,
+                        num_queries,
+                        computed_context_lens,
+                        *empties_for_tiles,
+                        inputs_embeds,
+                        *llava_args,
+                    )
+                else:
+                    outputs = self.base_model(
+                        input_ids,
+                        attention_mask,
+                        position_ids,
+                        seq_ids,
+                        sampling_params,
+                        torch.empty(0),
+                        torch.empty(0),
+                        torch.empty(0),
+                        torch.empty(0),
+                        torch.empty(0),
+                        torch.empty(0),
+                        slot_mapping,
+                        block_table,
+                        num_queries,
+                        computed_context_lens,
+                        *llava_args,
+                    )
             is_run_on_neuron = self.base_model.is_neuron()
         elif self.neuron_config.is_chunked_prefill:
             outputs, is_run_on_neuron = self._get_model_outputs_for_chunked_prefill(
@@ -4342,35 +4386,31 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
                     *tf_args,
                 )
             else:
-                if inputs_embeds is not None:
-                    # When inputs_embeds is provided, pass it at the correct
-                    # positional slot in NeuronBaseModel.forward().
-                    # Fill positions 7-17 (accepted_indices through tile_masks)
-                    # with empty tensors, then pass inputs_embeds at position 18.
-                    empties_before_embeds = [torch.empty(0) for _ in range(11)]
-                    outputs = self.context_encoding_model(
-                        input_ids,
-                        attention_mask,
-                        position_ids,
-                        seq_ids,
-                        sampling_params,
-                        prev_hidden,
-                        adapter_ids,
-                        *empties_before_embeds,
-                        inputs_embeds,
-                        *llava_args,
+                # Always pass full positional args including inputs_embeds
+                # at position 18. The traced model uses torch.where to select
+                # between token embeddings and provided embeddings.
+                empties_before_embeds = [torch.empty(0) for _ in range(11)]
+                if inputs_embeds is None:
+                    # No pre-computed embeddings: pass zeros so the traced model
+                    # uses the token embedding lookup via torch.where selection.
+                    batch_size = input_ids.shape[0]
+                    seq_len = input_ids.shape[1]
+                    inputs_embeds = torch.zeros(
+                        (batch_size, seq_len, self.config.hidden_size),
+                        dtype=self.config.neuron_config.torch_dtype,
                     )
-                else:
-                    outputs = self.context_encoding_model(
-                        input_ids,
-                        attention_mask,
-                        position_ids,
-                        seq_ids,
-                        sampling_params,
-                        prev_hidden,
-                        adapter_ids,
-                        *llava_args,
-                    )
+                outputs = self.context_encoding_model(
+                    input_ids,
+                    attention_mask,
+                    position_ids,
+                    seq_ids,
+                    sampling_params,
+                    prev_hidden,
+                    adapter_ids,
+                    *empties_before_embeds,
+                    inputs_embeds,
+                    *llava_args,
+                )
 
             self.kv_cache_populated = True
             is_run_on_neuron = self.context_encoding_model.is_neuron()
@@ -4424,6 +4464,16 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
                     *tf_args,
                 )
             else:
+                # Token generation: pass full positional args to match traced
+                # model's expected input count. inputs_embeds is zeros since
+                # token generation always uses input_ids for the next token.
+                empties_7_to_17 = [torch.empty(0) for _ in range(11)]
+                batch_size = input_ids.shape[0]
+                seq_len = input_ids.shape[1]
+                tg_inputs_embeds = torch.zeros(
+                    (batch_size, seq_len, self.config.hidden_size),
+                    dtype=self.config.neuron_config.torch_dtype,
+                )
                 outputs = self.token_generation_model(
                     input_ids,
                     attention_mask,
@@ -4432,6 +4482,8 @@ class NeuronBaseForCausalLM(NeuronApplicationBase):
                     sampling_params,
                     prev_hidden,
                     adapter_ids,
+                    *empties_7_to_17,
+                    tg_inputs_embeds,
                     *llava_args,
                 )
             is_run_on_neuron = self.token_generation_model.is_neuron()
