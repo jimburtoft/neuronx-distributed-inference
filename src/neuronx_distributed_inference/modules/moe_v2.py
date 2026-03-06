@@ -5,7 +5,10 @@ from torch import nn
 from neuronx_distributed.modules.moe.expert_mlps_v2 import ExpertMLPsV2
 from neuronx_distributed.modules.moe.model import MoE
 from neuronx_distributed.modules.moe.routing import RouterTopK
-from neuronx_distributed.modules.moe.moe_configs import RoutedExpertsMLPOpsConfig, MoEFusedTKGConfig
+from neuronx_distributed.modules.moe.moe_configs import (
+    RoutedExpertsMLPOpsConfig,
+    MoEFusedTKGConfig,
+)
 from neuronx_distributed.modules.moe.shared_experts import SharedExperts
 from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.modules.moe.moe_process_group import (
@@ -26,14 +29,18 @@ def initialize_moe_module(
     init_tkg_module: bool = False,
     apply_act_fn_over_topk: bool = False,
     router_bias: bool = False,
-    experts_bias: bool = False
+    experts_bias: bool = False,
 ):
     """
     Initializes and returns an MoE module corresponding to the given configuration.
     """
     enabled_hybrid_sharding = config.neuron_config.hybrid_sharding_config is not None
-    moe_tkg_tensor_model_parallel_group, moe_tkg_expert_model_parallel_group, moe_cte_tensor_model_parallel_group, moe_cte_expert_model_parallel_group = \
-        initialize_moe_process_group(config, enabled_hybrid_sharding)
+    (
+        moe_tkg_tensor_model_parallel_group,
+        moe_tkg_expert_model_parallel_group,
+        moe_cte_tensor_model_parallel_group,
+        moe_cte_expert_model_parallel_group,
+    ) = initialize_moe_process_group(config, enabled_hybrid_sharding)
 
     router = RouterTopK(
         num_experts=config.num_local_experts,
@@ -46,6 +53,9 @@ def initialize_moe_module(
         bias=router_bias,
         apply_act_fn_over_topk=apply_act_fn_over_topk,
         store_transposed_weights=init_tkg_module,  # register transposed weights for TKG kernel
+        expert_bias_size=getattr(
+            config, "expert_bias_size", None
+        ),  # optional post-activation selection bias
     )
 
     # applies to padded checkpoints
@@ -53,29 +63,30 @@ def initialize_moe_module(
     intermediate_size_actual = getattr(config, "original_intermediate_size", None)
 
     expert_mlps = ExpertMLPsV2(
-        routed_experts_mlp_config=RoutedExpertsMLPOpsConfig(num_experts=config.num_local_experts,
-                                                            hidden_size=config.hidden_size,
-                                                            intermediate_size=config.intermediate_size,
-                                                            hidden_size_actual=hidden_size_actual,
-                                                            intermediate_size_actual=intermediate_size_actual,
-                                                            is_hidden_dim_shuffled=config.neuron_config.is_hidden_dim_shuffled,
-                                                            is_intermediate_dim_shuffled=config.neuron_config.is_intermediate_dim_shuffled,
-                                                            top_k=config.num_experts_per_tok,
-                                                            hidden_act=config.hidden_act,
-                                                            bias=experts_bias,
-                                                            glu_mlp=config.neuron_config.glu_mlp,
-                                                            glu_type=config.neuron_config.glu_type,
-                                                            hidden_act_scaling_factor=config.neuron_config.hidden_act_scaling_factor,
-                                                            hidden_act_bias=config.neuron_config.hidden_act_bias,
-                                                            use_index_calc_kernel=config.neuron_config.use_index_calc_kernel,
-                                                            gate_clamp_upper_limit=config.neuron_config.gate_clamp_upper_limit,
-                                                            gate_clamp_lower_limit=config.neuron_config.gate_clamp_lower_limit,
-                                                            up_clamp_upper_limit=config.neuron_config.up_clamp_upper_limit,
-                                                            up_clamp_lower_limit=config.neuron_config.up_clamp_lower_limit,
-                                                            early_expert_affinity_modulation=config.neuron_config.early_expert_affinity_modulation,
-                                                            normalize_top_k_affinities=config.neuron_config.normalize_top_k_affinities,
-                                                            enable_spmd_rank=config.neuron_config.blockwise_matmul_config.parallelize_token_to_block_mapping
-                                                            ),
+        routed_experts_mlp_config=RoutedExpertsMLPOpsConfig(
+            num_experts=config.num_local_experts,
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
+            hidden_size_actual=hidden_size_actual,
+            intermediate_size_actual=intermediate_size_actual,
+            is_hidden_dim_shuffled=config.neuron_config.is_hidden_dim_shuffled,
+            is_intermediate_dim_shuffled=config.neuron_config.is_intermediate_dim_shuffled,
+            top_k=config.num_experts_per_tok,
+            hidden_act=config.hidden_act,
+            bias=experts_bias,
+            glu_mlp=config.neuron_config.glu_mlp,
+            glu_type=config.neuron_config.glu_type,
+            hidden_act_scaling_factor=config.neuron_config.hidden_act_scaling_factor,
+            hidden_act_bias=config.neuron_config.hidden_act_bias,
+            use_index_calc_kernel=config.neuron_config.use_index_calc_kernel,
+            gate_clamp_upper_limit=config.neuron_config.gate_clamp_upper_limit,
+            gate_clamp_lower_limit=config.neuron_config.gate_clamp_lower_limit,
+            up_clamp_upper_limit=config.neuron_config.up_clamp_upper_limit,
+            up_clamp_lower_limit=config.neuron_config.up_clamp_lower_limit,
+            early_expert_affinity_modulation=config.neuron_config.early_expert_affinity_modulation,
+            normalize_top_k_affinities=config.neuron_config.normalize_top_k_affinities,
+            enable_spmd_rank=config.neuron_config.blockwise_matmul_config.parallelize_token_to_block_mapping,
+        ),
         blockwise_matmul_config=config.neuron_config.blockwise_matmul_config,
         sequence_parallel_enabled=config.neuron_config.sequence_parallel_enabled,
         dtype=config.neuron_config.torch_dtype,
@@ -131,13 +142,25 @@ def initialize_moe_module(
     return moe
 
 
-def initialize_moe_process_group(config: InferenceConfig, enabled_hybrid_sharding: bool):
+def initialize_moe_process_group(
+    config: InferenceConfig, enabled_hybrid_sharding: bool
+):
     if enabled_hybrid_sharding:
-        moe_cte_tp_degree = config.neuron_config.hybrid_sharding_config.moe_cte_tp_degree
-        moe_cte_ep_degree = config.neuron_config.hybrid_sharding_config.moe_cte_ep_degree
-        moe_tkg_tp_degree = config.neuron_config.hybrid_sharding_config.moe_tkg_tp_degree
-        moe_tkg_ep_degree = config.neuron_config.hybrid_sharding_config.moe_tkg_ep_degree
-        init_tensor_expert_parallel_moe_process_groups(moe_tkg_tp_degree, moe_tkg_ep_degree, moe_cte_tp_degree, moe_cte_ep_degree)
+        moe_cte_tp_degree = (
+            config.neuron_config.hybrid_sharding_config.moe_cte_tp_degree
+        )
+        moe_cte_ep_degree = (
+            config.neuron_config.hybrid_sharding_config.moe_cte_ep_degree
+        )
+        moe_tkg_tp_degree = (
+            config.neuron_config.hybrid_sharding_config.moe_tkg_tp_degree
+        )
+        moe_tkg_ep_degree = (
+            config.neuron_config.hybrid_sharding_config.moe_tkg_ep_degree
+        )
+        init_tensor_expert_parallel_moe_process_groups(
+            moe_tkg_tp_degree, moe_tkg_ep_degree, moe_cte_tp_degree, moe_cte_ep_degree
+        )
         moe_tkg_tensor_model_parallel_group = get_moe_tp_ep_group(prefill=False)
         moe_tkg_expert_model_parallel_group = get_moe_ep_group(prefill=False)
         moe_cte_tensor_model_parallel_group = get_moe_tp_ep_group(prefill=True)
@@ -146,15 +169,30 @@ def initialize_moe_process_group(config: InferenceConfig, enabled_hybrid_shardin
         if config.neuron_config.moe_ep_degree > 1:
             moe_ep_degree = config.neuron_config.moe_ep_degree
             moe_tp_degree = config.neuron_config.moe_tp_degree
-            init_tensor_expert_parallel_moe_process_groups(moe_tp_degree, moe_ep_degree, moe_tp_degree, moe_ep_degree)
+            init_tensor_expert_parallel_moe_process_groups(
+                moe_tp_degree, moe_ep_degree, moe_tp_degree, moe_ep_degree
+            )
             moe_tkg_tensor_model_parallel_group = get_moe_tp_ep_group(prefill=False)
             moe_tkg_expert_model_parallel_group = get_moe_ep_group(prefill=False)
             moe_cte_tensor_model_parallel_group = get_moe_tp_ep_group(prefill=True)
             moe_cte_expert_model_parallel_group = get_moe_ep_group(prefill=True)
         else:
-            moe_tkg_tensor_model_parallel_group = parallel_state.get_tensor_model_parallel_group()
-            moe_tkg_expert_model_parallel_group = parallel_state.get_expert_model_parallel_group()
-            moe_cte_tensor_model_parallel_group = parallel_state.get_tensor_model_parallel_group()
-            moe_cte_expert_model_parallel_group = parallel_state.get_expert_model_parallel_group()
+            moe_tkg_tensor_model_parallel_group = (
+                parallel_state.get_tensor_model_parallel_group()
+            )
+            moe_tkg_expert_model_parallel_group = (
+                parallel_state.get_expert_model_parallel_group()
+            )
+            moe_cte_tensor_model_parallel_group = (
+                parallel_state.get_tensor_model_parallel_group()
+            )
+            moe_cte_expert_model_parallel_group = (
+                parallel_state.get_expert_model_parallel_group()
+            )
 
-    return moe_tkg_tensor_model_parallel_group, moe_tkg_expert_model_parallel_group, moe_cte_tensor_model_parallel_group, moe_cte_expert_model_parallel_group
+    return (
+        moe_tkg_tensor_model_parallel_group,
+        moe_tkg_expert_model_parallel_group,
+        moe_cte_tensor_model_parallel_group,
+        moe_cte_expert_model_parallel_group,
+    )
