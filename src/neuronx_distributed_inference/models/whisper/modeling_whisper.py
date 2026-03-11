@@ -20,6 +20,18 @@ from neuronx_distributed_inference.models.whisper.utils.state_dict import (
     expand_state_dict,
 )
 
+from neuronx_distributed_inference.experimental.functional.attention.causal_attention_functions import (
+    scaled_dot_product_attention_kernel,
+)
+
+# NKI fused Conv1D+GELU kernel (optional — falls back to PyTorch if nkilib not available)
+try:
+    from nkilib.experimental.conv.conv1d import conv1d as nki_conv1d
+    from nkilib.core.utils.common_types import ActFnType
+    _HAS_NKI_CONV1D = True
+except ImportError:
+    _HAS_NKI_CONV1D = False
+
 from transformers import WhisperModel
 from transformers.models.whisper.modeling_whisper import sinusoids
 from whisper import Whisper
@@ -76,23 +88,11 @@ class NeuronAttention(nn.Module):
         self.n_heads = ceil_div(n_head, tp_degree)
         self.n_kv_heads = self.n_heads  # Whisper doesn't use GQA
 
-        self.query = ColumnParallelLinear(
+        # Fused QKV projection: single matmul instead of 3 separate ones.
+        # Bias is included for all 3 (K portion is zeroed in state dict conversion).
+        self.qkv_proj = ColumnParallelLinear(
             n_state,
-            self.n_heads * tp_degree * self.head_dim,
-            bias=True,
-            gather_output=False,
-            dtype=dtype,
-        )
-        self.key = ColumnParallelLinear(
-            n_state,
-            self.n_kv_heads * tp_degree * self.head_dim,
-            bias=False,  # No bias for key projection
-            gather_output=False,
-            dtype=dtype,
-        )
-        self.value = ColumnParallelLinear(
-            n_state,
-            self.n_kv_heads * tp_degree * self.head_dim,
+            3 * self.n_heads * tp_degree * self.head_dim,
             bias=True,
             gather_output=False,
             dtype=dtype,
@@ -128,10 +128,13 @@ class NeuronAttention(nn.Module):
     ):
         bsz, seq_len, hidden_dim = x.shape
 
-        # bs, head, seqlen, head_dim
-        q = self.query(x).view(bsz, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        k = self.key(x).view(bsz, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.value(x).view(bsz, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        # Fused QKV: single matmul, then split into Q, K, V (contiguous layout)
+        qkv = self.qkv_proj(x)
+        n_state_per_tp = self.n_heads * self.head_dim
+        q, k, v = torch.tensor_split(qkv, (n_state_per_tp, 2 * n_state_per_tp), dim=2)
+        q = q.view(bsz, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k.view(bsz, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        v = v.view(bsz, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
 
         if self.cache_k is not None and self.cache_v is not None:
             if seq_len > 1:  # prefill: save all to cache
@@ -147,13 +150,23 @@ class NeuronAttention(nn.Module):
             k = updated_kcache
             v = updated_vcache
 
-        # Q.K^T/√d
-        scores = torch.matmul(q, k.transpose(2, 3)) / math.sqrt(self.head_dim)
-        if mask is not None:
-            scores = torch.where(mask, scores, torch.finfo(scores.dtype).min)
-        scores = F.softmax(scores.float(), dim=-1).type_as(q)
-        output = torch.matmul(scores, v)
-        output = output.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
+        if self.cache_k is None:
+            # Encoder path: use NKI flash attention kernel (avoids materializing
+            # the full 1500x1500 score matrix across all 32 encoder layers).
+            # Q, K, V are already in (B, H, S, d) layout from lines above.
+            output = scaled_dot_product_attention_kernel(
+                q, k, v, is_causal=False, scale=1.0 / math.sqrt(self.head_dim)
+            )
+            # Output is (B, H, S, d) -- transpose to (B, S, H*d)
+            output = output.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
+        else:
+            # Decoder path: standard matmul attention (KV cache changes seq dims)
+            scores = torch.matmul(q, k.transpose(2, 3)) / math.sqrt(self.head_dim)
+            if mask is not None:
+                scores = torch.where(mask, scores, torch.finfo(scores.dtype).min)
+            scores = F.softmax(scores.float(), dim=-1).type_as(q)
+            output = torch.matmul(scores, v)
+            output = output.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
 
         if self.cache_k is not None and self.cache_v is not None:
             return self.out(output), updated_kcache, updated_vcache
@@ -219,15 +232,16 @@ class NeuronCrossAttention(nn.Module):
         is_prefill: bool = True,
     ):
         bsz, seq_len, hidden_dim = x.shape
-        kv_seq_len = xa.shape[1]
 
-        # bs, head, seqlen, head_dim
+        # Q projection (always needed for both prefill and decode)
         q = self.query(x).view(bsz, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        k = self.key(xa).view(bsz, kv_seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.value(xa).view(bsz, kv_seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
 
-        # Save KV Cache
         if is_prefill:
+            # Prefill: compute K/V from encoder output and populate cache
+            kv_seq_len = xa.shape[1]
+            k = self.key(xa).view(bsz, kv_seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
+            v = self.value(xa).view(bsz, kv_seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
+
             indices = torch.arange(start=0, end=kv_seq_len, dtype=torch.int64, device=q.device)
             indices = indices.view(1, 1, kv_seq_len, 1)
             indices = indices.expand(bsz, self.n_kv_heads, kv_seq_len, self.head_dim)
@@ -235,6 +249,7 @@ class NeuronCrossAttention(nn.Module):
             updated_kcache = torch.scatter(self.cache_k, 2, indices, k)
             updated_vcache = torch.scatter(self.cache_v, 2, indices, v)
         else:
+            # Decode: use cached K/V directly (no K/V projection needed, xa is unused)
             updated_kcache = self.cache_k
             updated_vcache = self.cache_v
 
@@ -328,8 +343,27 @@ class NeuronAudioEncoder(nn.Module):
         x : torch.Tensor, shape = (batch_size, n_mels, n_ctx)
             the mel spectrogram of the audio
         """
-        x = F.gelu(self.conv1(x))
-        x = F.gelu(self.conv2(x))
+        if _HAS_NKI_CONV1D:
+            # NKI fused Conv1D+GELU: single kernel call per layer instead of
+            # separate Conv1D + GELU ops. Weights transposed from PyTorch
+            # (C_out, C_in, K) to NKI (K, C_in, C_out) layout.
+            x = nki_conv1d(
+                x,
+                self.conv1.weight.permute(2, 1, 0),
+                self.conv1.bias,
+                stride=1, padding=(1, 1),
+                activation_fn=ActFnType.GELU,
+            )
+            x = nki_conv1d(
+                x,
+                self.conv2.weight.permute(2, 1, 0),
+                self.conv2.bias,
+                stride=2, padding=(1, 1),
+                activation_fn=ActFnType.GELU,
+            )
+        else:
+            x = F.gelu(self.conv1(x))
+            x = F.gelu(self.conv2(x))
         x = x.permute(0, 2, 1)
 
         assert x.shape[1:] == self.positional_embedding.shape, "incorrect audio shape"
@@ -546,10 +580,13 @@ class ModelWrapperWhisperDecoderDecode(ModelWrapper):
         self.bucket_config = None  # Set to None if no bucketing needed
 
     def input_generator(self) -> List[Tuple[torch.Tensor]]:
-        # Generate example inputs for tracing
+        # Generate example inputs for tracing.
+        # Use minimal dummy xa (1 token instead of n_audio_ctx) since decode reads
+        # cross-attention K/V from cache, not from xa. The xa tensor must be present
+        # for forward signature compatibility but is unused in the decode graph.
         audio_embed = torch.randn(
             self.neuron_config.batch_size,
-            self.config.dims.n_audio_ctx,
+            1,
             self.config.dims.n_audio_state,
             dtype=self.neuron_config.torch_dtype,
         )
@@ -700,9 +737,17 @@ class NeuronApplicationWhisper(Whisper):
     def logits(self, tokens: torch.Tensor, audio_features: torch.Tensor):
         tokens = tokens.to(torch.int32)
         padded_tokens, last_pos, pad_mask = self._prepare_decoder_inputs(tokens)
-        return self.decoder(
-            padded_tokens, audio_features.to(self.config.neuron_config.torch_dtype), last_pos, pad_mask
-        )[:, : last_pos + 1]
+        is_prefill = padded_tokens.shape[1] > 1
+        if is_prefill:
+            xa = audio_features.to(self.config.neuron_config.torch_dtype)
+        else:
+            # Decode: pass minimal dummy xa since cross-attention K/V caches
+            # were populated during prefill. xa is unused in the decode graph.
+            xa = torch.zeros(
+                audio_features.shape[0], 1, audio_features.shape[2],
+                dtype=self.config.neuron_config.torch_dtype,
+            )
+        return self.decoder(padded_tokens, xa, last_pos, pad_mask)[:, : last_pos + 1]
 
     def _prepare_decoder_inputs(self, tokens: torch.Tensor):
         pad_token = -1
