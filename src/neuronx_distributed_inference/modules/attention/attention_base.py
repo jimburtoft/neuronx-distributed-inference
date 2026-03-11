@@ -56,6 +56,12 @@ except ImportError:
     from neuronxcc.nki.kernels.attention import attention_isa_kernel  # noqa: E402
 from neuronxcc.nki._private_kernels.prefix_caching_attention import prefix_caching_attention_fwd_isa_kernel
 
+try:
+    from nkilib.core.attention.attention_cte import attention_cte as _attention_cte_kernel
+    _has_attention_cte_kernel = True
+except ImportError:
+    _has_attention_cte_kernel = False
+
 import neuronx_distributed as nxd
 import torch_xla.core.xla_model as xm
 from neuronx_distributed.parallel_layers import utils  # noqa: E402
@@ -122,6 +128,7 @@ def import_nki_cte_attention_kernel():
 _flash_fwd_call_nki, _has_new_kernel, _has_new_pc_kernel, _has_native_gqa_tp_support = import_nki_cte_attention_kernel()
 _flash_fwd_call_bir = nki_jit()(attention_isa_kernel)
 _flash_fwd_call_strided_context_parallel = nki_jit()(attention_isa_kernel)
+_flash_fwd_call_strided_cp_cte = nki_jit()(_attention_cte_kernel) if _has_attention_cte_kernel else None
 _flash_fwd_pc_call_nki = _flash_fwd_call_nki
 _flash_fwd_pc_call_bir = nki_jit()(prefix_caching_attention_fwd_isa_kernel)
 
@@ -696,19 +703,37 @@ class NeuronAttentionBase(nn.Module):
                     **cp_fa_kernel_kwargs,
                 )
         elif strategy == FlashAttentionStrategy.STRIDED_CONTEXT_PARALLEL_KERNEL:
-            _flash_fwd_call_strided_context_parallel[grid](
-                Q,
-                K_active,
-                V_active,
-                1.0,
-                attn_output,
-                kernel_name="CausalAttentionMMSoftmaxMMWithoutSwap",
-                use_dma_transpose=True,
-                global_n_tiles=self.cp_degree,
-                tile_i=cp_rank,
-                strided_q_slicing=True,
-                **cp_fa_kernel_kwargs,
-            )
+            if self.head_dim > 128 and _flash_fwd_call_strided_cp_cte is not None:
+                # Use open-source attention_cte kernel for head_dim > 128
+                # (attention_isa_kernel overflows SBUF for head_dim > 128 with CP)
+                attn_output = _flash_fwd_call_strided_cp_cte[grid](
+                    Q,
+                    K_active,
+                    V_active,
+                    1.0,
+                    causal_mask=True,
+                    tp_q=True,
+                    tp_k=False,
+                    tp_out=True,
+                    global_cp_deg=self.cp_degree,
+                    cp_offset=cp_rank.reshape((1, 1)),
+                    cp_strided_q_slicing=True,
+                    **cp_fa_kernel_kwargs,
+                )
+            else:
+                _flash_fwd_call_strided_context_parallel[grid](
+                    Q,
+                    K_active,
+                    V_active,
+                    1.0,
+                    attn_output,
+                    kernel_name="CausalAttentionMMSoftmaxMMWithoutSwap",
+                    use_dma_transpose=True,
+                    global_n_tiles=self.cp_degree,
+                    tile_i=cp_rank,
+                    strided_q_slicing=True,
+                    **cp_fa_kernel_kwargs,
+                )
 
         else:
             raise ValueError(f"{strategy} is not supported with context parallel")
