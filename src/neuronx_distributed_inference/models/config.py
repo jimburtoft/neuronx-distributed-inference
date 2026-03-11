@@ -754,10 +754,18 @@ class InferenceConfig:
 
     def add_derived_config(self):
         """
-        Override this in custom model InferenceConfig for flash decoding. See LlamaInferenceConfig
+        Computes num_cores_per_group for flash decoding.
+        Subclasses can override to add additional derived config.
         """
         self.num_cores_per_group = 1
-        pass
+        if getattr(self.neuron_config, 'flash_decoding_enabled', False):
+            num_attn_heads = getattr(self, 'num_attention_heads', None)
+            num_kv_heads = getattr(self, 'num_key_value_heads', None)
+            if num_attn_heads is not None and num_kv_heads is not None:
+                from neuronx_distributed_inference.modules.flashdecode.utils import calculate_num_cores_per_group
+                self.num_cores_per_group = calculate_num_cores_per_group(
+                    num_attn_heads, num_kv_heads, self.neuron_config.tp_degree
+                )
 
     def load_config(self):
         """

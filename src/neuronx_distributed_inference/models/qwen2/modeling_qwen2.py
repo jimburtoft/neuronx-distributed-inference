@@ -57,7 +57,7 @@ class Qwen2NeuronConfig(NeuronConfig):
 class Qwen2InferenceConfig(InferenceConfig):
 
     def add_derived_config(self):
-        self.num_cores_per_group = 1
+        super().add_derived_config()
         self.qkv_bias = True
         self.o_bias = False
 

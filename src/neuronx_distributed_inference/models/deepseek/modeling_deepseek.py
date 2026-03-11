@@ -44,8 +44,6 @@ logger = logging.getLogger(__name__)
 
 
 class DeepseekV3InferenceConfig(InferenceConfig):
-    def add_derived_config(self):
-        self.num_cores_per_group = 1
 
     @classmethod
     def get_neuron_config_cls(cls) -> Type[NeuronConfig]:

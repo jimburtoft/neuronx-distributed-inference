@@ -593,6 +593,11 @@ class NeuronApplicationBase(torch.nn.Module):
             skip_collective_init=True,
         )
 
+        if getattr(self.config, 'num_cores_per_group', 1) > 1:
+            parallel_state.initialize_kv_group(
+                self.config.num_cores_per_group, sequential_ranks_in_group=True
+            )
+
         # get model based on config
         def get_neuron_model(model_cls, config):
             neuron_model = model_cls(config)

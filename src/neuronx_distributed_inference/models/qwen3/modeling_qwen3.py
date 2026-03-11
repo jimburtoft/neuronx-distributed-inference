@@ -56,9 +56,6 @@ class Qwen3NeuronConfig(NeuronConfig):
 
 class Qwen3InferenceConfig(InferenceConfig):
 
-    def add_derived_config(self):
-        self.num_cores_per_group = 1
-
     def get_required_attributes(self) -> List[str]:
         return [
             "hidden_size",
