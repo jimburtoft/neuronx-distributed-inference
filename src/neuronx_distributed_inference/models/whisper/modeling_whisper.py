@@ -627,6 +627,7 @@ class NeuronApplicationWhisperEncoder(NeuronApplicationBase):
         compiler_args += " --tensorizer-options='--enable-ccop-compute-overlap --cc-pipeline-tiling-factor=2'"
         if self.config.neuron_config.torch_dtype == torch.float32:
             compiler_args += " --auto-cast=none"
+        compiler_args += f" --lnc={self.config.neuron_config.logical_nc_config}"
         return compiler_args
 
     @staticmethod
@@ -682,6 +683,7 @@ class NeuronApplicationWhisperDecoder(NeuronApplicationBase):
         compiler_args += " --tensorizer-options='--enable-ccop-compute-overlap --cc-pipeline-tiling-factor=2'"
         if self.config.neuron_config.torch_dtype == torch.float32:
             compiler_args += " --auto-cast=none"
+        compiler_args += f" --lnc={self.config.neuron_config.logical_nc_config}"
         return compiler_args
 
     @staticmethod
