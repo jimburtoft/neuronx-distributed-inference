@@ -27,7 +27,9 @@ from neuronx_distributed_inference.models.qwen3_vl.modeling_qwen3_vl_vision impo
     NeuronQwen3VLVisionModel,
     NeuronQwen3VLVisionModelWrapper,
 )
-from neuronx_distributed_inference.modules.flashdecode.utils import calculate_num_cores_per_group
+from neuronx_distributed_inference.modules.flashdecode.utils import (
+    calculate_num_cores_per_group,
+)
 
 logger = logging.getLogger("Neuron")
 
@@ -90,7 +92,9 @@ class Qwen3VLInferenceConfig(ImageToTextInferenceConfig):
             raise ValueError("Qwen3VL does not yet support context parallel")
         if self.text_config.neuron_config.seq_len > 10240:
             # Need to increase CC buffer size for All-Reduce for long seq len
-            os.environ["NEURON_RT_DBG_INTRA_RDH_CHANNEL_BUFFER_SIZE"] = f"{140 * 1024 * 1024}"
+            os.environ["NEURON_RT_DBG_INTRA_RDH_CHANNEL_BUFFER_SIZE"] = (
+                f"{140 * 1024 * 1024}"
+            )
 
         if self.neuron_config.flash_decoding_enabled:
             # For Qwen3VL, we use REPLICATE_TO_TP_DEGREE as the sharding_strategy
@@ -115,13 +119,21 @@ class Qwen3VLInferenceConfig(ImageToTextInferenceConfig):
                 VISION_SEQ_LENGTH, VISION_SEQ_LENGTH
             )
 
-        logger.info(f"Bucketing Qwen3 VL vision model on sequence length. Buckets are {self.vision_config.neuron_config.buckets}")
+        logger.info(
+            f"Bucketing Qwen3 VL vision model on sequence length. Buckets are {self.vision_config.neuron_config.buckets}"
+        )
 
         # Ensure text max context length >= vision max seq length
         # Qwen3VLVisionPatchMerger compress the vision seq len before passing vision embeddings to text model
-        vision_seq_len_to_text_model = self.vision_config.neuron_config.seq_len // (self.vision_config.spatial_merge_size**2)
-        assert self.text_config.neuron_config.max_context_length >= vision_seq_len_to_text_model, \
+        vision_seq_len_to_text_model = self.vision_config.neuron_config.seq_len // (
+            self.vision_config.spatial_merge_size**2
+        )
+        assert (
+            self.text_config.neuron_config.max_context_length
+            >= vision_seq_len_to_text_model
+        ), (
             f"Text model max context length {self.text_config.neuron_config.max_context_length} must be no less than compressed vision model sequence length {vision_seq_len_to_text_model}"
+        )
 
     def validate_vision_model_supported_configs(self):
         Qwen3VL_VISION_MODEL_UNSUPPORTED_NEURON_CONFIG = [
@@ -134,7 +146,10 @@ class Qwen3VLInferenceConfig(ImageToTextInferenceConfig):
         ]
         for unsupported_config in Qwen3VL_VISION_MODEL_UNSUPPORTED_NEURON_CONFIG:
             # attn_kernel_enabled defaults to None, and None means enabled
-            if getattr(self.vision_config.neuron_config, unsupported_config, False) is not False:
+            if (
+                getattr(self.vision_config.neuron_config, unsupported_config, False)
+                is not False
+            ):
                 setattr(self.vision_config.neuron_config, unsupported_config, False)
                 logger.warning(
                     f"Qwen3VL vision model does not yet support '{unsupported_config}'. Will be disabled."
@@ -187,7 +202,6 @@ class Qwen3VLInferenceConfig(ImageToTextInferenceConfig):
 
 
 class NeuronQwen3VLForCausalLM(NeuronBaseForImageToText):
-
     text_model_cls = NeuronQwen3VLTextModel
     vision_model_cls = NeuronQwen3VLVisionModel
 
@@ -206,14 +220,18 @@ class NeuronQwen3VLForCausalLM(NeuronBaseForImageToText):
         self.rope_deltas = None
 
     def get_vision_compiler_args(self) -> str:
-        cc_pipeline_tiling_factor = self.vision_config.neuron_config.cc_pipeline_tiling_factor
+        cc_pipeline_tiling_factor = (
+            self.vision_config.neuron_config.cc_pipeline_tiling_factor
+        )
         return f"--auto-cast=none --model-type=transformer \
                 --tensorizer-options='--enable-ccop-compute-overlap \
                 --cc-pipeline-tiling-factor={cc_pipeline_tiling_factor}' -O1 \
                 --internal-max-instruction-limit=15000000"
 
     def get_compiler_args(self) -> str:
-        cc_pipeline_tiling_factor = self.text_config.neuron_config.cc_pipeline_tiling_factor
+        cc_pipeline_tiling_factor = (
+            self.text_config.neuron_config.cc_pipeline_tiling_factor
+        )
         return f"--auto-cast=none --model-type=transformer \
                 --tensorizer-options='--enable-ccop-compute-overlap \
                 --cc-pipeline-tiling-factor={cc_pipeline_tiling_factor}' -O1 \
@@ -223,7 +241,9 @@ class NeuronQwen3VLForCausalLM(NeuronBaseForImageToText):
         """The list of additional input arguments to be prepared in HuggingFaceGenerationAdapter.prepare_inputs_for_generation()"""
         return ["pixel_values", "image_grid_thw"]
 
-    def enable_vision_encoder(self, enable_wlt_optimization: bool = True, **model_init_kwargs):
+    def enable_vision_encoder(
+        self, enable_wlt_optimization: bool = True, **model_init_kwargs
+    ):
         new_config = copy.deepcopy(self.config)
         self.vision_encoder_model = self.vision_model_wrapper(
             config=new_config,
@@ -250,7 +270,6 @@ class NeuronQwen3VLForCausalLM(NeuronBaseForImageToText):
     def convert_hf_to_neuron_state_dict(
         state_dict: dict, inference_config: InferenceConfig
     ) -> dict:
-
         state_dict = NeuronQwen3VLForImageEncoding.convert_hf_to_neuron_state_dict(
             state_dict, inference_config
         )
@@ -283,7 +302,9 @@ class NeuronQwen3VLForCausalLM(NeuronBaseForImageToText):
 
         # Since we use timestamps to seperate videos, like <t1> <vision_start> <frame1> <vision_end> <t2> <vision_start> <frame2> <vision_end>, the video_grid_thw should also be split
         if video_grid_thw is not None:
-            video_grid_thw = torch.repeat_interleave(video_grid_thw, video_grid_thw[:, 0], dim=0)
+            video_grid_thw = torch.repeat_interleave(
+                video_grid_thw, video_grid_thw[:, 0], dim=0
+            )
             video_grid_thw[:, 0] = 1
 
         spatial_merge_size = self.config.vision_config.spatial_merge_size
@@ -291,7 +312,9 @@ class NeuronQwen3VLForCausalLM(NeuronBaseForImageToText):
         video_token_id = self.config.video_token_id
         vision_start_token_id = self.config.vision_start_token_id
         mrope_position_deltas = []
-        if input_ids is not None and (image_grid_thw is not None or video_grid_thw is not None):
+        if input_ids is not None and (
+            image_grid_thw is not None or video_grid_thw is not None
+        ):
             total_input_ids = input_ids
             if attention_mask is None:
                 attention_mask = torch.ones_like(total_input_ids)
@@ -307,7 +330,9 @@ class NeuronQwen3VLForCausalLM(NeuronBaseForImageToText):
             for i, input_ids in enumerate(total_input_ids):
                 input_ids = input_ids[attention_mask[i] == 1]
                 image_nums, video_nums = 0, 0
-                vision_start_indices = torch.argwhere(input_ids == vision_start_token_id).squeeze(1)
+                vision_start_indices = torch.argwhere(
+                    input_ids == vision_start_token_id
+                ).squeeze(1)
                 vision_tokens = input_ids[vision_start_indices + 1]
                 image_nums = (vision_tokens == image_token_id).sum()
                 video_nums = (vision_tokens == video_token_id).sum()
@@ -350,7 +375,11 @@ class NeuronQwen3VLForCausalLM(NeuronBaseForImageToText):
                     )
                     text_len = ed - st
 
-                    st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
+                    st_idx = (
+                        llm_pos_ids_list[-1].max() + 1
+                        if len(llm_pos_ids_list) > 0
+                        else 0
+                    )
                     llm_pos_ids_list.append(
                         torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx
                     )
@@ -380,7 +409,11 @@ class NeuronQwen3VLForCausalLM(NeuronBaseForImageToText):
                     st = ed + llm_grid_t * llm_grid_h * llm_grid_w
 
                 if st < len(input_tokens):
-                    st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
+                    st_idx = (
+                        llm_pos_ids_list[-1].max() + 1
+                        if len(llm_pos_ids_list) > 0
+                        else 0
+                    )
                     text_len = len(input_tokens) - st
                     llm_pos_ids_list.append(
                         torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx
@@ -388,8 +421,12 @@ class NeuronQwen3VLForCausalLM(NeuronBaseForImageToText):
 
                 llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
                 llm_positions = llm_positions.to(total_input_ids.dtype)
-                position_ids[..., i, attention_mask[i] == 1] = llm_positions.to(position_ids.device)
-                mrope_position_deltas.append(llm_positions.max() + 1 - len(total_input_ids[i]))
+                position_ids[..., i, attention_mask[i] == 1] = llm_positions.to(
+                    position_ids.device
+                )
+                mrope_position_deltas.append(
+                    llm_positions.max() + 1 - len(total_input_ids[i])
+                )
             mrope_position_deltas = torch.tensor(
                 mrope_position_deltas, device=input_ids.device
             ).unsqueeze(1)
@@ -398,8 +435,14 @@ class NeuronQwen3VLForCausalLM(NeuronBaseForImageToText):
             if attention_mask is not None:
                 position_ids = attention_mask.long().cumsum(-1) - 1
                 position_ids.masked_fill_(attention_mask == 0, 1)
-                position_ids = position_ids.unsqueeze(0).expand(3, -1, -1).to(attention_mask.device)
-                max_position_ids = position_ids.max(0, keepdim=False)[0].max(-1, keepdim=True)[0]
+                position_ids = (
+                    position_ids.unsqueeze(0)
+                    .expand(3, -1, -1)
+                    .to(attention_mask.device)
+                )
+                max_position_ids = position_ids.max(0, keepdim=False)[0].max(
+                    -1, keepdim=True
+                )[0]
                 mrope_position_deltas = max_position_ids + 1 - attention_mask.shape[-1]
             else:
                 position_ids = (
@@ -434,7 +477,6 @@ class NeuronQwen3VLForCausalLM(NeuronBaseForImageToText):
         tensor_capture_hook: Optional[Callable] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
-
         pad_limit = self.get_padding_length(input_ids)
 
         if (
@@ -449,9 +491,12 @@ class NeuronQwen3VLForCausalLM(NeuronBaseForImageToText):
             vision_mask = pad_positions(vision_mask, pad_limit, (pad_limit - 1))
 
             vision_embeddings, deepstack_vision_embeds = self.vision_encoder_model(
-                pixel_values.to(self.vision_config.neuron_config.torch_dtype), image_grid_thw
+                pixel_values.to(self.vision_config.neuron_config.torch_dtype),
+                image_grid_thw,
             )
-            vision_embeddings = vision_embeddings.to(self.text_config.neuron_config.torch_dtype)
+            vision_embeddings = vision_embeddings.to(
+                self.text_config.neuron_config.torch_dtype
+            )
 
             # flatten vision embeddings and add batch dim size 1
             embedding_dim = vision_embeddings.shape[-1]
@@ -461,7 +506,11 @@ class NeuronQwen3VLForCausalLM(NeuronBaseForImageToText):
 
             # flatten deepstack feature and add batch dim size 1
             for i, feat in enumerate(deepstack_vision_embeds):
-                feat = feat.view(-1, embedding_dim).unsqueeze(0).to(self.text_config.neuron_config.torch_dtype)
+                feat = (
+                    feat.view(-1, embedding_dim)
+                    .unsqueeze(0)
+                    .to(self.text_config.neuron_config.torch_dtype)
+                )
                 deepstack_vision_embeds[i] = pad_vision_embeddings(feat, pad_limit)
             # stack the list into a tensor because all traced inputs are expected to be of the same type (torch.Tensor)
             deepstack_vision_embeds = torch.stack(deepstack_vision_embeds)
@@ -527,8 +576,9 @@ class NeuronQwen3VLForCausalLM(NeuronBaseForImageToText):
             else:
                 delta = 0
 
-            rotary_position_ids = copy.deepcopy(position_ids)
-            rotary_position_ids = rotary_position_ids.view(1, -1).expand(batch_size, -1)
+            # Fix: Don't flatten batch*seq with view(1, -1); that creates S=B*S
+            # when batch_size > 1. Instead, keep [B, S] shape intact.
+            rotary_position_ids = position_ids.clone()  # [B, S] where S=1 for TKG
             rotary_position_ids = rotary_position_ids.add(delta)
 
             rotary_position_ids = rotary_position_ids.unsqueeze(0).expand(3, -1, -1)

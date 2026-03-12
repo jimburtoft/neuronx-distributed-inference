@@ -7,13 +7,37 @@ from neuronx_distributed_inference.models.model_wrapper import (
     ModelWrapper,
 )
 from neuronx_distributed_inference.modules.async_execution import is_ranked_io
-from neuronx_distributed_inference.modules.generation.sampling import prepare_sampling_params
+from neuronx_distributed_inference.modules.generation.sampling import (
+    prepare_sampling_params,
+)
 
 
-IMAGE_TO_TEXT_MODEL_WRAPPER_INPUT_KEYS = ("input_ids", "attention_mask", "position_ids", "seq_ids", "sampling_params", "prev_hidden",
-                                          "adapter_ids", "accepted_indices", "current_length", "medusa_mask", "scatter_index", "slot_mapping",
-                                          "active_block_table", "num_queries", "computed_context_lens", "tile_q_indices", "tile_block_tables",
-                                          "tile_masks", "inputs_embeds", "kv_cache", "active_mask", "rotary_position_ids", "vision_embeddings", "vision_mask")
+IMAGE_TO_TEXT_MODEL_WRAPPER_INPUT_KEYS = (
+    "input_ids",
+    "attention_mask",
+    "position_ids",
+    "seq_ids",
+    "sampling_params",
+    "prev_hidden",
+    "adapter_ids",
+    "accepted_indices",
+    "current_length",
+    "medusa_mask",
+    "scatter_index",
+    "slot_mapping",
+    "active_block_table",
+    "num_queries",
+    "computed_context_lens",
+    "tile_q_indices",
+    "tile_block_tables",
+    "tile_masks",
+    "inputs_embeds",
+    "kv_cache",
+    "active_mask",
+    "rotary_position_ids",
+    "vision_embeddings",
+    "vision_mask",
+)
 
 
 class ImageToTextModelWrapper(ModelWrapper):
@@ -92,7 +116,9 @@ class ImageToTextModelWrapper(ModelWrapper):
             return tensor[0].unsqueeze(0).repeat(padded_shape[0], 1).to(tensor.dtype)
 
         def fill_value_tensor(value):
-            return lambda tensor, padded_shape: torch.full(padded_shape, fill_value=value, dtype=tensor.dtype)
+            return lambda tensor, padded_shape: torch.full(
+                padded_shape, fill_value=value, dtype=tensor.dtype
+            )
 
         PAD_TYPES = {
             "repeat_first_batchline": repeat_first_batchline,
@@ -102,7 +128,9 @@ class ImageToTextModelWrapper(ModelWrapper):
         }
 
         if pad_type not in PAD_TYPES:
-            raise ValueError(f"Unknown pad_type '{pad_type}'. Available: {list(PAD_TYPES.keys())}")
+            raise ValueError(
+                f"Unknown pad_type '{pad_type}'. Available: {list(PAD_TYPES.keys())}"
+            )
 
         padded_tensor = PAD_TYPES[pad_type](tensor, padded_shape)
         padded_tensor[: tensor.shape[0]] = tensor
@@ -159,7 +187,11 @@ class ImageToTextModelWrapper(ModelWrapper):
         seq_ids_list = seq_ids.tolist()
         padded_seq_ids = torch.tensor(
             seq_ids_list
-            + [x for x in range(self.neuron_config.max_batch_size) if x not in seq_ids_list],
+            + [
+                x
+                for x in range(self.neuron_config.max_batch_size)
+                if x not in seq_ids_list
+            ],
             dtype=seq_ids.dtype,
         )
         padded_seq_ids, indices = torch.sort(padded_seq_ids)
@@ -200,9 +232,31 @@ class ImageToTextModelWrapper(ModelWrapper):
             batch_sort_indices=indices if not self.is_prefix_caching else None,
         )
         padded_args.append(padded_sampling_params)
-        # add args prev_hidden --> vision_mask without padding
-        for i, arg in enumerate(args[5:24]):
-            padded_args.append(arg)
+        # add remaining args (prev_hidden onwards) without padding,
+        # except rotary_position_ids which needs special batch-dimension handling.
+        # Note: args[5:] is used instead of args[5:24] to support models like
+        # Qwen3-VL that extend input_generator() beyond 24 arguments (e.g.,
+        # deepstack_vision_embeds at index 24).
+        target_batch_size = self.neuron_config.batch_size
+        for i, arg in enumerate(args[5:]):
+            actual_idx = i + 5
+            if actual_idx == 21 and arg.dim() == 3:
+                # rotary_position_ids has shape [3, B, S] for M-RoPE models (e.g., Qwen3-VL).
+                # The parent forward() slices all args along dim 0 assuming it's the batch dim,
+                # which corrupts this tensor by truncating [3, B, S] to [1, B, S].
+                # Reconstruct dim 0 and pad dim 1 (the actual batch dimension).
+                rotary = arg
+                if rotary.shape[0] < 3:
+                    missing = 3 - rotary.shape[0]
+                    fill = rotary[-1:].expand(missing, -1, -1)
+                    rotary = torch.cat([rotary, fill], dim=0)
+                if rotary.shape[1] < target_batch_size:
+                    pad_size = target_batch_size - rotary.shape[1]
+                    padding = rotary[:, 0:1, :].expand(-1, pad_size, -1)
+                    rotary = torch.cat([rotary, padding], dim=1)
+                padded_args.append(rotary.contiguous())
+            else:
+                padded_args.append(arg)
 
         outputs = self._forward(*padded_args)
 
@@ -228,12 +282,9 @@ class ImageToTextModelWrapper(ModelWrapper):
             )
             # we trace not actual vision mask, but positions, for best performance.
             vision_mask = torch.full(
-                size=(
-                    input_batch_size,
-                    n_active_tokens,
-                    1),
+                size=(input_batch_size, n_active_tokens, 1),
                 fill_value=fill_value,
-                dtype=torch.int32
+                dtype=torch.int32,
             )
         else:
             vision_embeddings = torch.zeros((0), dtype=config.neuron_config.torch_dtype)
@@ -254,7 +305,9 @@ class ImageToTextModelWrapper(ModelWrapper):
             input_ids = torch.zeros(
                 (self.neuron_config.batch_size, n_active_tokens), dtype=torch.int32
             )
-            attention_mask = torch.zeros((self.neuron_config.batch_size, bucket), dtype=torch.int32)
+            attention_mask = torch.zeros(
+                (self.neuron_config.batch_size, bucket), dtype=torch.int32
+            )
             position_ids = torch.zeros(
                 (self.neuron_config.batch_size, n_active_tokens), dtype=torch.int32
             )
@@ -263,17 +316,21 @@ class ImageToTextModelWrapper(ModelWrapper):
             # Get the count of sampling params currently supported.
             sampling_params_len = prepare_sampling_params(1).shape[1]
             sampling_params = torch.zeros(
-                (self.neuron_config.batch_size, sampling_params_len), dtype=torch.float32
+                (self.neuron_config.batch_size, sampling_params_len),
+                dtype=torch.float32,
             )
             # During model tracing, we fill vision embeddings and vision_mask with zeros
             vision_embeddings, vision_mask = self.get_dummy_vision_inputs(
                 config=self.config,
                 input_ids=input_ids,
                 n_active_tokens=n_active_tokens,
-                fill_value=0
+                fill_value=0,
             )
 
-            if self.tag == CONTEXT_ENCODING_MODEL_TAG or self.tag == TOKEN_GENERATION_MODEL_TAG:
+            if (
+                self.tag == CONTEXT_ENCODING_MODEL_TAG
+                or self.tag == TOKEN_GENERATION_MODEL_TAG
+            ):
                 inputs.append(
                     (
                         input_ids,
@@ -294,7 +351,9 @@ class ImageToTextModelWrapper(ModelWrapper):
                         torch.empty(0),  # tile_q_indices=None,
                         torch.empty(0),  # tile_block_tables=None,
                         torch.empty(0),  # tile_masks=None,
-                        torch.empty(0),  # inputs_embeds: Optional[torch.FloatTensor] = None,
+                        torch.empty(
+                            0
+                        ),  # inputs_embeds: Optional[torch.FloatTensor] = None,
                         torch.empty(0),  # kv_cache: Optional[torch.Tensor] = None,
                         torch.empty(0),  # active_mask=None,
                         torch.empty(0),  # rotary_position_ids=None,
@@ -303,6 +362,8 @@ class ImageToTextModelWrapper(ModelWrapper):
                     )
                 )
             else:
-                raise ValueError(f"Unsupported model tag '{self.tag}' for ImageToText models")
+                raise ValueError(
+                    f"Unsupported model tag '{self.tag}' for ImageToText models"
+                )
 
         return inputs
