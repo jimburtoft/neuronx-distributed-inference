@@ -9,7 +9,9 @@ from torch import Tensor
 from whisper.decoding import DecodingOptions, DecodingResult, DecodingTask, Inference
 
 if TYPE_CHECKING:
-    from neuronx_distributed_inference.models.whisper.modeling_whisper import NeuronApplicationWhisper as Whisper
+    from neuronx_distributed_inference.models.whisper.modeling_whisper import (
+        NeuronApplicationWhisper as Whisper,
+    )
 
 
 class NeuronInference(Inference):
@@ -19,6 +21,7 @@ class NeuronInference(Inference):
 
     def logits(self, tokens: Tensor, audio_features: Tensor) -> Tensor:
         tokens = tokens.to(torch.int32)
+        model_dtype = self.model.config.neuron_config.torch_dtype
         padded_tokens, last_pos, pad_mask = self.model._prepare_decoder_inputs(tokens)
 
         if tokens.shape[-1] > self.initial_token_length:
@@ -26,14 +29,24 @@ class NeuronInference(Inference):
             # cross-attention K/V caches were populated during prefill
             tokens = tokens[:, -1:]
             dummy_audio = torch.zeros(
-                audio_features.shape[0], 1, audio_features.shape[2],
-                dtype=audio_features.dtype,
+                audio_features.shape[0],
+                1,
+                audio_features.shape[2],
+                dtype=model_dtype,
             )
             return self.model.decoder(tokens, dummy_audio, last_pos, pad_mask)
         else:
-            # Prefill: pass full audio features
+            # Prefill: return logits for all real (non-padded) token positions.
+            # The upstream _main_loop indexes logits[:, sot_index] and logits[:, -1],
+            # so we must return the full unpadded sequence (not just last_pos).
+            xa = audio_features.to(model_dtype)
             tokens = padded_tokens
-        return self.model.decoder(tokens, audio_features, last_pos, pad_mask)[:, : last_pos + 1]
+            logits = self.model.decoder(tokens, xa, last_pos, pad_mask)
+            # Slice to real token length (last_pos is 0-indexed, so +1 for length).
+            # For batched decoding, all samples share the same initial_token_length,
+            # so last_pos is uniform — use the first sample's value.
+            seq_len = last_pos[0].item() + 1
+            return logits[:, :seq_len, :]
 
 
 class NeuronDecodingTask(DecodingTask):
@@ -44,7 +57,10 @@ class NeuronDecodingTask(DecodingTask):
 
 @torch.no_grad()
 def decode(
-    model: "Whisper", mel: Tensor, options: DecodingOptions = DecodingOptions(), **kwargs
+    model: "Whisper",
+    mel: Tensor,
+    options: DecodingOptions = DecodingOptions(),
+    **kwargs,
 ) -> Union[DecodingResult, List[DecodingResult]]:
     """
     Performs decoding of 30-second audio segment(s), provided as Mel spectrogram(s).
@@ -72,7 +88,13 @@ def decode(
         options = replace(options, **kwargs)
 
     dtype = model.config.neuron_config.torch_dtype
-    assert dtype in [torch.float16, torch.float32], f"Unsupported dtype: {dtype}"
+    assert dtype in [torch.float16, torch.bfloat16, torch.float32], (
+        f"Unsupported dtype: {dtype}"
+    )
+    # For fp16, set fp16=True so upstream whisper casts audio_features to float16.
+    # For bfloat16, set fp16=False — we cast to bfloat16 ourselves in NeuronInference.logits().
+    # (Upstream whisper only knows float16/float32; setting fp16=True with bfloat16
+    #  would cast to float16, causing a dtype mismatch with the traced model.)
     options = replace(options, fp16=(dtype == torch.float16))
 
     result = NeuronDecodingTask(model, options).run(mel)
