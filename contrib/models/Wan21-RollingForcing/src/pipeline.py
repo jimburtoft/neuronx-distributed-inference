@@ -1308,9 +1308,19 @@ class NxDIUnifiedRollingPipeline:
     def _call_update_via_cached(self, hidden_states, timestep, enc, uc, kv_cache):
         """Call update mode through the cached NEFF with f3 padded to f15.
 
-        The update model's Q (4680 tokens) attends to the cached KV only.
-        The cached NEFF writes current K/V into the buffer, but the mask
-        prevents real Q tokens from attending to the garbage positions.
+        GPU reference behavior (causal_model.py lines 248-262):
+          1. The update call computes K/V from the clean input
+          2. Writes them into kv_cache at [local_start_index:local_end_index],
+             OVERWRITING the main call's noisy K/V at that position
+          3. Extracts attention context: kv_cache[extract_start:extract_end]
+             where extract_end = local_end_index (INCLUDES the just-written clean K/V)
+          4. Q attends to: prior_blocks_KV + update_own_clean_KV
+
+        Neuron adaptation:
+          - Pre-assemble prior blocks' KV (excluding current block) at buffer [0:prior_len]
+          - The model writes its own K/V at [prefix_len:prefix_len+f15_seq_len]
+          - Unmask BOTH the prior KV AND the model's self-written positions
+          - This way Q sees: prior_blocks_KV + update_clean_KV (matching GPU)
 
         Args:
             hidden_states: [B, C, F, H, W] input latents (F=3)
@@ -1334,11 +1344,17 @@ class NxDIUnifiedRollingPipeline:
             (self.f15_post_f, uc.current_start_frame_for_rope)
         ]
 
-        # Compute valid_len from schedule
+        # Compute prior_len: KV from prior blocks EXCLUDING the current block.
+        # GPU reference includes the current block's KV (overwritten with clean KV),
+        # but we get the clean KV from the model's self-written positions instead.
         if uc.extract_cache_start is not None and uc.extract_cache_end is not None:
-            valid_len = uc.extract_cache_end - uc.extract_cache_start
+            full_valid_len = uc.extract_cache_end - uc.extract_cache_start
+            prior_len = full_valid_len - BLOCK_LENGTH
+            if prior_len < 0:
+                prior_len = 0
         else:
-            valid_len = BLOCK_LENGTH
+            prior_len = 0
+            full_valid_len = 0
 
         # Check if anchor needs re-roping
         if uc.attention_path == "C" and uc.rope_start_frame_anchor is not None:
@@ -1349,7 +1365,7 @@ class NxDIUnifiedRollingPipeline:
         else:
             anchor_cos = anchor_sin = None
 
-        # Assemble per-layer KV buffers (same as cached layout)
+        # Assemble per-layer KV buffers with ONLY prior blocks' KV
         kv_tensors = []
         for layer_idx in range(NUM_TRANSFORMER_LAYERS):
             kv_k, kv_v, _ = kv_cache.assemble_kv_buffer_update(layer_idx, uc)
@@ -1361,26 +1377,32 @@ class NxDIUnifiedRollingPipeline:
                     anchor_raw_k, anchor_cos, anchor_sin
                 )
 
-            # Reshape to cached layout: put valid KV at start, zeros elsewhere
-            # The cached NEFF will write its K/V at positions
-            # [MAX_ATTENTION_SIZE - f15_seq_len, MAX_ATTENTION_SIZE)
-            # For update, we don't want the model's own K/V in attention.
-            # Solution: put the update's cached KV at the start of the buffer,
-            # mask out everything else (including model-written positions).
+            # Zero out the current block's main-call KV (at positions prior_len to
+            # full_valid_len) to ensure Q only sees prior blocks' KV + its own clean KV
+            if prior_len < full_valid_len:
+                kv_k[:, prior_len:full_valid_len] = 0.0
+                kv_v[:, prior_len:full_valid_len] = 0.0
+
             kv_tensors.append(kv_k)
             kv_tensors.append(kv_v)
 
         # Build attention mask
-        # Real Q rows (0 to 4679) attend ONLY to cached KV (first valid_len positions)
-        # The model will write K/V at [MAX_ATTENTION_SIZE - f15_seq_len, ...)
-        # but we mask those positions for real Q rows.
-        # Padding Q rows (4680 to 23399) are fully masked.
+        # The cached NEFF writes its own K/V at [prefix_len : prefix_len + f15_seq_len].
+        # We unmask:
+        #   1. Prior blocks' KV at [0 : prior_len]
+        #   2. Model's own clean KV at [prefix_len : prefix_len + real_seq_len]
+        # This matches GPU reference: Q sees prior_blocks_KV + update_clean_KV
+        prefix_len = MAX_ATTENTION_SIZE - self.f15_seq_len
         attn_mask = torch.full(
             (1, 1, self.f15_seq_len, MAX_ATTENTION_SIZE),
             torch.finfo(self.dtype).min,
             dtype=self.dtype,
         )
-        attn_mask[:, :, :real_seq_len, :valid_len] = 0.0
+        # Unmask prior blocks' cached KV
+        if prior_len > 0:
+            attn_mask[:, :, :real_seq_len, :prior_len] = 0.0
+        # Unmask model's own K/V (update's clean KV for current block)
+        attn_mask[:, :, :real_seq_len, prefix_len : prefix_len + real_seq_len] = 0.0
 
         with torch.no_grad():
             outputs = self.app.forward_cached(
@@ -1606,11 +1628,16 @@ class NxDIUnifiedRollingPipeline:
             # --- Convert flow prediction to x0 ---
             # Reference: x0 = xt - sigma_t * flow_pred (per-frame sigma)
             # Flatten to per-frame for sigma lookup: [B*F, C, H, W]
-            # CRITICAL: Use float32 for x0 prediction to avoid bf16 compound error.
-            # The model output (flow_pred) is bf16 but we convert to float32 here.
+            # CRITICAL: Use the SAME xt values the model saw (bf16→float32).
+            # The GPU reference uses one tensor for both model input and x0 formula.
+            # Using the original float32 noisy_input here would introduce a mismatch:
+            # the model computed flow_pred based on bf16 xt, but x0 would subtract
+            # sigma * flow_pred from a different (float32) xt value.
             B_f = B * current_num_frames
             flow_flat = flow_pred.float().permute(0, 2, 1, 3, 4).reshape(B_f, C, H, W)
-            xt_flat = noisy_input.float().permute(0, 2, 1, 3, 4).reshape(B_f, C, H, W)
+            xt_flat = (
+                noisy_input_bf16.float().permute(0, 2, 1, 3, 4).reshape(B_f, C, H, W)
+            )
             t_flat = current_timestep.expand(B, -1).reshape(B_f)
 
             denoised_pred_flat = self.scheduler.convert_flow_pred_to_x0(
@@ -1689,30 +1716,19 @@ class NxDIUnifiedRollingPipeline:
             # context_noise = 0 → timestep = 0 for all frames (float32 for precision)
             timestep_zero = torch.zeros(B, NUM_FRAME_PER_BLOCK, dtype=torch.float32)
 
-            # FIX: Always use self-attention for update calls.
-            # The cached NEFF's Path B attention produces numerically different K/V
-            # when the update Q attends to cached context (vs self-only). In bf16,
-            # these differences compound through 30 transformer layers and corrupt
-            # the stored K/V values, causing cascading degradation in all subsequent
-            # windows that read from this cache. Using self-attention for updates
-            # produces clean K/V that the main calls' cached attention handles correctly.
-            # See: force_self_update experiment (task-007).
-            if not force_self_main:
-                # Normal case + force_self_mode + force_self_update: self-attention for update
+            # Use cached attention for update calls when the schedule says Path C,
+            # matching GPU reference behavior. Path A windows (0-4) use self-attention.
+            # The GPU reference (causal_model.py:248-262) runs update calls with
+            # cache-augmented attention where Q attends to all prior cached K/V.
+            if uc.attention_path == "C" and not force_self_mode:
+                outputs = self._call_update_via_cached(
+                    update_input_bf16, timestep_zero, enc, uc, kv_cache
+                )
+            else:
+                # Path A: self-attention only (windows 0-4), or forced self mode
                 outputs = self._call_self_unified(
                     update_input_bf16, timestep_zero, enc, uc
                 )
-            else:
-                # force_self_main mode: main calls are self, keep update as scheduled
-                # (diagnostic only — not used in production)
-                if uc.attention_path == "A":
-                    outputs = self._call_self_unified(
-                        update_input_bf16, timestep_zero, enc, uc
-                    )
-                else:
-                    outputs = self._call_update_via_cached(
-                        update_input_bf16, timestep_zero, enc, uc, kv_cache
-                    )
 
             _ = self._process_model_output(outputs, uc, kv_cache, is_update=True)
 
