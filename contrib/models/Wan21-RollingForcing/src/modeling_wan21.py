@@ -553,8 +553,10 @@ class NeuronCausalSelfAttention(nn.Module):
                     )
                     chunks_out.append(out_chunk)
                 out = torch.cat(chunks_out, dim=2)
-            elif HAS_NKI_FLASH and q_t.device.type != "cpu":
-                # Unpadded self mode: NKI flash attention (no mask needed).
+            elif HAS_NKI_FLASH and q_t.device.type != "cpu" and False:
+                # DISABLED: NKI flash attention produces non-deterministic results
+                # on Neuron hardware, causing visible artifacts at block boundaries.
+                # Plain SDPA is deterministic and the compiler handles tiling.
                 out = nki_flash_attention(q_t, k_t, v_t)
             else:
                 out = F.scaled_dot_product_attention(q_t, k_t, v_t)
