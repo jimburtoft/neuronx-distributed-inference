@@ -24,7 +24,8 @@ NeuronX Distributed Inference implementation of Qwen3-VL-30B-A3B-Instruct, a 30B
 ## Validation Results
 
 **Validated:** 2026-03-17
-**Configuration:** TP=4, batch_size=1, seq_len=2176, max_context_length=2048, bfloat16
+**Instance:** trn2.3xlarge (ap-southeast-4), SDK 2.28, NxDI 0.8.0
+**Configuration:** TP=4, LNC=2, batch_size=1, seq_len=2176, max_context_length=2048, bfloat16
 
 ### Test Results
 
@@ -33,9 +34,11 @@ NeuronX Distributed Inference implementation of Qwen3-VL-30B-A3B-Instruct, a 30B
 | Smoke Test | PASS | Model compiles, loads, and runs |
 | Text Generation | PASS | Correct factual responses ("Paris", "2") |
 | Vision + Text | PASS | Correctly identifies colors in images |
-| Decode Throughput | PASS | 95-99 tok/s with ISA kernels |
+| Decode Throughput | PASS | 96.7 tok/s (measured via pytest) |
 
 ### Performance Metrics
+
+All benchmarks were run on trn2.3xlarge (TP=4, LNC=2, BF16, batch=1) by this project.
 
 | Metric | No ISA Kernels | ISA Kernels (QKV+Attn) |
 |--------|:--------------:|:----------------------:|
@@ -43,18 +46,6 @@ NeuronX Distributed Inference implementation of Qwen3-VL-30B-A3B-Instruct, a 30B
 | Text decode throughput | 65 tok/s | **95-99 tok/s** |
 | Text prefill (5 tok) | 150ms | 1072ms |
 | VL prefill (80 tok, 224x224) | 264ms | 1191ms |
-
-**Status:** VALIDATED
-
-### Performance Context
-
-| Model | Instance | Decode tok/s | Notes |
-|-------|----------|:------------:|-------|
-| **Qwen3-VL-30B-A3B (this)** | **trn2.3xlarge** | **95-99** | **ISA kernels, BF16, batch=1** |
-| Qwen3-VL-8B (dense) | trn2.3xlarge | 43.9 | Dense model, ISA kernels |
-| Qwen3.5-35B-A3B | trn2.3xlarge | 54.9 | Similar MoE VL architecture |
-
-The 95-99 tok/s result is 2.2x faster than dense Qwen3-VL-8B and 1.8x faster than Qwen3.5-35B-A3B, demonstrating MoE efficiency: only 3B active params execute per token.
 
 ## Source Code Structure
 
@@ -183,16 +174,39 @@ cd contrib/models/Qwen3-VL-30B-A3B-Instruct
 python3 test/integration/test_model.py
 ```
 
-## NKI Kernel Notes
+## NKI Kernel Analysis
 
-| Kernel | Status | Notes |
-|--------|--------|-------|
-| QKV ISA | Enabled | +50% decode throughput |
-| Attention ISA (CTE) | Enabled | Flash attention for context encoding |
-| MLP ISA | Disabled | N/A for MoE layers |
-| MoE Blockwise Matmul | Default | Active for CTE expert computation |
-| MoE Fused TKG | Not recommended | Requires 33% padding (768->1024), net-negative performance |
-| Sequence Parallel | Disabled | Risky with MoE routing |
+### Kernels Enabled
+
+| Kernel | Flag | Impact | Details |
+|--------|------|--------|---------|
+| **QKV ISA** | `qkv_kernel_enabled=True` | +50% decode throughput (65 -> 95-99 tok/s) | Fuses RMSNorm + QKV projection into a single NKI kernel. Compatible because head_dim=128 and fused_qkv=True are standard dimensions. QK-Norm (RMSNorm on Q/K) is applied after the kernel, outside its scope. |
+| **Attention ISA (CTE)** | `attn_kernel_enabled=True` | Accelerates context encoding | Flash attention NKI kernel for prefill. head_dim=128 is natively supported. GQA 8:1 ratio works with TP=4 sharding. CTE bucket alignment verified: 128, 512, 2048 all satisfy the kernel's alignment requirements. |
+| **MoE Blockwise Matmul** | `blockwise_matmul_config={"block_size": 32768}` | Default for CTE expert computation | Standard NxDI blockwise matmul for MoE context encoding. I_TP=192 at TP=4 satisfies the basic kernel alignment (192 % 16 = 0). Block size of 32768 exceeds seq_len * top_k for all bucket sizes. |
+
+### Kernels Disabled (with reasoning)
+
+| Kernel | Flag | Why Disabled |
+|--------|------|-------------|
+| **MLP ISA** | `mlp_kernel_enabled=False` | The MLP ISA kernel targets dense `NeuronLlamaMLP` layers. All 48 decoder layers in this model are MoE -- they use `initialize_moe_module()` which has its own compute path (blockwise matmul for CTE, standard dispatch for TKG). Setting this flag to True would be a no-op. |
+| **MoE Fused TKG** | `moe_fused_nki_kernel_enabled=False` | The fused TKG mega-kernel combines router + expert gather + gate/up/down matmuls into one kernel. It requires `I_TP % 128 == 0`, where I_TP = moe_intermediate_size / moe_tp_degree. At TP=4: I_TP = 768/4 = 192. Since 192 % 128 = 64, the kernel cannot run without padding moe_intermediate_size from 768 to 1024 (+33%). **We tested this**: padding works, compilation succeeds, but performance drops to 80-88 tok/s (vs 95-99 without) because the 33% extra FLOPs across 128 experts x 48 layers x top-8 outweighs the kernel fusion savings. |
+| **Shard-on-Intermediate Blockwise** | Not configured | The shard-on-intermediate variant of blockwise matmul requires `I_TP % 256 == 0`. At TP=4: 192 % 256 != 0. Would require the same 768->1024 padding as fused TKG, with the same 33% overhead. |
+| **Sequence Parallel** | `sequence_parallel_enabled=False` | Sequence parallelism shards activations across TP ranks along the sequence dimension. This interacts poorly with MoE routing: the top-K expert selection and token-to-expert dispatch assume full sequence visibility. Enabling it risks incorrect routing decisions or silent accuracy degradation. |
+| **Vision Encoder Kernels** | All `False` for vision config | The 27-layer ViT vision encoder has head_dim=72 (1152/16 heads), which is not supported by the attention ISA kernel (requires head_dim=128). QKV and MLP kernels are also disabled for vision -- this matches all other VL models in NxDI (Qwen2.5-VL, Qwen3-VL-8B, etc.). Vision compilation uses `-O1` with `--auto-cast=none`. |
+
+### Kernels Not Applicable (architecture mismatch)
+
+These kernels exist in other NxDI contrib models but do not apply to Qwen3-VL-30B-A3B-Instruct:
+
+| Kernel | Used By | Why Not Applicable |
+|--------|---------|-------------------|
+| **DeltaNet NKI** (`nki_deltanet`) | Qwen3.5-35B-A3B | DeltaNet is a linear recurrent attention mechanism that replaces standard QKV softmax attention with a gated delta-rule state update. Qwen3.5 uses DeltaNet for 30 of 40 layers. Qwen3-VL-30B-A3B uses standard GQA attention for all 48 layers -- completely different attention mechanism. Cannot be applied without changing the model architecture and weights. |
+| **Flash Attention d256** (`nki_flash_attn_d256`) | Qwen3.5-35B-A3B | Custom NKI kernel that tiles QK matmul into 128-dim chunks to support head_dim=256 (exceeds the standard kernel's 128 limit). Qwen3-VL-30B-A3B has head_dim=128, which the standard attention ISA kernel handles natively. This kernel solves a problem that does not exist for our model. |
+| **Sigmoid-Gated Shared Expert** | Qwen3.5-35B-A3B | Qwen3.5 has a shared expert with sigmoid gating (`sigmoid(gate(x)) * expert(x)`). Qwen3-VL-30B-A3B has `n_shared_experts=0` -- no shared experts at all. |
+
+### Future Kernel Opportunities
+
+The primary optimization opportunity is a **custom MoE blockwise matmul kernel that handles I_TP=192 natively** without padding. The current fused TKG kernel requires 128-element SBUF partition alignment, forcing a 33% size increase. A kernel that supports non-128-aligned intermediate sizes (or uses a smaller partition granularity) could recover the fusion benefit. This would require authoring a new NKI kernel -- it is the only remaining kernel opportunity with meaningful performance potential for this model.
 
 ## Memory Requirements
 
@@ -210,6 +224,6 @@ python3 test/integration/test_model.py
 
 ## Maintainer
 
-Neuroboros Team - Annapurna Labs
+Jim Burtoft (jimburtoft)
 
-**Last Updated:** 2026-03-17
+**Last Updated:** 2026-03-18
