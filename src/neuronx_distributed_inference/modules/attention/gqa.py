@@ -5,14 +5,19 @@ import os
 
 import torch
 from neuronx_distributed.parallel_layers import parallel_state
-from neuronx_distributed.parallel_layers.layers import ColumnParallelLinear, RowParallelLinear
+from neuronx_distributed.parallel_layers.layers import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+)
 from neuronx_distributed.parallel_layers.mappings import (
     gather_from_sequence_parallel_region,
     reduce_from_tensor_model_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
 )
 from neuronx_distributed.parallel_layers.pad import get_number_of_extra_heads
-from neuronx_distributed.quantization.quantization_layers import BaseQuantizeParallelLinear
+from neuronx_distributed.quantization.quantization_layers import (
+    BaseQuantizeParallelLinear,
+)
 from neuronxcc.nki.compiler.backends.neuron.dimensions import CCPipeline  # noqa: N813
 from neuronxcc.nki.language import nc
 from torch import nn
@@ -21,9 +26,16 @@ from torch.nn import functional as F
 from torch_neuronx.xla_impl.ops import nki_jit  # noqa: E402
 from torch_neuronx.utils import get_platform_target
 
-from neuronx_distributed_inference.modules.attention.utils import transpose_parallel_linear_layer
-from neuronx_distributed_inference.modules.lora_serving.lora_module import is_lora_module
-from neuronxcc.nki._private_kernels.qkv import rmsnorm_qkv_isa_kernel, rmsnorm_qkv_isa_fused_add_kernel
+from neuronx_distributed_inference.modules.attention.utils import (
+    transpose_parallel_linear_layer,
+)
+from neuronx_distributed_inference.modules.lora_serving.lora_module import (
+    is_lora_module,
+)
+from neuronxcc.nki._private_kernels.qkv import (
+    rmsnorm_qkv_isa_kernel,
+    rmsnorm_qkv_isa_fused_add_kernel,
+)
 
 logger = logging.getLogger("Neuron")
 
@@ -45,9 +57,12 @@ _traced_qkv_kernel_fused_add_bir = nki_jit()(rmsnorm_qkv_isa_fused_add_kernel)
 
 try:
     if os.environ.get("NKI_FRONTEND_FRAMEWORK") == "beta2":
-        from neuronxcc.nki._pre_prod_nkl.output_projection.output_projection_cte import output_projection_cte
+        from neuronxcc.nki._pre_prod_nkl.output_projection.output_projection_cte import (
+            output_projection_cte,
+        )
     else:
         from neuronxcc.nki._pre_prod_kernels.output_proj import output_proj_kernel
+
         _traced_o_proj_kernel = nki_jit()(output_proj_kernel)
 except ImportError:
     logger.warning(
@@ -85,25 +100,54 @@ class GQA(enum.Enum):
     # | Q1 Q2 | Q3 Q4 | Q5 Q6 | Q7 Pad1 | Q8 Q9 | ... | Q5 Q6 | | Q7 Pad8 |
     REPLICATE_TO_TP_DEGREE = "replicate-to-tp-degree"
 
+    # Shard KV heads directly across TP ranks without replication.
+    # Used when num_key_value_heads >= tp_degree and kv_heads % tp_degree == 0.
+    # Each rank gets kv_heads / tp_degree KV heads (may be > 1).
+    # Example:
+    # tp_degree = 4, num_key_value_heads = 8, num_attention_heads = 32
+    # Each rank gets: 8 Q heads, 2 KV heads (no replication, no padding)
+    SHARD_OVER_HEADS = "shard-over-heads"
+
 
 def determine_sharding_strategy(
-    tp_degree: int, source_key_value_heads: int, desired_sharding_strategy: Optional[GQA] = None
+    tp_degree: int,
+    source_key_value_heads: int,
+    desired_sharding_strategy: Optional[GQA] = None,
 ) -> GQA:
     sharding_strategy = (
-        desired_sharding_strategy if desired_sharding_strategy else GQA.REPLICATE_TO_TP_DEGREE
+        desired_sharding_strategy
+        if desired_sharding_strategy
+        else GQA.REPLICATE_TO_TP_DEGREE
     )
 
     if sharding_strategy == GQA.REPLICATE_TO_TP_DEGREE and (
         tp_degree % source_key_value_heads != 0
     ):
-        logger.warning(f"TP degree ({tp_degree}) and KV heads ({source_key_value_heads}) are not divisible. Overriding attention sharding strategy to GQA.CONVERT_TO_MHA!")
-        sharding_strategy = GQA.CONVERT_TO_MHA
+        # Check if we can shard KV heads directly (kv_heads >= tp and divisible)
+        if (
+            source_key_value_heads >= tp_degree
+            and source_key_value_heads % tp_degree == 0
+        ):
+            logger.info(
+                f"TP degree ({tp_degree}) does not divide KV heads ({source_key_value_heads}), "
+                f"but KV heads divide evenly across TP. Using SHARD_OVER_HEADS strategy "
+                f"({source_key_value_heads // tp_degree} KV heads per rank)."
+            )
+            sharding_strategy = GQA.SHARD_OVER_HEADS
+        else:
+            logger.warning(
+                f"TP degree ({tp_degree}) and KV heads ({source_key_value_heads}) are not divisible. Overriding attention sharding strategy to GQA.CONVERT_TO_MHA!"
+            )
+            sharding_strategy = GQA.CONVERT_TO_MHA
 
     return sharding_strategy
 
 
 def get_shardable_head_counts(
-    tp_degree: int, num_attention_heads: int, num_key_value_heads: int, sharding_strategy: GQA
+    tp_degree: int,
+    num_attention_heads: int,
+    num_key_value_heads: int,
+    sharding_strategy: GQA,
 ) -> Tuple[int, int]:
     # Pad attention heads
     updated_num_attention_heads = num_attention_heads + get_number_of_extra_heads(
@@ -117,12 +161,13 @@ def get_shardable_head_counts(
     else:  # GQA / MQA
         if (num_key_value_heads < tp_degree) or (num_key_value_heads % tp_degree != 0):
             if sharding_strategy == GQA.REPLICATE_TO_TP_DEGREE:
-                assert (
-                    tp_degree % num_key_value_heads == 0
-                ), "GQA.REPLICATE_TO_TP_DEGREE requires tp_degree to be divisible by num_key_value_heads"
+                assert tp_degree % num_key_value_heads == 0, (
+                    "GQA.REPLICATE_TO_TP_DEGREE requires tp_degree to be divisible by num_key_value_heads"
+                )
                 updated_num_key_value_heads = tp_degree
             elif sharding_strategy == GQA.CONVERT_TO_MHA:
                 updated_num_key_value_heads = updated_num_attention_heads
+        # SHARD_OVER_HEADS: no change needed, kv_heads already divides evenly across TP
 
     return updated_num_attention_heads, updated_num_key_value_heads
 
@@ -169,7 +214,9 @@ def maybe_pad_interleaved(
     source_group_size: int,
     tensor_scale: torch.Tensor = None,
 ):
-    tensor = _maybe_pad_interleaved(tensor, pad_dim, source_heads, target_heads, source_group_size)
+    tensor = _maybe_pad_interleaved(
+        tensor, pad_dim, source_heads, target_heads, source_group_size
+    )
     if should_pad_scale(tensor_scale=tensor_scale, pad_dim=pad_dim):
         tensor_scale = _maybe_pad_interleaved(
             tensor_scale, pad_dim, source_heads, target_heads, source_group_size
@@ -202,7 +249,9 @@ def _maybe_pad_interleaved(
     splits = torch.split(tensor, source_group_size, dim=pad_dim)
 
     pad_size = list(splits[0].size())
-    pad_size[pad_dim] = (target_heads - source_heads) // (source_heads // source_group_size)
+    pad_size[pad_dim] = (target_heads - source_heads) // (
+        source_heads // source_group_size
+    )
     pads = [torch.zeros(pad_size, dtype=tensor.dtype)] * len(splits)
 
     interleaved = [t for pair in zip(splits, pads) for t in pair]
@@ -220,10 +269,14 @@ def _maybe_pad_interleaved(
     return tensor.view(shape)
 
 
-def maybe_pad_tail(tensor, source_heads: int, target_heads: int, pad_dim: int, tensor_scale=None):
+def maybe_pad_tail(
+    tensor, source_heads: int, target_heads: int, pad_dim: int, tensor_scale=None
+):
     tensor = _maybe_pad_tail(tensor, source_heads, target_heads, pad_dim)
     if should_pad_scale(tensor_scale=tensor_scale, pad_dim=pad_dim):
-        tensor_scale = _maybe_pad_tail(tensor_scale, source_heads, target_heads, pad_dim)
+        tensor_scale = _maybe_pad_tail(
+            tensor_scale, source_heads, target_heads, pad_dim
+        )
     return tensor, tensor_scale
 
 
@@ -241,13 +294,18 @@ def _maybe_pad_tail(tensor, source_heads: int, target_heads: int, pad_dim: int):
     return F.pad(tensor, pad)
 
 
-def replicate_kv(tensor, source_heads: int, repeats: int, head_dim=0, tensor_scale=None):
+def replicate_kv(
+    tensor, source_heads: int, repeats: int, head_dim=0, tensor_scale=None
+):
     tensor = _replicate_kv(
         tensor=tensor, source_heads=source_heads, repeats=repeats, head_dim=head_dim
     )
     if should_pad_scale(tensor_scale=tensor_scale, pad_dim=head_dim):
         tensor_scale = _replicate_kv(
-            tensor=tensor_scale, source_heads=source_heads, repeats=repeats, head_dim=head_dim
+            tensor=tensor_scale,
+            source_heads=source_heads,
+            repeats=repeats,
+            head_dim=head_dim,
         )
     return tensor, tensor_scale
 
@@ -288,7 +346,9 @@ class BaseGroupQueryAttention(nn.Module):
         if tensor_model_parallel_group is not None:
             self.tensor_model_parallel_group = tensor_model_parallel_group
         elif parallel_state.model_parallel_is_initialized():
-            self.tensor_model_parallel_group = parallel_state.get_tensor_model_parallel_group()
+            self.tensor_model_parallel_group = (
+                parallel_state.get_tensor_model_parallel_group()
+            )
         else:
             self.tensor_model_parallel_group = None
 
@@ -297,9 +357,9 @@ class BaseGroupQueryAttention(nn.Module):
                 # update default value
                 tp_degree = tensor_model_parallel_group.size()
             else:
-                assert (
-                    tp_degree == self.tensor_model_parallel_group.size()
-                ), f"TP Degree {tp_degree} and tensor model parallel group size {self.tensor_model_parallel_group.size()} does not match"
+                assert tp_degree == self.tensor_model_parallel_group.size(), (
+                    f"TP Degree {tp_degree} and tensor model parallel group size {self.tensor_model_parallel_group.size()} does not match"
+                )
 
         self.hidden_size = hidden_size
         self.tp_degree = tp_degree
@@ -331,7 +391,11 @@ class BaseGroupQueryAttention(nn.Module):
         return self.num_key_value_heads
 
     def get_bias(
-        self, prefix: str, layer: torch.nn.Module, layer_name: str, model_state_dict: dict
+        self,
+        prefix: str,
+        layer: torch.nn.Module,
+        layer_name: str,
+        model_state_dict: dict,
     ) -> Tuple[torch.Tensor]:
         if hasattr(layer, "get_bias_from_state_dict"):
             bias = layer.get_bias_from_state_dict(
@@ -351,7 +415,9 @@ class BaseGroupQueryAttention(nn.Module):
     ) -> Tuple[torch.Tensor]:
         if hasattr(layer, "set_bias_to_state_dict"):
             layer.set_bias_to_state_dict(
-                prefix=f"{prefix}.{layer_name}.", tensor=tensor, state_dict=model_state_dict
+                prefix=f"{prefix}.{layer_name}.",
+                tensor=tensor,
+                state_dict=model_state_dict,
             )
         else:
             model_state_dict[f"{prefix}.{layer_name}.bias"] = tensor.clone()
@@ -369,7 +435,9 @@ class BaseGroupQueryAttention(nn.Module):
                 old_keys.append(key)
 
         for key_index in range(len(old_keys)):
-            model_state_dict[new_keys[key_index]] = model_state_dict[old_keys[key_index]]
+            model_state_dict[new_keys[key_index]] = model_state_dict[
+                old_keys[key_index]
+            ]
 
 
 class GroupQueryAttention_QKV(BaseGroupQueryAttention):
@@ -426,7 +494,9 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
         self.qkv_kernel_enabled = qkv_kernel_enabled
         self.qkv_nki_kernel_enabled = qkv_nki_kernel_enabled
         if self.qkv_nki_kernel_enabled:
-            assert is_nki_qkv_kernel_available is True, "Use a more recent neuron compiler version to enable NKI qkv kernel."
+            assert is_nki_qkv_kernel_available is True, (
+                "Use a more recent neuron compiler version to enable NKI qkv kernel."
+            )
         self.fused_rmsnorm = not self.sequence_parallel_enabled
         self.fused_rmsnorm_skip_gamma = fused_rmsnorm_skip_gamma and self.fused_rmsnorm
         self.tiling_factor = tiling_factor
@@ -439,7 +509,8 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
             if self.fused_qkv:
                 self.Wqkv = ColumnParallelLinear(
                     self.hidden_size,
-                    (self.num_attention_heads + 2 * self.num_key_value_heads) * self.head_dim,
+                    (self.num_attention_heads + 2 * self.num_key_value_heads)
+                    * self.head_dim,
                     bias=self.bias,
                     gather_output=self.gather_output,
                     dtype=dtype,
@@ -454,13 +525,21 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
 
                 # Set heads info as weight parameter attributes to be used in weights sharding
                 setattr(self.Wqkv.weight, "fused_qkv", True)
-                setattr(self.Wqkv.weight, "num_attention_heads", self.num_attention_heads)
-                setattr(self.Wqkv.weight, "num_key_value_heads", self.num_key_value_heads)
+                setattr(
+                    self.Wqkv.weight, "num_attention_heads", self.num_attention_heads
+                )
+                setattr(
+                    self.Wqkv.weight, "num_key_value_heads", self.num_key_value_heads
+                )
                 setattr(self.Wqkv.weight, "head_dim", self.head_dim)
                 if self.bias:
                     setattr(self.Wqkv.bias, "fused_qkv", True)
-                    setattr(self.Wqkv.bias, "num_attention_heads", self.num_attention_heads)
-                    setattr(self.Wqkv.bias, "num_key_value_heads", self.num_key_value_heads)
+                    setattr(
+                        self.Wqkv.bias, "num_attention_heads", self.num_attention_heads
+                    )
+                    setattr(
+                        self.Wqkv.bias, "num_key_value_heads", self.num_key_value_heads
+                    )
                     setattr(self.Wqkv.bias, "head_dim", self.head_dim)
 
             else:
@@ -498,23 +577,40 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
             if self.fused_qkv:
                 self.Wqkv = nn.Linear(
                     self.hidden_size,
-                    (self.num_attention_heads + 2 * self.num_key_value_heads) * self.head_dim,
+                    (self.num_attention_heads + 2 * self.num_key_value_heads)
+                    * self.head_dim,
                     bias=self.bias,
                 )
             else:
                 self.q_proj = nn.Linear(
-                    self.hidden_size, self.num_attention_heads * self.head_dim, bias=self.bias
+                    self.hidden_size,
+                    self.num_attention_heads * self.head_dim,
+                    bias=self.bias,
                 )
                 self.k_proj = nn.Linear(
-                    self.hidden_size, self.num_key_value_heads * self.head_dim, bias=self.bias
+                    self.hidden_size,
+                    self.num_key_value_heads * self.head_dim,
+                    bias=self.bias,
                 )
                 self.v_proj = nn.Linear(
-                    self.hidden_size, self.num_key_value_heads * self.head_dim, bias=self.bias
+                    self.hidden_size,
+                    self.num_key_value_heads * self.head_dim,
+                    bias=self.bias,
                 )
 
-    def forward(self, hidden_states: torch.Tensor, rmsnorm=None, adapter_ids=None, residual=None,
-                cos_cache=None, sin_cache=None):
-        if self.sequence_parallel_enabled and self.tensor_model_parallel_group is not None:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        rmsnorm=None,
+        adapter_ids=None,
+        residual=None,
+        cos_cache=None,
+        sin_cache=None,
+    ):
+        if (
+            self.sequence_parallel_enabled
+            and self.tensor_model_parallel_group is not None
+        ):
             hidden_states = gather_from_sequence_parallel_region(
                 hidden_states,
                 self.sequence_dimension,
@@ -524,7 +620,9 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
 
         if self.qkv_kernel_enabled or self.qkv_nki_kernel_enabled:
             assert self.fused_qkv, "QKV kernel only supported when fused_qkv is TRUE"
-            return self._kernel_qkv_forward(hidden_states, rmsnorm, residual, cos_cache, sin_cache)
+            return self._kernel_qkv_forward(
+                hidden_states, rmsnorm, residual, cos_cache, sin_cache
+            )
         else:
             Q, K, V = self._native_qkv_forward(hidden_states, adapter_ids)
         return Q, K, V, residual
@@ -576,7 +674,9 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
         # torch.split has accuracy issue and leads to more reshapes in hlo.
         # Using torch.tensor_split here. NAPP-3145
         q_end_index = self.num_attention_heads * self.head_dim // self.tp_degree
-        k_end_index = q_end_index + self.num_key_value_heads * self.head_dim // self.tp_degree
+        k_end_index = (
+            q_end_index + self.num_key_value_heads * self.head_dim // self.tp_degree
+        )
         Q, K, V = torch.tensor_split(
             QKV,
             (
@@ -592,7 +692,9 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
         logger.debug(f"V shape after tensor_split: {V.shape}")
         return Q, K, V
 
-    def _kernel_qkv_forward(self, hidden_states, rmsnorm, residual, cos_cache, sin_cache):
+    def _kernel_qkv_forward(
+        self, hidden_states, rmsnorm, residual, cos_cache, sin_cache
+    ):
         logger.debug(
             f"QKV kernel: fused_rmsnorm={self.fused_rmsnorm}, skip_gamma={self.fused_rmsnorm_skip_gamma} logical_nc_config={self.logical_nc_config}"
         )
@@ -603,7 +705,9 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
         # underneath there are two separate kernel implementations: TKG & CTE
         # We only want to pad the sequence length for the CTE, which has batch * original seqlen > 64
         if bs * seqlen > 64 and seqlen % 2 != 0:
-            logger.debug("For the CTE QKV kernel pad the sequence length to the next even number")
+            logger.debug(
+                "For the CTE QKV kernel pad the sequence length to the next even number"
+            )
             hidden_states = F.pad(
                 hidden_states,
                 pad=(
@@ -636,7 +740,9 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
             norm_weights = rmsnorm.weight.unsqueeze(0)
             assert norm_weights.shape == (1, h)
 
-        if seqlen <= self.seq_len_threshold_for_cc_tiling:  # Keep regular grid for TKG. Messes up the impl
+        if (
+            seqlen <= self.seq_len_threshold_for_cc_tiling
+        ):  # Keep regular grid for TKG. Messes up the impl
             grid = (nc(self.logical_nc_config),)
         else:  # Add CC pipelining dim for CTE kernel grid
             grid = (CCPipeline(self.tiling_factor) * nc(self.logical_nc_config),)
@@ -669,12 +775,14 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
 
                 kernel_kwargs = {}
                 if fuse_rope:
-                    kernel_kwargs.update({
-                        "cos_cache": cos_cache,
-                        "sin_cache": sin_cache,
-                        "num_q_heads": self.num_attention_heads // self.tp_degree,
-                        "num_kv_heads": self.num_key_value_heads // self.tp_degree,
-                    })
+                    kernel_kwargs.update(
+                        {
+                            "cos_cache": cos_cache,
+                            "sin_cache": sin_cache,
+                            "num_q_heads": self.num_attention_heads // self.tp_degree,
+                            "num_kv_heads": self.num_key_value_heads // self.tp_degree,
+                        }
+                    )
 
                 QKV = _traced_qkv_kernel_nki[grid](
                     hidden=hidden_states,
@@ -694,12 +802,14 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
             else:
                 kernel_kwargs = {}
                 if fuse_rope:
-                    kernel_kwargs.update({
-                        "cos_cache": cos_cache,
-                        "sin_cache": sin_cache,
-                        "num_q_heads": self.num_attention_heads // self.tp_degree,
-                        "num_kv_heads": self.num_key_value_heads // self.tp_degree,
-                    })
+                    kernel_kwargs.update(
+                        {
+                            "cos_cache": cos_cache,
+                            "sin_cache": sin_cache,
+                            "num_q_heads": self.num_attention_heads // self.tp_degree,
+                            "num_kv_heads": self.num_key_value_heads // self.tp_degree,
+                        }
+                    )
 
                 QKV = _traced_qkv_kernel_nki[grid](
                     hidden=hidden_states,
@@ -721,7 +831,9 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                 # back to original layout:
                 #   output layout: [b, s, n*d]
                 QKV = (
-                    QKV.permute(1, 2, 0, 3)  # after permute: batch, padded_seqlen, num_heads, d_head
+                    QKV.permute(
+                        1, 2, 0, 3
+                    )  # after permute: batch, padded_seqlen, num_heads, d_head
                     .reshape(bs, padded_seqlen, fused_qkv_size)
                     .to(hidden_states.dtype)
                 )
@@ -738,10 +850,14 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                     device=hidden_states.device,
                 )
 
-                if seqlen <= self.seq_len_threshold_for_cc_tiling:  # Keep regular grid for TKG. Messes up the impl
+                if (
+                    seqlen <= self.seq_len_threshold_for_cc_tiling
+                ):  # Keep regular grid for TKG. Messes up the impl
                     grid = (nc(self.logical_nc_config),)
                 else:  # Add CC pipelining dim for CTE kernel grid
-                    grid = (CCPipeline(self.tiling_factor) * nc(self.logical_nc_config),)
+                    grid = (
+                        CCPipeline(self.tiling_factor) * nc(self.logical_nc_config),
+                    )
 
                 if residual is not None:
                     # attn_out is set to zeros becauses we getting the residual from fused-add-MLP directly
@@ -803,7 +919,9 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                 # back to original layout:
                 #   output layout: [b, s, n*d]
                 QKV = (
-                    QKV.permute(1, 2, 0, 3)  # after permute: batch, padded_seqlen, num_heads, d_head
+                    QKV.permute(
+                        1, 2, 0, 3
+                    )  # after permute: batch, padded_seqlen, num_heads, d_head
                     .reshape(bs, padded_seqlen, fused_qkv_size)
                     .to(hidden_states.dtype)
                 )
@@ -903,7 +1021,10 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
             )
             # TODO: Add Static Activation support for fused_qkv
             qkv_weight, qkv_scale, _ = self.get_weight(
-                prefix=prefix, layer=self.Wqkv, layer_name="Wqkv", model_state_dict=model_state_dict
+                prefix=prefix,
+                layer=self.Wqkv,
+                layer_name="Wqkv",
+                model_state_dict=model_state_dict,
             )
             q_proj_weight, k_proj_weight, v_proj_weight = qkv_weight.split(
                 [
@@ -927,7 +1048,10 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                 q_proj_scale, k_proj_scale, v_proj_scale = None, None, None
 
             qkv_bias = self.get_bias(
-                prefix=prefix, layer=self.Wqkv, layer_name="Wqkv", model_state_dict=model_state_dict
+                prefix=prefix,
+                layer=self.Wqkv,
+                layer_name="Wqkv",
+                model_state_dict=model_state_dict,
             )
             if qkv_bias is not None:
                 q_proj_bias, k_proj_bias, v_proj_bias = qkv_bias.split(
@@ -1008,7 +1132,10 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                 tensor_scale=k_proj_scale,
             )
             k_proj_bias, _ = replicate_kv(
-                k_proj_bias, source_heads=self._src_num_key_value_heads, repeats=repeats, head_dim=0
+                k_proj_bias,
+                source_heads=self._src_num_key_value_heads,
+                repeats=repeats,
+                head_dim=0,
             )
             v_proj_weight, v_proj_scale = replicate_kv(
                 v_proj_weight,
@@ -1018,7 +1145,10 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                 tensor_scale=v_proj_scale,
             )
             v_proj_bias, _ = replicate_kv(
-                v_proj_bias, source_heads=self._src_num_key_value_heads, repeats=repeats, head_dim=0
+                v_proj_bias,
+                source_heads=self._src_num_key_value_heads,
+                repeats=repeats,
+                head_dim=0,
             )
 
         if self.sharding_strategy == GQA.REPLICATE_TO_TP_DEGREE:
@@ -1027,7 +1157,8 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                 pad_dim=0,
                 source_heads=self._src_num_attention_heads,
                 target_heads=self.num_attention_heads,
-                source_group_size=self._src_num_attention_heads // self._src_num_key_value_heads,
+                source_group_size=self._src_num_attention_heads
+                // self._src_num_key_value_heads,
                 tensor_scale=q_proj_scale,
             )
             q_proj_bias, _ = maybe_pad_interleaved(
@@ -1035,7 +1166,8 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
                 pad_dim=0,
                 source_heads=self._src_num_attention_heads,
                 target_heads=self.num_attention_heads,
-                source_group_size=self._src_num_attention_heads // self._src_num_key_value_heads,
+                source_group_size=self._src_num_attention_heads
+                // self._src_num_key_value_heads,
             )
 
         if self.sharding_strategy == GQA.CONVERT_TO_MHA:
@@ -1082,12 +1214,17 @@ class GroupQueryAttention_QKV(BaseGroupQueryAttention):
         if self.fused_qkv:
             qkv_weight = torch.cat([q_proj_weight, k_proj_weight, v_proj_weight], dim=0)
             qkv_scale = None
-            if all(scale is not None for scale in (q_proj_scale, k_proj_scale, v_proj_scale)):
+            if all(
+                scale is not None
+                for scale in (q_proj_scale, k_proj_scale, v_proj_scale)
+            ):
                 qkv_scale = torch.cat([q_proj_scale, k_proj_scale, v_proj_scale], dim=0)
 
             # Set heads info as weight parameter attributes to be used in weights sharding
             fused_qkv_params = (
-                [self.Wqkv.weight, self.Wqkv.scale] if qkv_scale is not None else [self.Wqkv.weight]
+                [self.Wqkv.weight, self.Wqkv.scale]
+                if qkv_scale is not None
+                else [self.Wqkv.weight]
             )
             for param in fused_qkv_params:
                 setattr(param, "fused_qkv", True)
@@ -1229,7 +1366,9 @@ class GroupQueryAttention_O(BaseGroupQueryAttention):
                 self.o_proj.weight = transpose_parallel_linear_layer(self.o_proj.weight)
         else:
             self.o_proj = nn.Linear(
-                self.num_attention_heads * self.head_dim, self.hidden_size, bias=self.bias
+                self.num_attention_heads * self.head_dim,
+                self.hidden_size,
+                bias=self.bias,
             )
 
         # Prepared for changing "o_proj" to the corresponding name in model_state_dict
@@ -1237,7 +1376,9 @@ class GroupQueryAttention_O(BaseGroupQueryAttention):
         self.layer_name = layer_name
 
     def _kernel_o_proj(self, attention_output):
-        logger.debug(f"Output projection kernel: logical_nc_config={self.logical_nc_config}")
+        logger.debug(
+            f"Output projection kernel: logical_nc_config={self.logical_nc_config}"
+        )
         logger.debug(
             f"attention_output.shape: {attention_output.shape}"
             f"Output projection weight - shape: {self.o_proj.weight.shape}, dtype: {self.o_proj.weight.dtype}"
@@ -1246,20 +1387,24 @@ class GroupQueryAttention_O(BaseGroupQueryAttention):
         nd, H = self.o_proj.weight.shape
         B, S, nd = attention_output.shape
         heads_per_core = self.num_attention_heads // self.tp_degree
-        assert (
-            nd == heads_per_core * self.head_dim
-        ), f"attention_output.shape = {attention_output.shape}, heads_per_core = {heads_per_core}, head_dim = {self.head_dim}"
+        assert nd == heads_per_core * self.head_dim, (
+            f"attention_output.shape = {attention_output.shape}, heads_per_core = {heads_per_core}, head_dim = {self.head_dim}"
+        )
 
         # Kernel wants BndS layout for input.
         attention_output = attention_output.reshape(B, S, heads_per_core, self.head_dim)
         kernel_attn_in = attention_output.permute(0, 2, 3, 1)
 
-        out = torch.zeros(B, S, H, dtype=attention_output.dtype, device=attention_output.device)
+        out = torch.zeros(
+            B, S, H, dtype=attention_output.dtype, device=attention_output.device
+        )
 
         # TODO: deperecate this and pass bias as None once the bias argument is available generally.
         o_proj_kernel_kwargs = {}
         if self.bias:
-            o_proj_kernel_kwargs["bias"] = self.o_proj.bias.unsqueeze(0) / self.tp_degree
+            o_proj_kernel_kwargs["bias"] = (
+                self.o_proj.bias.unsqueeze(0) / self.tp_degree
+            )
 
         if os.environ.get("NKI_FRONTEND_FRAMEWORK") == "beta2":
             os.environ["NEURON_PLATFORM_TARGET_OVERRIDE"] = get_platform_target()
@@ -1323,7 +1468,8 @@ class GroupQueryAttention_O(BaseGroupQueryAttention):
                 pad_dim=1,
                 source_heads=self._src_num_attention_heads,
                 target_heads=self.num_attention_heads,
-                source_group_size=self._src_num_attention_heads // self._src_num_key_value_heads,
+                source_group_size=self._src_num_attention_heads
+                // self._src_num_key_value_heads,
                 tensor_scale=o_proj_scale,
             )
 
@@ -1344,7 +1490,10 @@ class GroupQueryAttention_O(BaseGroupQueryAttention):
             model_state_dict[f"{prefix}.o_proj.input_scale"] = o_proj_input_scale
 
         o_proj_bias = self.get_bias(
-            prefix=prefix, layer=self.o_proj, layer_name="o_proj", model_state_dict=model_state_dict
+            prefix=prefix,
+            layer=self.o_proj,
+            layer_name="o_proj",
+            model_state_dict=model_state_dict,
         )
         if self.bias:
             self.set_bias(
