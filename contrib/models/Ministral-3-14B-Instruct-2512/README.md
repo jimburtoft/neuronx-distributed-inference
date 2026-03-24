@@ -16,7 +16,7 @@ text decoder and a Mistral3-specific PatchMerger projector.
 
 - Text decoder: 40 layers, hidden\_size=5120, num\_attention\_heads=32, num\_kv\_heads=8,
   vocab\_size=131072, intermediate\_size=16384, head\_dim=128, rope\_theta=1e9
-- Vision encoder: Pixtral ViT (patch\_size=16, hidden=1024, 24 layers, 16 heads)
+- Vision encoder: Pixtral ViT (patch\_size=14, hidden=1024, 24 layers, 16 heads)
 - Projector: Mistral3 PatchMerger (spatial 2x2 merge via F.unfold) + 2-layer MLP (runs on CPU)
 - At TP=4: q\_heads\_per\_rank=8, kv\_heads\_per\_rank=2
 
@@ -141,8 +141,8 @@ image_sizes = torch.tensor([[1024, 1024]], dtype=torch.int32)
 
 # Build input with [IMG] tokens (token_id=10)
 # The number of [IMG] tokens must match: (H/patch_size/2) * (W/patch_size/2)
-# For 1024x1024 with patch=16, merge=2: (64/2)*(64/2) = 1024 tokens
-num_img_tokens = 1024
+# For 1024x1024 with patch=14, merge=2: (73/2)*(73/2) ≈ 1296 tokens (ceil arithmetic)
+num_img_tokens = 1296
 img_tokens = torch.full((1, num_img_tokens), 10, dtype=torch.long)
 text_tokens = torch.tensor([encoded.ids], dtype=torch.long)
 input_ids = torch.cat([img_tokens, text_tokens], dim=1)
@@ -161,7 +161,32 @@ out = model(
 
 ## Performance Results
 
-Measured on trn2.3xlarge (TP=4, LNC=2, SDK 2.28):
+Measured on trn2.3xlarge (TP=4, LNC=2, SDK 2.28) via vllm-neuron:
+
+### Decode Throughput
+
+| Platform | Config | Text tok/s | VL tok/s | Text TTFT | VL TTFT |
+|----------|--------|-----------|---------|----------|---------|
+| **trn2.3xlarge** | BS=1, fused QKV+NKI | **71.0** | **69.0** | 32.7ms | 63.5ms |
+| **trn2.3xlarge** | **BS=4, fused QKV+NKI** | **213.7** | **199.9** | 36ms | 66ms |
+| p5.48xlarge | 1x H100 80GB, FP8 | 140.3 | 139.4 | 21.4ms | 21.5ms |
+| g6e.4xlarge | 1x L40S 48GB, FP8 | 43.9 | — | — | — |
+
+At BS=4, Neuron **exceeds H100 throughput by 1.5x** (text) and 1.4x (VL) while being
+3-5x more cost-efficient per tok/s per $/hr.
+
+### TTFT (Time to First Token)
+
+| Prompt Type | trn2 median | H100 median | Ratio |
+|-------------|-------------|-------------|-------|
+| Short text (~2 tok) | 38.6ms | 21.2ms | 1.82x |
+| Medium text (~26 tok) | 32.7ms | 21.4ms | 1.53x |
+| VL (image+text, ~134 tok) | 63.5ms | 21.5ms | 2.95x |
+
+Bucket optimization (adding buckets 32, 64 to default power-of-2 list) reduced text TTFT
+from 38.4ms → 32.7ms (15%). The ~32ms floor is fixed vLLM scheduling + NxDI dispatch overhead.
+
+### Standalone (contrib) Throughput
 
 | Mode | Throughput | Notes |
 |------|-----------|-------|
@@ -189,10 +214,11 @@ issue is fixed.
 2. **KVDP not supported**: KV data parallelism is not compatible with the multi-KV-head
    kernel path.
 
-3. **Batch size 1 only**: VL pipeline is validated with batch\_size=1.
-
-4. **FP8 checkpoint**: The original checkpoint uses FP8 E4M3 weights. These are dequantized
+3. **FP8 checkpoint**: The original checkpoint uses FP8 E4M3 weights. These are dequantized
    to bf16 during state\_dict conversion. Runtime FP8 inference is not currently supported.
+
+4. **attn\_block\_tkg\_nki\_kernel blocked**: Fused TKG attention block kernel hits compiler
+   ICE NCC\_ITEN404 on buckets >= 512. Disabled by default.
 
 ## Compatibility Matrix
 
@@ -201,6 +227,62 @@ issue is fixed.
 | trn2.3xlarge (TP=4) | Tested | Not tested | Not supported |
 | trn2.48xlarge | Not tested | Not tested | Not tested |
 | trn1 / inf2 | Not supported | Not supported | Not supported |
+
+## vllm-neuron Serving
+
+This model is also available as a first-class NxDI model served via vllm-neuron. The
+vllm-neuron integration handles compilation, bucketing, and batching automatically.
+
+### Launch (BS=4, recommended)
+
+```bash
+source /opt/aws_neuronx_venv_pytorch_inference_vllm_0_13/bin/activate
+export NEURON_PLATFORM_TARGET_OVERRIDE=trn2
+export NEURON_COMPILE_CACHE_URL=""
+
+python -m vllm.entrypoints.openai.api_server \
+  --model /mnt/models/Ministral-3-14B-Instruct-2512 \
+  --tensor-parallel-size 4 \
+  --max-model-len 4096 \
+  --max-num-seqs 4 \
+  --port 8000 \
+  --host 0.0.0.0 \
+  --no-enable-prefix-caching \
+  --block-size 8
+```
+
+For BS=1 (lower latency, lower throughput), change `--max-num-seqs 1`.
+
+### Query
+
+```bash
+# Text-only
+curl -s http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "/mnt/models/Ministral-3-14B-Instruct-2512",
+       "messages": [{"role": "user", "content": "What is the capital of France?"}],
+       "max_tokens": 256}'
+
+# Vision-language
+curl -s http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "/mnt/models/Ministral-3-14B-Instruct-2512",
+       "messages": [{"role": "user", "content": [
+         {"type": "image_url", "image_url": {"url": "https://example.com/image.jpg"}},
+         {"type": "text", "text": "Describe this image."}
+       ]}],
+       "max_tokens": 256}'
+```
+
+### vllm-neuron Code Changes
+
+The vllm-neuron integration lives in the `embeddings` branch of the vllm-neuron fork:
+
+| File | Changes |
+|------|---------|
+| `worker/constants.py` | Added `Mistral3ForConditionalGeneration` to `NEURON_MULTI_MODAL_MODELS` |
+| `worker/neuronx_distributed_model_loader.py` | `NeuronMistral3ForCausalLM` wrapper class (vision BS=1 fix, bucket config, NKI defaults) |
+| `worker/neuronx_distributed_model_runner.py` | `"leanstral"` model\_type handler with key remapping |
 
 ## Source Files
 
@@ -242,4 +324,4 @@ This contrib model identifies 3 NxDI gaps that would benefit from upstream suppo
 
 Leanstral Project
 
-**Last Updated:** 2026-03-20
+**Last Updated:** 2026-03-24
