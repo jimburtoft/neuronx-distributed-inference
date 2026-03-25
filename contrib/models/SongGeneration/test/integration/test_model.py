@@ -13,16 +13,16 @@ Requirements:
     - codeclm source repository at CODECLM_PATH
 
 Environment variables:
-    SONGGEN_MODEL_PATH: Path to model.pt (default: /mnt/models/ckpt/songgeneration_base/model.pt)
+    SONGGEN_MODEL_PATH: Path to model.pt (default: base-new model)
     SONGGEN_CONFIG_PATH: Path to config.yaml
     SONGGEN_SAFETENSORS_PATH: Path to model_2.safetensors
-    SONGGEN_PROMPT_PATH: Path to prompt.pt
+    SONGGEN_PROMPT_PATH: Path to new_auto_prompt.pt (language-aware)
     SONGGEN_COMPILED_DIR: Path to pre-compiled models (skip compilation if set)
     CODECLM_PATH: Path to codeclm source (default: /mnt/models/songgeneration)
 
 Usage:
     # Full test (compile + run):
-    pytest test/integration/test_model.py -v --timeout=1800
+    pytest test/integration/test_model.py -v --timeout=3600
 
     # With pre-compiled models:
     SONGGEN_COMPILED_DIR=/mnt/models/songgeneration/compiled pytest test/integration/test_model.py -v
@@ -46,23 +46,57 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
 # ============================================================================
 
 MODEL_PATH = os.environ.get(
-    "SONGGEN_MODEL_PATH", "/mnt/models/ckpt/songgeneration_base/model.pt"
+    "SONGGEN_MODEL_PATH", "/mnt/models/ckpt/songgeneration_base_new/model.pt"
 )
 CONFIG_PATH = os.environ.get(
-    "SONGGEN_CONFIG_PATH", "/mnt/models/ckpt/songgeneration_base/config.yaml"
+    "SONGGEN_CONFIG_PATH", "/mnt/models/ckpt/songgeneration_base_new/config.yaml"
 )
 SAFETENSORS_PATH = os.environ.get(
     "SONGGEN_SAFETENSORS_PATH",
     "/mnt/models/songgeneration/ckpt/model_septoken/model_2.safetensors",
 )
 PROMPT_PATH = os.environ.get(
-    "SONGGEN_PROMPT_PATH", "/mnt/models/songgeneration/ckpt/prompt.pt"
+    "SONGGEN_PROMPT_PATH",
+    "/mnt/models/songgeneration/codeclm_repo/tools/new_auto_prompt.pt",
 )
 COMPILED_DIR = os.environ.get("SONGGEN_COMPILED_DIR", None)
 CODECLM_PATH = os.environ.get("CODECLM_PATH", "/mnt/models/songgeneration")
 
-DURATION_SEC = 5.0
-T_FRAMES = int(DURATION_SEC * 25)  # 125 frames
+DURATION_SEC = 15.0
+T_FRAMES = int(DURATION_SEC * 25)  # 375 frames
+
+# English lyrics for testing
+TEST_LYRICS = (
+    "[intro-short] ; "
+    "[verse] Sunlight breaks through morning haze."
+    "Golden fields stretch far away."
+    "Rivers flow with gentle grace."
+    "Finding peace in nature's embrace ; "
+    "[chorus] Sing along.Let the music carry you home."
+    "Sing along.You were never meant to walk alone ; "
+    "[outro-short]"
+)
+
+TEST_DESCRIPTIONS = "female, pop, upbeat, piano and acoustic guitar, the bpm is 120"
+
+
+# ============================================================================
+# Helper: load English prompts
+# ============================================================================
+
+
+def load_english_prompts(prompt_path):
+    """Load language-aware prompt file and extract English prompts."""
+    data = torch.load(prompt_path, map_location="cpu", weights_only=False)
+    if isinstance(data, dict):
+        first_val = next(iter(data.values()))
+        if isinstance(first_val, dict) and "en" in first_val:
+            # new_auto_prompt.pt format: {genre: {lang: [tensors]}}
+            return {g: data[g]["en"] for g in data if "en" in data[g]}
+        else:
+            # Old prompt.pt format: {genre: [tensors]} -- no language split
+            return data
+    return data
 
 
 # ============================================================================
@@ -72,7 +106,7 @@ T_FRAMES = int(DURATION_SEC * 25)  # 125 frames
 
 @pytest.fixture(scope="module")
 def pipeline():
-    """Build or load the SongGeneration Neuron pipeline."""
+    """Build or load the SongGeneration Neuron pipeline (TP=1 baseline)."""
     from modeling_songgeneration import SongGenerationNeuron, SongGenerationConfig
 
     config = SongGenerationConfig(
@@ -90,6 +124,9 @@ def pipeline():
         model.load(COMPILED_DIR)
     else:
         model.compile()
+
+    # Override with English prompts
+    model._prompt_data = load_english_prompts(PROMPT_PATH)
 
     model.warmup()
     return model
@@ -243,7 +280,6 @@ class TestGPT2Accuracy:
             ref["inputs"], ref["mask"], ref["timestep"]
         )
         rel_error = (ref["output"] - neuron_output).abs() / (ref["output"].abs() + 1e-8)
-        # Check 99th percentile (robust to outliers)
         p99_rel = torch.quantile(rel_error.float(), 0.99).item()
         assert p99_rel < 0.05, f"GPT2 p99 relative error {p99_rel:.4f} > 0.05"
 
@@ -281,12 +317,12 @@ class TestVAEAccuracy:
 
 
 class TestE2EGeneration:
-    """End-to-end generation tests."""
+    """End-to-end generation tests with English lyrics."""
 
     def test_generates_audio(self, pipeline):
         """Pipeline should generate non-zero audio tensor."""
         audio, sr = pipeline.generate(
-            "A cheerful pop song", genre="Pop", duration_sec=5.0, seed=42
+            TEST_LYRICS, genre="Pop", duration_sec=DURATION_SEC, seed=42
         )
         assert audio is not None
         assert sr == 48000
@@ -297,7 +333,7 @@ class TestE2EGeneration:
     def test_audio_valid_range(self, pipeline):
         """Audio values should be in reasonable range."""
         audio, _ = pipeline.generate(
-            "A gentle ballad", genre="Pop", duration_sec=5.0, seed=123
+            TEST_LYRICS, genre="Pop", duration_sec=DURATION_SEC, seed=123
         )
         assert audio.abs().max() < 10.0, "Audio values out of range"
         assert audio.std() > 1e-6, "Audio is silent (zero std)"
@@ -305,7 +341,7 @@ class TestE2EGeneration:
     def test_timed_generation(self, pipeline):
         """generate_timed should return timing breakdown."""
         result = pipeline.generate_timed(
-            "An upbeat dance track", genre="Pop", duration_sec=5.0, seed=99
+            TEST_LYRICS, genre="Pop", duration_sec=DURATION_SEC, seed=99
         )
         assert "audio" in result
         assert "sample_rate" in result
@@ -316,6 +352,19 @@ class TestE2EGeneration:
         assert t["vae_s"] > 0
         assert t["total_s"] > 0
 
+    def test_audio_rms_healthy(self, pipeline):
+        """Audio RMS should indicate non-trivial content (not silence or buzz)."""
+        audio, sr = pipeline.generate(
+            TEST_LYRICS, genre="Pop", duration_sec=DURATION_SEC, seed=42
+        )
+        audio_np = audio.float().cpu().numpy().squeeze(0)
+        if audio_np.ndim > 1:
+            audio_np = audio_np.mean(axis=0)
+        peak = max(abs(audio_np.max()), abs(audio_np.min()), 1e-10)
+        audio_int16 = (audio_np / peak * 32767).astype(np.int16)
+        rms = np.sqrt(np.mean(audio_int16.astype(float) ** 2))
+        assert rms > 1000, f"Audio RMS {rms:.0f} too low (likely silent)"
+
 
 class TestPerformance:
     """Performance benchmarks."""
@@ -323,19 +372,19 @@ class TestPerformance:
     def test_lelm_step_latency(self, pipeline):
         """LeLM combined step latency should be < 60ms (on-device KV target)."""
         result = pipeline.generate_timed(
-            "A cheerful pop song", genre="Pop", duration_sec=5.0, seed=42
+            TEST_LYRICS, genre="Pop", duration_sec=DURATION_SEC, seed=42
         )
         t = result["timings"]
         ms_per_step = (t["lelm_s"] * 1000) / t["lelm_steps"]
         assert ms_per_step < 60, f"LeLM step latency {ms_per_step:.1f}ms > 60ms target"
 
-    def test_total_faster_than_gpu(self, pipeline):
-        """Total E2E time should be < 20.1s (GPU A10G baseline for 5s audio)."""
+    def test_total_time_reasonable(self, pipeline):
+        """Total E2E time for 15s audio should be < 60s (TP=1 baseline)."""
         result = pipeline.generate_timed(
-            "A cheerful pop song", genre="Pop", duration_sec=5.0, seed=42
+            TEST_LYRICS, genre="Pop", duration_sec=DURATION_SEC, seed=42
         )
         total = result["timings"]["total_s"]
-        assert total < 20.1, f"Total time {total:.1f}s > 20.1s GPU baseline"
+        assert total < 60, f"Total time {total:.1f}s > 60s for 15s audio"
 
 
 # ============================================================================
@@ -358,17 +407,23 @@ if __name__ == "__main__":
         default_duration_sec=DURATION_SEC,
     )
 
+    print(f"\nModel: {MODEL_PATH}")
+    print(f"Duration: {DURATION_SEC}s")
+    print(f"Lyrics: {TEST_LYRICS[:60]}...")
+
     print("\n[1/6] Building pipeline...")
     model = SongGenerationNeuron(config)
     if COMPILED_DIR and os.path.isdir(COMPILED_DIR):
         model.load(COMPILED_DIR)
     else:
         model.compile()
+
+    # Load English prompts
+    model._prompt_data = load_english_prompts(PROMPT_PATH)
     model.warmup()
     print("  PASS: Pipeline compiled and loaded")
 
     print("\n[2/6] Testing GPT2 accuracy...")
-    # Build CPU reference
     sys.path.insert(0, CODECLM_PATH)
     sys.path.insert(0, os.path.join(CODECLM_PATH, "codeclm/tokenizer/Flow1dVAE"))
     sys.path.insert(
@@ -448,17 +503,27 @@ if __name__ == "__main__":
     )
     print(f"  VAE SNR: {snr:.1f} dB {'PASS' if snr > 20 else 'FAIL'}")
 
-    print("\n[4/6] Testing E2E generation...")
+    print("\n[4/6] Testing E2E generation (English lyrics)...")
     result = model.generate_timed(
-        "A cheerful pop song with catchy melody", genre="Pop", duration_sec=5.0, seed=42
+        TEST_LYRICS, genre="Pop", duration_sec=DURATION_SEC, seed=42
     )
     audio = result["audio"]
     t = result["timings"]
     print(f"  Audio shape: {audio.shape}")
     print(f"  Audio range: [{audio.min():.4f}, {audio.max():.4f}]")
     print(f"  Audio std: {audio.std():.6f}")
+
+    audio_np = audio.float().cpu().numpy().squeeze(0)
+    if audio_np.ndim > 1:
+        audio_np_mono = audio_np.mean(axis=0)
+    else:
+        audio_np_mono = audio_np
+    peak = max(abs(audio_np_mono.max()), abs(audio_np_mono.min()), 1e-10)
+    audio_int16 = (audio_np_mono / peak * 32767).astype(np.int16)
+    rms = np.sqrt(np.mean(audio_int16.astype(float) ** 2))
+    print(f"  Audio RMS: {rms:.0f}")
     print(
-        f"  {'PASS' if audio.std() > 1e-6 and audio.abs().max() < 10 else 'FAIL'}: Audio is valid"
+        f"  {'PASS' if audio.std() > 1e-6 and rms > 1000 else 'FAIL'}: Audio is valid"
     )
 
     print("\n[5/6] Performance results...")
@@ -469,18 +534,21 @@ if __name__ == "__main__":
     print(f"  Diffusion: {t['diffusion_s']:.3f}s")
     print(f"  VAE: {t['vae_s']:.3f}s")
     print(f"  Total: {t['total_s']:.1f}s")
+    print(f"  RTF: {t['total_s'] / DURATION_SEC:.2f}x")
     print(f"  {'PASS' if ms_per_step < 60 else 'FAIL'}: Step latency < 60ms")
-    print(f"  {'PASS' if t['total_s'] < 20.1 else 'FAIL'}: Faster than GPU (20.1s)")
+    print(
+        f"  {'PASS' if t['total_s'] < 60 else 'FAIL'}: Total < 60s for {DURATION_SEC}s audio"
+    )
 
     print("\n[6/6] Saving audio...")
     try:
         import scipy.io.wavfile
 
-        audio_np = audio.squeeze(0).float().cpu().numpy().T
-        audio_np = np.clip(audio_np, -1.0, 1.0)
-        audio_int16 = (audio_np * 32767).astype(np.int16)
+        audio_np_stereo = audio.squeeze(0).float().cpu().numpy().T
+        audio_np_stereo = np.clip(audio_np_stereo, -1.0, 1.0)
+        audio_int16_stereo = (audio_np_stereo * 32767).astype(np.int16)
         wav_path = "/tmp/songgeneration_test_output.wav"
-        scipy.io.wavfile.write(wav_path, 48000, audio_int16)
+        scipy.io.wavfile.write(wav_path, 48000, audio_int16_stereo)
         print(f"  Audio saved to {wav_path}")
     except Exception as e:
         print(f"  Could not save WAV: {e}")

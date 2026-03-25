@@ -71,6 +71,7 @@ class SongGenerationConfig:
     # Compilation
     max_seq_len: int = 512
     batch_size: int = 2  # CFG doubles batch
+    prefill_len: int = 512  # Prefill NEFF size (processes this many tokens in one shot)
     compiler_args: str = "--auto-cast matmult --model-type transformer"
 
     # Generation defaults
@@ -189,8 +190,9 @@ class _NeuronPrimaryTransformer(nn.Module):
 
     def forward(self, inputs_embeds, position_ids, cache_position, attn_mask):
         hidden_states = inputs_embeds
-        cos_pos = self.rope_cos[position_ids].unsqueeze(2)
-        sin_pos = self.rope_sin[position_ids].unsqueeze(2)
+        seq_len = inputs_embeds.shape[1]  # 1 for decode, P for prefill
+        cos_pos = self.rope_cos[position_ids].unsqueeze(1)
+        sin_pos = self.rope_sin[position_ids].unsqueeze(1)
 
         for i in range(self.num_layers):
             layer = self.layers[i]
@@ -208,13 +210,13 @@ class _NeuronPrimaryTransformer(nn.Module):
             value_states = attn.v_proj(hidden_states)
 
             query_states = query_states.view(
-                bsz, 1, self.num_heads, self.head_dim
+                bsz, seq_len, self.num_heads, self.head_dim
             ).transpose(1, 2)
             key_states = key_states.view(
-                bsz, 1, self.num_heads, self.head_dim
+                bsz, seq_len, self.num_heads, self.head_dim
             ).transpose(1, 2)
             value_states = value_states.view(
-                bsz, 1, self.num_heads, self.head_dim
+                bsz, seq_len, self.num_heads, self.head_dim
             ).transpose(1, 2)
 
             query_states = (query_states * cos_pos) + (
@@ -222,8 +224,8 @@ class _NeuronPrimaryTransformer(nn.Module):
             )
             key_states = (key_states * cos_pos) + (_rotate_half(key_states) * sin_pos)
 
-            idx = cache_position.view(1, 1, 1, 1).expand(
-                bsz, self.num_heads, 1, self.head_dim
+            idx = cache_position.view(1, 1, seq_len, 1).expand(
+                bsz, self.num_heads, seq_len, self.head_dim
             )
             setattr(self, f"cache_k_{i}", torch.scatter(k_cache, 2, idx, key_states))
             setattr(self, f"cache_v_{i}", torch.scatter(v_cache, 2, idx, value_states))
@@ -241,7 +243,7 @@ class _NeuronPrimaryTransformer(nn.Module):
             attn_output = torch.matmul(attn_weights, v_cache)
 
             attn_output = (
-                attn_output.transpose(1, 2).contiguous().reshape(bsz, 1, self.dim)
+                attn_output.transpose(1, 2).contiguous().reshape(bsz, seq_len, self.dim)
             )
             attn_output = attn.o_proj(attn_output)
 
@@ -312,9 +314,10 @@ class _NeuronFusedSecondary(nn.Module):
     ):
         bridge_input = torch.cat([fused_input2, primary_hidden], dim=-1)
         hidden_states = self.mlp_bridge(bridge_input)
+        seq_len = fused_input2.shape[1]  # 1 for decode, P for prefill
 
-        cos_pos = self.rope_cos[position_ids].unsqueeze(2)
-        sin_pos = self.rope_sin[position_ids].unsqueeze(2)
+        cos_pos = self.rope_cos[position_ids].unsqueeze(1)
+        sin_pos = self.rope_sin[position_ids].unsqueeze(1)
 
         for i in range(self.num_layers):
             layer = self.layers[i]
@@ -332,13 +335,13 @@ class _NeuronFusedSecondary(nn.Module):
             value_states = attn.v_proj(hidden_states)
 
             query_states = query_states.view(
-                bsz, 1, self.num_heads, self.head_dim
+                bsz, seq_len, self.num_heads, self.head_dim
             ).transpose(1, 2)
             key_states = key_states.view(
-                bsz, 1, self.num_heads, self.head_dim
+                bsz, seq_len, self.num_heads, self.head_dim
             ).transpose(1, 2)
             value_states = value_states.view(
-                bsz, 1, self.num_heads, self.head_dim
+                bsz, seq_len, self.num_heads, self.head_dim
             ).transpose(1, 2)
 
             query_states = (query_states * cos_pos) + (
@@ -346,8 +349,8 @@ class _NeuronFusedSecondary(nn.Module):
             )
             key_states = (key_states * cos_pos) + (_rotate_half(key_states) * sin_pos)
 
-            idx = cache_position.view(1, 1, 1, 1).expand(
-                bsz, self.num_heads, 1, self.head_dim
+            idx = cache_position.view(1, 1, seq_len, 1).expand(
+                bsz, self.num_heads, seq_len, self.head_dim
             )
             setattr(self, f"cache_k_{i}", torch.scatter(k_cache, 2, idx, key_states))
             setattr(self, f"cache_v_{i}", torch.scatter(v_cache, 2, idx, value_states))
@@ -365,7 +368,7 @@ class _NeuronFusedSecondary(nn.Module):
             attn_output = torch.matmul(attn_weights, v_cache)
 
             attn_output = (
-                attn_output.transpose(1, 2).contiguous().reshape(bsz, 1, self.dim)
+                attn_output.transpose(1, 2).contiguous().reshape(bsz, seq_len, self.dim)
             )
             attn_output = attn.o_proj(attn_output)
 
@@ -911,6 +914,10 @@ class SongGenerationNeuron:
         self._setup_codeclm_paths()
         from omegaconf import OmegaConf
 
+        # chdir to codeclm base so relative paths in config (e.g. conf/vocab.yaml) resolve
+        prev_cwd = os.getcwd()
+        os.chdir(self.config.codeclm_path)
+
         OmegaConf.register_new_resolver("eval", lambda x: eval(x), replace=True)
         OmegaConf.register_new_resolver(
             "concat", lambda *x: [xxx for xx in x for xxx in xx], replace=True
@@ -935,15 +942,27 @@ class SongGenerationNeuron:
         }
         model.load_state_dict(stripped, strict=False)
         model.eval()
+        os.chdir(prev_cwd)  # restore cwd
         self._lelm_model = model
         return model
 
     def _build_attn_mask(self, cache_position):
-        mask = torch.full(
-            (1, 1, 1, self.config.max_seq_len), float("-inf"), dtype=torch.float32
-        )
-        mask[:, :, :, : cache_position + 1] = 0.0
-        return mask.expand(self.config.batch_size, -1, -1, -1)
+        """Build causal attention mask.
+
+        For decode (cache_position is int): mask shape [B, 1, 1, max_seq]
+        For prefill (cache_position is tensor of len P): mask shape [B, 1, P, max_seq]
+        """
+        max_seq = self.config.max_seq_len
+        B = self.config.batch_size
+        if isinstance(cache_position, int):
+            mask = torch.full((1, 1, 1, max_seq), float("-inf"), dtype=torch.float32)
+            mask[:, :, :, : cache_position + 1] = 0.0
+        else:
+            P = cache_position.shape[0]
+            mask = torch.full((1, 1, P, max_seq), float("-inf"), dtype=torch.float32)
+            for q in range(P):
+                mask[:, :, q, : cache_position[q].item() + 1] = 0.0
+        return mask.expand(B, -1, -1, -1)
 
     def compile(self):
         """Compile all pipeline components on Neuron.
@@ -983,6 +1002,20 @@ class SongGenerationNeuron:
             "attn_mask": self._build_attn_mask(0),
         }
         builder.trace(kwargs=example_kwargs, tag="decode")
+
+        # Prefill trace (prefill_len tokens at once)
+        if cfg.prefill_len > 0:
+            prefill_positions = torch.arange(cfg.prefill_len, dtype=torch.long)
+            prefill_kwargs = {
+                "inputs_embeds": torch.randn(cfg.batch_size, cfg.prefill_len, cfg.dim),
+                "position_ids": prefill_positions.unsqueeze(0).expand(
+                    cfg.batch_size, -1
+                ),
+                "cache_position": prefill_positions,
+                "attn_mask": self._build_attn_mask(prefill_positions),
+            }
+            builder.trace(kwargs=prefill_kwargs, tag="prefill")
+
         self._primary_neuron = builder.compile(
             priority_model_key="decode", compiler_args=cfg.compiler_args
         )
@@ -1007,6 +1040,21 @@ class SongGenerationNeuron:
             "attn_mask": self._build_attn_mask(0),
         }
         builder.trace(kwargs=example_kwargs, tag="decode")
+
+        # Prefill trace (prefill_len tokens at once)
+        if cfg.prefill_len > 0:
+            prefill_positions = torch.arange(cfg.prefill_len, dtype=torch.long)
+            prefill_kwargs = {
+                "fused_input2": torch.randn(cfg.batch_size, cfg.prefill_len, cfg.dim),
+                "primary_hidden": torch.randn(cfg.batch_size, cfg.prefill_len, cfg.dim),
+                "position_ids": prefill_positions.unsqueeze(0).expand(
+                    cfg.batch_size, -1
+                ),
+                "cache_position": prefill_positions,
+                "attn_mask": self._build_attn_mask(prefill_positions),
+            }
+            builder.trace(kwargs=prefill_kwargs, tag="prefill")
+
         self._secondary_neuron = builder.compile(
             priority_model_key="decode", compiler_args=cfg.compiler_args
         )
@@ -1212,7 +1260,7 @@ class SongGenerationNeuron:
         print(f"Loaded compiled pipeline from {model_dir}")
 
     def warmup(self, n_warmup: int = 5):
-        """Warm up all Neuron models."""
+        """Warm up all Neuron models (prefill + decode + GPT2 + VAE)."""
         cfg = self.config
         T_frames = int(cfg.default_duration_sec * 25)
 
@@ -1225,13 +1273,42 @@ class SongGenerationNeuron:
             )
             self._neuron_vae(torch.randn(1, 64, T_frames))
 
-        # LeLM on-device KV
+        # LeLM prefill warmup
+        if cfg.prefill_len > 0:
+            prefill_positions = torch.arange(cfg.prefill_len, dtype=torch.long)
+            prefill_pos_ids = prefill_positions.unsqueeze(0).expand(cfg.batch_size, -1)
+            prefill_mask = self._build_attn_mask(prefill_positions)
+            for _ in range(2):
+                primary_out = self._primary_neuron(
+                    torch.randn(cfg.batch_size, cfg.prefill_len, cfg.dim),
+                    prefill_pos_ids,
+                    prefill_positions,
+                    prefill_mask,
+                    model_name="prefill",
+                )
+                primary_hidden = (
+                    primary_out[0] if isinstance(primary_out, tuple) else primary_out[0]
+                )
+                self._secondary_neuron(
+                    torch.randn(cfg.batch_size, cfg.prefill_len, cfg.dim),
+                    primary_hidden,
+                    prefill_pos_ids,
+                    prefill_positions,
+                    prefill_mask,
+                    model_name="prefill",
+                )
+
+        # LeLM decode warmup
         for i in range(n_warmup):
             pos_ids = torch.full((cfg.batch_size, 1), i, dtype=torch.long)
             cp = torch.tensor([i], dtype=torch.long)
             am = self._build_attn_mask(i)
             self._primary_neuron(
-                torch.randn(cfg.batch_size, 1, cfg.dim), pos_ids, cp, am
+                torch.randn(cfg.batch_size, 1, cfg.dim),
+                pos_ids,
+                cp,
+                am,
+                model_name="decode",
             )
             self._secondary_neuron(
                 torch.randn(cfg.batch_size, 1, cfg.dim),
@@ -1239,6 +1316,7 @@ class SongGenerationNeuron:
                 pos_ids,
                 cp,
                 am,
+                model_name="decode",
             )
 
     @torch.no_grad()
@@ -1362,7 +1440,12 @@ class SongGenerationNeuron:
 
     @torch.no_grad()
     def _stage1_lelm(self, text, prompt_tensor, T_frames, temp, top_k, cfg_coef):
-        """Autoregressive token generation with on-device KV cache."""
+        """Autoregressive token generation with on-device KV cache and prefill.
+
+        Uses prefill optimization: the first prefill_len condition tokens are
+        processed in a single Neuron call (via the "prefill" NEFF), then the
+        remaining prepend tokens and AR generation use the "decode" NEFF.
+        """
         cfg = self.config
         model = self._lelm_model
         code_depth = model.code_depth
@@ -1404,10 +1487,6 @@ class SongGenerationNeuron:
 
         t_start = time.time()
 
-        # CRITICAL: Use streaming mode so the ConditionFuser only prepends
-        # condition tokens (602 total) on the FIRST step. Without streaming,
-        # prepend happens every step, corrupting the KV cache and causing
-        # CB1/CB2 token collapse.
         with model.streaming():
             for offset in range(start_offset_sequence, gen_sequence_len):
                 curr_sequence = gen_sequence[..., prev_offset:offset]
@@ -1426,105 +1505,221 @@ class SongGenerationNeuron:
                     input_1, input_2, condition_tensors
                 )
 
-                # On first step, fused outputs include prepended conditions
                 fused_S = fused_input1_cfg.shape[1]
 
-                for s_idx in range(fused_S):
-                    token_input1 = fused_input1_cfg[:, s_idx : s_idx + 1, :]
-                    position_ids = torch.full(
-                        (cfg.batch_size, 1), neuron_position, dtype=torch.long
+                if fused_S > 1 and cfg.prefill_len > 0:
+                    # PREFILL: process first prefill_len tokens in one shot
+                    prefill_len = min(cfg.prefill_len, fused_S - 1)
+
+                    prefill_input1 = fused_input1_cfg[:, :prefill_len, :]
+                    prefill_input2 = fused_input2_cfg[:, :prefill_len, :]
+                    if prefill_len < cfg.prefill_len:
+                        pad_len = cfg.prefill_len - prefill_len
+                        prefill_input1 = torch.cat(
+                            [
+                                prefill_input1,
+                                torch.zeros(
+                                    cfg.batch_size,
+                                    pad_len,
+                                    cfg.dim,
+                                    dtype=prefill_input1.dtype,
+                                ),
+                            ],
+                            dim=1,
+                        )
+                        prefill_input2 = torch.cat(
+                            [
+                                prefill_input2,
+                                torch.zeros(
+                                    cfg.batch_size,
+                                    pad_len,
+                                    cfg.dim,
+                                    dtype=prefill_input2.dtype,
+                                ),
+                            ],
+                            dim=1,
+                        )
+
+                    prefill_positions = torch.arange(cfg.prefill_len, dtype=torch.long)
+                    prefill_pos_ids = prefill_positions.unsqueeze(0).expand(
+                        cfg.batch_size, -1
                     )
-                    cache_position = torch.tensor([neuron_position], dtype=torch.long)
-                    attn_mask = self._build_attn_mask(neuron_position)
+                    prefill_attn_mask = self._build_attn_mask(prefill_positions)
 
                     primary_out = self._primary_neuron(
-                        token_input1, position_ids, cache_position, attn_mask
+                        prefill_input1,
+                        prefill_pos_ids,
+                        prefill_positions,
+                        prefill_attn_mask,
+                        model_name="prefill",
                     )
                     primary_hidden = (
                         primary_out[0]
                         if isinstance(primary_out, tuple)
                         else primary_out[0]
                     )
-                    primary_logits = (
-                        primary_out[1]
-                        if isinstance(primary_out, tuple)
-                        else primary_out[1]
-                    )
-
-                    token_input2 = fused_input2_cfg[:, s_idx : s_idx + 1, :]
-                    secondary_out = self._secondary_neuron(
-                        token_input2,
+                    self._secondary_neuron(
+                        prefill_input2,
                         primary_hidden,
-                        position_ids,
-                        cache_position,
-                        attn_mask,
+                        prefill_pos_ids,
+                        prefill_positions,
+                        prefill_attn_mask,
+                        model_name="prefill",
                     )
-                    fused_res_logits = (
-                        secondary_out[0]
-                        if isinstance(secondary_out, tuple)
-                        else secondary_out
-                    )
+                    neuron_position = cfg.prefill_len
 
-                    neuron_position += 1
+                    # Decode remainder one-by-one
+                    for s_idx in range(prefill_len, fused_S):
+                        token_input1 = fused_input1_cfg[:, s_idx : s_idx + 1, :]
+                        position_ids = torch.full(
+                            (cfg.batch_size, 1), neuron_position, dtype=torch.long
+                        )
+                        cache_position = torch.tensor(
+                            [neuron_position], dtype=torch.long
+                        )
+                        attn_mask = self._build_attn_mask(neuron_position)
 
-            # CFG on logits
-            logits_cb0 = primary_logits
-            cond_logits_cb0, uncond_logits_cb0 = logits_cb0.split(B, dim=0)
-            logits_cb0 = (
-                uncond_logits_cb0 + (cond_logits_cb0 - uncond_logits_cb0) * cfg_coef
-            )
+                        primary_out = self._primary_neuron(
+                            token_input1,
+                            position_ids,
+                            cache_position,
+                            attn_mask,
+                            model_name="decode",
+                        )
+                        primary_hidden = (
+                            primary_out[0]
+                            if isinstance(primary_out, tuple)
+                            else primary_out[0]
+                        )
+                        primary_logits = (
+                            primary_out[1]
+                            if isinstance(primary_out, tuple)
+                            else primary_out[1]
+                        )
 
-            cond_res, uncond_res = fused_res_logits.split(B, dim=0)
-            res_logits = uncond_res + (cond_res - uncond_res) * cfg_coef
+                        token_input2 = fused_input2_cfg[:, s_idx : s_idx + 1, :]
+                        secondary_out = self._secondary_neuron(
+                            token_input2,
+                            primary_hidden,
+                            position_ids,
+                            cache_position,
+                            attn_mask,
+                            model_name="decode",
+                        )
+                        fused_res_logits = (
+                            secondary_out[0]
+                            if isinstance(secondary_out, tuple)
+                            else secondary_out
+                        )
+                        neuron_position += 1
+                else:
+                    # Normal decode: process token by token
+                    for s_idx in range(fused_S):
+                        token_input1 = fused_input1_cfg[:, s_idx : s_idx + 1, :]
+                        position_ids = torch.full(
+                            (cfg.batch_size, 1), neuron_position, dtype=torch.long
+                        )
+                        cache_position = torch.tensor(
+                            [neuron_position], dtype=torch.long
+                        )
+                        attn_mask = self._build_attn_mask(neuron_position)
 
-            logits = torch.cat([logits_cb0.unsqueeze(1), res_logits], dim=1)
-            logits = logits[:, :, :, :code_size][..., -1, :]
+                        primary_out = self._primary_neuron(
+                            token_input1,
+                            position_ids,
+                            cache_position,
+                            attn_mask,
+                            model_name="decode",
+                        )
+                        primary_hidden = (
+                            primary_out[0]
+                            if isinstance(primary_out, tuple)
+                            else primary_out[0]
+                        )
+                        primary_logits = (
+                            primary_out[1]
+                            if isinstance(primary_out, tuple)
+                            else primary_out[1]
+                        )
 
-            # Repetition penalty
-            if record_token_pool:
-                pool = torch.stack(record_token_pool[-150:], -1)
-                for q in range(code_depth):
-                    q_count = torch.bincount(torch.unique(pool[q]))
-                    tmp = min(q_count.shape[-1], code_size - 1)
-                    logits[:, q, :tmp] /= 1.1 ** q_count[:tmp]
+                        token_input2 = fused_input2_cfg[:, s_idx : s_idx + 1, :]
+                        secondary_out = self._secondary_neuron(
+                            token_input2,
+                            primary_hidden,
+                            position_ids,
+                            cache_position,
+                            attn_mask,
+                            model_name="decode",
+                        )
+                        fused_res_logits = (
+                            secondary_out[0]
+                            if isinstance(secondary_out, tuple)
+                            else secondary_out
+                        )
+                        neuron_position += 1
 
-            if ignore_tokens is not None and len(ignore_tokens) > 0:
-                logits[0][0][ignore_tokens.to(torch.int)] = float("-inf")
-
-            # Sampling
-            if temp > 0:
-                probs = torch.softmax(logits / temp, dim=-1)
-                top_k_probs_0, top_k_idx_0 = torch.topk(probs[:, [0], :], top_k, dim=-1)
-                top_k_probs_0 = top_k_probs_0 / top_k_probs_0.sum(dim=-1, keepdim=True)
-                sample_0 = torch.multinomial(top_k_probs_0.view(-1, top_k), 1).view(
-                    B, 1, 1
+                # CFG on logits (INSIDE the for-offset loop)
+                logits_cb0 = primary_logits
+                cond_logits_cb0, uncond_logits_cb0 = logits_cb0.split(B, dim=0)
+                logits_cb0 = (
+                    uncond_logits_cb0 + (cond_logits_cb0 - uncond_logits_cb0) * cfg_coef
                 )
-                next_cb0 = torch.gather(top_k_idx_0, -1, sample_0)
 
-                top_k_probs_r, top_k_idx_r = torch.topk(probs[:, 1:, :], 1, dim=-1)
-                next_res = top_k_idx_r
-                next_token = torch.cat([next_cb0, next_res], dim=1)
-            else:
-                next_token = torch.argmax(logits, dim=-1, keepdim=True)
+                cond_res, uncond_res = fused_res_logits.split(B, dim=0)
+                res_logits = uncond_res + (cond_res - uncond_res) * cfg_coef
 
-            valid_mask = mask[..., offset : offset + 1].expand(B, -1, -1)
-            next_token[~valid_mask] = model.special_token_id
-            next_token[is_end] = model.special_token_id
-            is_end = is_end | (next_token == model.eos_token_id)
+                logits = torch.cat([logits_cb0.unsqueeze(1), res_logits], dim=1)
+                logits = logits[:, :, :, :code_size][..., -1, :]
 
-            gen_sequence[..., offset : offset + 1] = torch.where(
-                gen_sequence[..., offset : offset + 1] == unknown_token,
-                next_token,
-                gen_sequence[..., offset : offset + 1],
-            )
+                # Repetition penalty
+                if record_token_pool:
+                    pool = torch.stack(record_token_pool[-150:], -1)
+                    for q in range(code_depth):
+                        q_count = torch.bincount(torch.unique(pool[q]))
+                        tmp = min(q_count.shape[-1], code_size - 1)
+                        logits[:, q, :tmp] /= 1.1 ** q_count[:tmp]
 
-            record_token_pool.append(next_token.squeeze())
+                if ignore_tokens is not None and len(ignore_tokens) > 0:
+                    logits[0][0][ignore_tokens.to(torch.int)] = float("-inf")
 
-            if torch.all(is_end):
-                gen_sequence = gen_sequence[..., : offset + 1]
-                break
+                # Sampling
+                if temp > 0:
+                    probs = torch.softmax(logits / temp, dim=-1)
+                    top_k_probs_0, top_k_idx_0 = torch.topk(
+                        probs[:, [0], :], top_k, dim=-1
+                    )
+                    top_k_probs_0 = top_k_probs_0 / top_k_probs_0.sum(
+                        dim=-1, keepdim=True
+                    )
+                    sample_0 = torch.multinomial(top_k_probs_0.view(-1, top_k), 1).view(
+                        B, 1, 1
+                    )
+                    next_cb0 = torch.gather(top_k_idx_0, -1, sample_0)
 
-            prev_offset = offset
+                    top_k_probs_r, top_k_idx_r = torch.topk(probs[:, 1:, :], 1, dim=-1)
+                    next_res = top_k_idx_r
+                    next_token = torch.cat([next_cb0, next_res], dim=1)
+                else:
+                    next_token = torch.argmax(logits, dim=-1, keepdim=True)
+
+                valid_mask = mask[..., offset : offset + 1].expand(B, -1, -1)
+                next_token[~valid_mask] = model.special_token_id
+                next_token[is_end] = model.special_token_id
+                is_end = is_end | (next_token == model.eos_token_id)
+
+                gen_sequence[..., offset : offset + 1] = torch.where(
+                    gen_sequence[..., offset : offset + 1] == unknown_token,
+                    next_token,
+                    gen_sequence[..., offset : offset + 1],
+                )
+
+                record_token_pool.append(next_token.squeeze())
+
+                if torch.all(is_end):
+                    gen_sequence = gen_sequence[..., : offset + 1]
+                    break
+
+                prev_offset = offset
 
         gen_time = time.time() - t_start
 

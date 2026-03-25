@@ -1,10 +1,11 @@
 # Contrib Model: SongGeneration (LeVo)
 
-Text-to-music generation on AWS Trainium2 using Tencent's SongGeneration (LeVo) model -- a hybrid LLM-Diffusion audio pipeline that generates stereo 48kHz music from text descriptions.
+Text-to-music generation on AWS Trainium2 using Tencent's SongGeneration (LeVo) model -- a hybrid LLM-Diffusion audio pipeline that generates stereo 48kHz music with vocals from lyrics and text descriptions.
 
 ## Model Information
 
-- **HuggingFace ID:** `tencent/SongGeneration`
+- **HuggingFace ID:** `lglg666/SongGeneration-base-new` (English + Chinese)
+- **Also compatible:** `tencent/SongGeneration` (Chinese-only base model)
 - **Model Type:** Multi-stage audio generation pipeline (LLM + Diffusion + VAE)
 - **Parameters:** ~4.1B total (LeLM 2.83B + Diffusion 1.1B + VAE 169M)
 - **Architecture:** Dual-Llama AR LM (28L primary + 12L secondary) with delayed codebook pattern, GPT2-RoPE CFM diffusion backbone (16L), Stable Audio VAE decoder
@@ -17,13 +18,21 @@ SongGeneration uses a three-stage pipeline:
 
 | Stage | Component | Params | Neuron Compilation | Key Innovation |
 |-------|-----------|--------|-------------------|----------------|
-| 1. LeLM | Dual-Llama AR (28L + 12L) | 2.83B | `ModelBuilder` (on-device KV) | `torch.scatter` KV cache in HBM |
+| 1. LeLM | Dual-Llama AR (28L + 12L) | 2.83B | `ModelBuilder` (on-device KV) | Prefill + `torch.scatter` KV cache in HBM |
 | 2. Diffusion | GPT2-RoPE CFM (16L) | 1.1B | `torch_neuronx.trace()` | Rewritten RoPE (no complex numbers) |
 | 3. VAE | Stable Audio decoder | 169M | `torch_neuronx.trace()` | `weight_norm` removal pre-trace |
 
 ### On-Device KV Cache
 
 The LeLM transformers use on-device KV caching via `neuronx_distributed.ModelBuilder`. Instead of passing KV cache tensors as model inputs/outputs each autoregressive step (PCIe round-trip), the cache is stored as `register_buffer` on the model and updated in-place with `torch.scatter`. This keeps the cache in Neuron HBM, providing a 3.2x speedup on the LeLM stage.
+
+### Prefill Optimization
+
+The first 512 of ~602 condition-prepend tokens (text encoding + prompt audio + description) are processed in a single Neuron call via a dedicated "prefill" NEFF, rather than one-at-a-time through the decode NEFF. This reduces total LeLM time by ~45%.
+
+### TP=2 NxDI Mode
+
+An optional TP=2 mode uses `NxDParallelState` from `neuronx_distributed` with NxDI `NeuronLlamaDecoderLayer` wrappers to shard the LeLM transformers across 2 NeuronCores. This provides a further 2x speedup on the LeLM stage, bringing total generation time close to real-time.
 
 ### Neuron-Specific Adaptations
 
@@ -33,11 +42,11 @@ The LeLM transformers use on-device KV caching via `neuronx_distributed.ModelBui
 - **weight_norm removal:** `torch.nn.utils.remove_weight_norm` applied to VAE before tracing
 - **bf16 precision:** AR loop state kept in FP32 on CPU to avoid compound rounding errors; LeLM Neuron models use `--auto-cast matmult`
 - **GPT2 diffusion fp32:** The GPT2 diffusion backbone **must** be traced with `--auto-cast none` (full FP32). Using `--auto-cast matmult` causes severe numerical degradation (cosine similarity drops from 1.0 to 0.64 vs CPU) which compounds across 10 Euler solver steps into garbled audio. The VAE can safely use `--auto-cast matmult`.
-- **v1 conditioning:** The base checkpoint uses `version='v1'` tokenizers. Do NOT prefix descriptions with `[Musicality-very-high]` (a v2-only feature). Use plain `description.lower()` for the type_info conditioner.
+- **Language-aware prompts:** The `new_auto_prompt.pt` file provides per-language prompt audio tokens (`['Pop']['en']` for English, `['Pop']['zh']` for Chinese). Using the correct language prompt is essential for generating vocals in the target language.
 
 ## Validation Results
 
-**Validated:** 2026-03-20
+**Validated:** 2026-03-25
 **Instance:** trn2.3xlarge (LNC=2, 4 NeuronCores)
 **SDK:** Neuron SDK 2.28 (DLAMI 20260227), PyTorch 2.9
 
@@ -50,145 +59,205 @@ The LeLM transformers use on-device KV caching via `neuronx_distributed.ModelBui
 | VAE decoder | Cosine similarity vs CPU | 1.0001 | > 0.98 |
 | VAE decoder | SNR vs CPU | > 40 dB | > 20 dB |
 
-### Benchmark Results (5s audio generation)
+### Benchmark Results (15s audio generation, English vocals)
 
-| Metric | On-Device KV | PCIe KV | GPU (A10G) | CPU |
-|--------|-------------|---------|------------|-----|
-| **LeLM AR time** | **45.4s** | 50.1s | 17.5s | 112.9s |
-| **Diffusion + VAE** | **0.16s** | 0.15s | 2.7s | 46.8s |
-| **Total E2E** | **45.6s** | 60.7s | 20.1s | 159.7s |
-| **Real-Time Factor** | **9.1x** | 12.1x | 4.0x | 31.9x |
-| **vs GPU** | **2.3x slower** | 3.0x slower | baseline | 7.9x slower |
+Model: `SongGeneration-base-new` with English prompt audio and structured lyrics.
 
-**Note:** LeLM AR includes 602 condition-prepend tokens processed on the first step via single-token decoding. A prefill model optimization would process these in one batch (~1s), reducing total to ~18s and achieving 1.1x faster than GPU.
+| Metric | Baseline (TP=1) | NxDI TP=2 | Speedup |
+|--------|----------------|-----------|---------|
+| **LeLM AR time** | **39.7s** | **19.4s** | **2.0x** |
+| **Diffusion + VAE** | **0.6s** | **0.6s** | 1.0x |
+| **Total E2E** | **40.3s** | **20.0s** | **2.0x** |
+| **Real-Time Factor** | **2.69x** | **1.33x** | -- |
+| **LeLM per-step** | **32.3ms** | **15.8ms** | **2.0x** |
+| **AR steps** | 1227 | 1227 | -- |
 
-### Benchmark Results (30s audio generation, with prefill optimization)
+Audio quality validated by human listening across 3 seeds per configuration. Both TP=1 and TP=2 produce clear English vocals with comparable quality.
 
-| Metric | Neuron (fp32 GPT2) | CPU |
-|--------|-------------------|-----|
-| **LeLM AR time** | **59.0s** | ~500s (est.) |
-| **Diffusion (10 steps)** | **1.47s** | ~23s (est.) |
-| **VAE decode** | **0.42s** | ~25s (est.) |
-| **Total E2E** | **60.9s** | ~550s (est.) |
-| **Real-Time Factor** | **2.03x** | ~18x |
+### Benchmark Results (5s audio generation, Chinese vocals)
 
-**With v1 conditioning fix + early EOS:** Total drops to ~42s (RTF 1.4x) because the model generates correct EOS tokens and stops early.
+Model: `songgeneration_base` (Chinese-only) with Chinese prompt audio.
 
-### Per-Step Latency (decode phase)
+| Metric | Baseline (TP=1) | NxDI TP=2 |
+|--------|----------------|-----------|
+| **LeLM AR time** | **24.0s** | **12.1s** |
+| **Total E2E** | **24.2s** | **12.3s** |
+| **Real-Time Factor** | **4.84x** | **2.46x** |
 
-| Component | On-Device KV | PCIe KV | Speedup |
-|-----------|-------------|---------|---------|
-| Primary (28L) step | 28.0ms | 94.5ms | 3.4x |
-| Fused Secondary (12L) step | 13.7ms | 39.1ms | 2.9x |
-| Combined LeLM step | 41.7ms | 133.6ms | 3.2x |
-| GPT2 diffusion step (fp32) | 14.5ms | 7.8ms | 0.5x (fp32 required) |
-| VAE decode (full) | 71.5ms | 71.5ms | 1.0x |
+### Per-Step Latency
+
+| Component | TP=1 (baseline) | TP=2 (NxDI) | Speedup |
+|-----------|-----------------|--------------|---------|
+| Primary (28L) step | ~20ms | ~10ms | 2.0x |
+| Fused Secondary (12L) step | ~12ms | ~6ms | 2.0x |
+| Combined LeLM step | ~32ms | ~16ms | 2.0x |
 
 ## Usage
 
 ### Prerequisites
 
-1. Clone the SongGeneration repository to the instance:
+1. Clone the SongGeneration repository:
    ```bash
-   git clone https://huggingface.co/tencent/SongGeneration /mnt/models/songgeneration
+   git clone https://github.com/tencent-ailab/songgeneration.git /mnt/models/songgeneration/codeclm_repo
+   cp -r /mnt/models/songgeneration/codeclm_repo/codeclm /mnt/models/songgeneration/
    ```
 
-2. Download model weights:
+2. Download model weights (English-capable):
    ```bash
-   # Main checkpoint (11 GB)
-   huggingface-cli download tencent/SongGeneration --local-dir /mnt/models/ckpt/songgeneration_base
+   pip install huggingface_hub
+   python -c "
+   from huggingface_hub import snapshot_download
+   # English + Chinese model
+   snapshot_download('lglg666/SongGeneration-base-new',
+                     local_dir='/mnt/models/ckpt/songgeneration_base_new',
+                     ignore_patterns=['*.md'])
+   # Shared assets (diffusion, VAE, tokenizer, prompts)
+   snapshot_download('tencent/SongGeneration',
+                     local_dir='/mnt/models/ckpt/songgeneration_base',
+                     ignore_patterns=['*.md'])
+   "
    ```
 
-3. Activate Neuron environment:
+3. Pull language-aware prompt audio (requires git-lfs):
+   ```bash
+   cd /mnt/models/songgeneration/codeclm_repo
+   git lfs pull --include='tools/new_auto_prompt.pt'
+   ```
+
+4. Set up symlinks and paths:
+   ```bash
+   cd /mnt/models/songgeneration
+   ln -sf /mnt/models/ckpt/songgeneration_base/third_party third_party
+   ln -sf /mnt/models/ckpt/songgeneration_base/ckpt ckpt
+   mkdir -p conf && cp codeclm_repo/conf/vocab.yaml conf/vocab.yaml
+   ```
+
+5. Activate Neuron environment and install dependencies:
    ```bash
    source /opt/aws_neuronx_venv_pytorch_inference_vllm_0_13/bin/activate
+   pip install accelerate flashy alias-free-torch descript-audio-codec \
+       k-diffusion vector-quantize-pytorch einops-exts x-transformers \
+       diffusers==0.37.0 peft==0.18.0 lightning openunmix
+   pip install protobuf==5.29.3  # Must be after descript-audio-codec
    export PYTHONPATH="$(pwd)/codeclm/tokenizer/:$(pwd):$(pwd)/codeclm/tokenizer/Flow1dVAE/:$PYTHONPATH"
    ```
 
-### Compile and Generate
+6. Apply patches (required on each new instance):
+   ```bash
+   # SequenceSummary stub
+   UTILS_FILE=$(python3 -c "import transformers.modeling_utils; print(transformers.modeling_utils.__file__)")
+   echo '
+   class SequenceSummary:
+       pass' >> "$UTILS_FILE"
+
+   # Flash attention import fix
+   find codeclm/ -name "*.py" -exec sed -i "s/is_flash_attn_available/is_flash_attn_2_available/g" {} +
+
+   # Remove transformers version assertion
+   sed -i "/assert.*transformers.*version/d" codeclm/models/levo.py
+   ```
+
+### Compile and Generate (Baseline TP=1)
 
 ```python
 from modeling_songgeneration import SongGenerationNeuron, SongGenerationConfig
+import torch
 
 config = SongGenerationConfig(
-    model_path="/mnt/models/ckpt/songgeneration_base/model.pt",
-    config_path="/mnt/models/ckpt/songgeneration_base/config.yaml",
+    model_path="/mnt/models/ckpt/songgeneration_base_new/model.pt",
+    config_path="/mnt/models/ckpt/songgeneration_base_new/config.yaml",
     safetensors_path="/mnt/models/songgeneration/ckpt/model_septoken/model_2.safetensors",
-    prompt_path="/mnt/models/songgeneration/ckpt/prompt.pt",
+    prompt_path="/mnt/models/songgeneration/ckpt/prompt.pt",  # placeholder, overridden below
+    default_duration_sec=15.0,
 )
 
-# Compile (first time, ~15-20 min)
 pipeline = SongGenerationNeuron(config)
-pipeline.compile()
-pipeline.save("/mnt/models/songgeneration/compiled")
+pipeline.compile()  # ~20 min first time
 
-# Load pre-compiled (subsequent runs, ~3 min)
-pipeline = SongGenerationNeuron(config)
-pipeline.load("/mnt/models/songgeneration/compiled")
+# Load English prompt audio
+auto_prompt = torch.load(
+    '/mnt/models/songgeneration/codeclm_repo/tools/new_auto_prompt.pt',
+    map_location='cpu', weights_only=False
+)
+pipeline._prompt_data = {g: auto_prompt[g]['en'] for g in auto_prompt if 'en' in auto_prompt[g]}
+
 pipeline.warmup()
 
-# Generate
-audio, sample_rate = pipeline.generate(
-    "A cheerful pop song with catchy melody",
-    genre="Pop",
-    duration_sec=5.0,
+# Generate with English lyrics
+lyrics = (
+    "[intro-short] ; "
+    "[verse] Sunlight breaks through morning haze."
+    "Golden fields stretch far away ; "
+    "[chorus] Sing along.Let the music carry you home ; "
+    "[outro-short]"
 )
+audio, sr = pipeline.generate(lyrics, genre="Pop", duration_sec=15.0)
 
 # Save as WAV
-import scipy.io.wavfile
-import numpy as np
-audio_np = audio.squeeze(0).float().cpu().numpy().T
-audio_np = np.clip(audio_np, -1.0, 1.0)
-audio_int16 = (audio_np * 32767).astype(np.int16)
-scipy.io.wavfile.write("output.wav", sample_rate, audio_int16)
+import scipy.io.wavfile, numpy as np
+audio_np = audio.squeeze(0).float().cpu().numpy()
+if audio_np.ndim > 1:
+    audio_np = audio_np.mean(axis=0)
+peak = max(abs(audio_np.max()), abs(audio_np.min()), 1e-10)
+audio_int16 = (audio_np / peak * 32767).astype(np.int16)
+scipy.io.wavfile.write("output.wav", sr, audio_int16)
 ```
 
-### Command Line
-
-```bash
-python src/modeling_songgeneration.py \
-    --text "A gentle piano ballad with soft strings" \
-    --genre Pop \
-    --duration-sec 5.0 \
-    --output-wav output.wav
-```
-
-### With Lyrics
-
-```bash
-python src/modeling_songgeneration.py \
-    --lyrics "[intro-short] ; [verse] Walking through the city lights.Feeling like everything is right ; [chorus] We are alive tonight.Hearts on fire burning bright ; [outro-short]" \
-    --description "pop, uplifting, piano, acoustic guitar, drums, male vocals" \
-    --genre Pop \
-    --duration-sec 30.0 \
-    --output-wav output_lyrics.wav
-```
-
-### Timing Breakdown
+### Generate with NxDI TP=2 (2x faster)
 
 ```python
-result = pipeline.generate_timed(
-    "An upbeat dance track",
-    genre="Pop",
-    duration_sec=5.0,
+from modeling_songgeneration import SongGenerationNeuron, SongGenerationConfig
+from hybrid_benchmark import compile_hybrid
+import torch
+
+config = SongGenerationConfig(
+    model_path="/mnt/models/ckpt/songgeneration_base_new/model.pt",
+    config_path="/mnt/models/ckpt/songgeneration_base_new/config.yaml",
+    safetensors_path="/mnt/models/songgeneration/ckpt/model_septoken/model_2.safetensors",
+    prompt_path="/mnt/models/songgeneration/ckpt/prompt.pt",
+    default_duration_sec=15.0,
 )
-print(f"LeLM:      {result['timings']['lelm_s']:.1f}s")
-print(f"Diffusion: {result['timings']['diffusion_s']:.3f}s")
-print(f"VAE:       {result['timings']['vae_s']:.3f}s")
-print(f"Total:     {result['timings']['total_s']:.1f}s")
+
+pipeline = SongGenerationNeuron(config)
+compile_hybrid(pipeline, "full-nxdi")  # ~25 min, uses TP=2
+
+# Load English prompts
+auto_prompt = torch.load(
+    '/mnt/models/songgeneration/codeclm_repo/tools/new_auto_prompt.pt',
+    map_location='cpu', weights_only=False
+)
+pipeline._prompt_data = {g: auto_prompt[g]['en'] for g in auto_prompt if 'en' in auto_prompt[g]}
+
+pipeline.warmup()
+
+result = pipeline.generate_timed(lyrics, genre="Pop", duration_sec=15.0)
+print(f"Total: {result['timings']['total_s']:.1f}s")  # ~20s for 15s audio
 ```
+
+### Lyrics Format
+
+The model expects structured lyrics with section tags separated by ` ; ` and lines separated by `.`:
+
+```
+[intro-short] ; [verse] First line of verse.Second line of verse ; [chorus] Chorus line one.Chorus line two ; [outro-short]
+```
+
+**Structure tags:** `[verse]`, `[chorus]`, `[bridge]`, `[intro-short/medium/long]`, `[outro-short/medium/long]`, `[inst-short/medium/long]`, `[silence]`
+
+**Language:** The model generates vocals in the language of the lyrics. Use English lyrics for English vocals, Chinese for Chinese. The prompt audio language should match (use `new_auto_prompt.pt` with `['en']` or `['zh']` key).
 
 ## Compatibility Matrix
 
 | Instance | SDK 2.28 | SDK 2.27 |
 |----------|----------|----------|
-| trn2.3xlarge (LNC=2) | VALIDATED | Not tested |
+| trn2.3xlarge (LNC=2, TP=1) | VALIDATED | Not tested |
+| trn2.3xlarge (LNC=2, TP=2) | VALIDATED | Not tested |
 | trn2.48xlarge | Not tested | Not tested |
-| inf2.xlarge | Not tested | Not tested |
 
 ## Example Checkpoints
 
-* [tencent/SongGeneration](https://huggingface.co/tencent/SongGeneration)
+* [lglg666/SongGeneration-base-new](https://huggingface.co/lglg666/SongGeneration-base-new) (English + Chinese, recommended)
+* [tencent/SongGeneration](https://huggingface.co/tencent/SongGeneration) (Chinese-only base + shared assets)
 
 ## Testing Instructions
 
@@ -199,13 +268,13 @@ cd /mnt/models/songgeneration
 
 # Set paths
 export PYTHONPATH="$(pwd)/codeclm/tokenizer/:$(pwd):$(pwd)/codeclm/tokenizer/Flow1dVAE/:$PYTHONPATH"
-export SONGGEN_MODEL_PATH=/mnt/models/ckpt/songgeneration_base/model.pt
-export SONGGEN_CONFIG_PATH=/mnt/models/ckpt/songgeneration_base/config.yaml
+export SONGGEN_MODEL_PATH=/mnt/models/ckpt/songgeneration_base_new/model.pt
+export SONGGEN_CONFIG_PATH=/mnt/models/ckpt/songgeneration_base_new/config.yaml
 export SONGGEN_SAFETENSORS_PATH=/mnt/models/songgeneration/ckpt/model_septoken/model_2.safetensors
-export SONGGEN_PROMPT_PATH=/mnt/models/songgeneration/ckpt/prompt.pt
+export SONGGEN_PROMPT_PATH=/mnt/models/songgeneration/codeclm_repo/tools/new_auto_prompt.pt
 
 # Run tests (compile from scratch, ~30 min):
-pytest contrib/models/SongGeneration/test/integration/test_model.py -v --timeout=1800
+pytest contrib/models/SongGeneration/test/integration/test_model.py -v --timeout=3600
 
 # Or run standalone:
 python contrib/models/SongGeneration/test/integration/test_model.py
@@ -213,19 +282,19 @@ python contrib/models/SongGeneration/test/integration/test_model.py
 
 ## Known Issues
 
-1. **GPT2 diffusion MUST use `--auto-cast none`:** The iterative Euler solver (10 steps) amplifies per-step numerical errors exponentially. With `--auto-cast matmult`, the GPT2 NEFF has only 0.64 cosine similarity with CPU -- after 10 iterations this produces completely garbled audio. With `--auto-cast none`, cosine similarity is 1.0004 and audio quality is correct. This adds ~50% to per-step GPT2 latency (14.5ms vs 7.8ms) but the total impact on E2E is small (~0.5s extra for 30s audio).
+1. **GPT2 diffusion MUST use `--auto-cast none`:** The iterative Euler solver (10 steps) amplifies per-step numerical errors exponentially. With `--auto-cast matmult`, the GPT2 NEFF has only 0.64 cosine similarity with CPU -- after 10 iterations this produces completely garbled audio. With `--auto-cast none`, cosine similarity is 1.0004 and audio quality is correct.
 
-2. **torchaudio WAV saving:** The Neuron DLAMI's torchaudio may lack codec support for WAV saving. Use `scipy.io.wavfile` instead (included in the pipeline).
+2. **Language-aware prompt audio is essential:** Using the old `prompt.pt` (Chinese-only) with English lyrics produces Chinese vocals regardless of lyric language. Always use `new_auto_prompt.pt` with the correct language key.
 
-2. **First-run library rehydration:** The first import of torch-neuronx/transformers on a fresh DLAMI instance can take 2-5 minutes due to lazy package decompression. This is normal.
+3. **Duration affects compilation:** The GPT2 and VAE components are traced at a fixed frame count (`T_frames = duration_sec * 25`). Changing duration requires recompilation. The LeLM models support variable lengths up to `max_seq_len`.
 
-3. **transformers version:** The upstream codeclm codebase has an assertion requiring `transformers < 4.40`. This assertion is patched out in the loading code (line 99 of `codeclm/models/levo.py`).
+4. **torchaudio WAV saving:** The Neuron DLAMI's torchaudio may lack codec support for WAV saving. Use `scipy.io.wavfile` instead.
 
-4. **CUDA patching:** The upstream codebase assumes CUDA availability. All CUDA calls are redirected to CPU at import time. This patch is applied automatically by the pipeline.
+5. **First-run library rehydration:** The first import of torch-neuronx/transformers on a fresh DLAMI instance can take 2-5 minutes due to lazy package decompression.
 
-5. **Compilation time:** Full compilation (LeLM + GPT2 + VAE) takes ~15-20 minutes. Use `save()`/`load()` to avoid recompilation.
+6. **NxDI TP=2 requires LNC=2:** The `NxDParallelState(world_size=2)` compiles NEFFs with Logical Core Size 2. The instance must be configured with `NEURON_LOGICAL_NC_CONFIG=2` (the default on trn2.3xlarge).
 
-6. **Duration flexibility:** The GPT2 and VAE components are traced at a fixed frame count. To generate audio of a different duration, recompilation is required. The LeLM models (on-device KV) support variable lengths up to `max_seq_len`.
+7. **Compilation not cached across sessions:** ModelBuilder does not persist compiled NEFFs between Python sessions. Each run recompiles (~20 min for TP=1, ~25 min for TP=2). Use `save()`/`load()` for the baseline pipeline to avoid recompilation.
 
 ## Maintainer
 
