@@ -56,10 +56,7 @@ This yields ~30% speedup over sequential CFG.
 
 | | g5.2xlarge (A10G) | trn2.3xlarge |
 |---|:---:|:---:|
-| Hourly cost | $2.06 | $2.24 |
 | Top-1 images/hr | 1,263 | 4,091 |
-| Cost per 1k images | $1.63 | **$0.55** |
-| **Cost ratio** | baseline | **2.97x cheaper** |
 
 ### Component Accuracy (Neuron vs CPU reference)
 
