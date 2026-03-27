@@ -165,7 +165,7 @@ class Qwen2_5_VLInferenceConfig(ImageToTextInferenceConfig):
         for unsupported in [
             "sequence_parallel_enabled",
             "flash_decoding_enabled",
-            "qkv_kernel_enabled",
+            "qkv_kernel_enabled",  # Fused RMSNorm+QKV fails: eps type mismatch with vision RMSNorm
             "attn_block_tkg_nki_kernel_cache_update",
             "attn_block_tkg_nki_kernel_enabled",
         ]:

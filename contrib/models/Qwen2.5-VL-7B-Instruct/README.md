@@ -50,27 +50,43 @@ Full vision-language implementation of Qwen2.5-VL-7B-Instruct on NeuronX Distrib
 | VL Generation | PASS | Correctly identifies shapes/colors in synthetic images |
 | Multi-resolution VL | PASS | 224x224, 448x448, 672x672, 640x480 all working |
 | vllm-neuron API | PASS | 6/6 OpenAI-compatible API tests passed |
+| Multi-bucket CTE | PASS | 7/7 tests pass with optimized bucketing config |
 
-### Performance Metrics (TP=4, trn2.3xlarge)
+### Performance Metrics (TP=4, trn2.3xlarge, optimized config)
+
+Configuration: Multi-bucket CTE [512, 1024, 2048, 4096], vision flash attention enabled.
 
 | Metric | Text-only | Vision-Language |
 |--------|-----------|-----------------|
-| TTFT (P50) | 182.8 ms | 215.3 ms |
 | Token Generation | 86.4 tok/s | 86.7 tok/s |
 | TPOT | 11.57 ms | 11.57 ms |
 | HBM per Core | 4.2 GB | 4.2 GB |
-| Compile Time | 71.3 s | 71.3 s (text) + 32.3 s (vision) |
+| Compile Time | 81.6 s (5 NEFFs) | 81.6 s (text) + ~30 s (vision) |
 | Model Load Time | 12-14 s | 12-14 s |
+
+### TTFT by Input Length (Multi-bucket CTE)
+
+| Input Tokens | CTE Bucket Used | TTFT (P50) |
+|-------------|-----------------|------------|
+| ~115 | 512 | **38.2 ms** |
+| ~484 | 512 | **38.3 ms** |
+| ~943 | 1024 | **57.6 ms** |
+| ~1861 | 2048 | **95.0 ms** |
+| ~3175 | 4096 | **182.8 ms** |
+
+Multi-bucket CTE provides **4.8x TTFT improvement** for short inputs vs single-bucket (38 ms vs 183 ms).
 
 ### Comparison with Qwen3-VL-8B (TP=4, trn2.3xlarge)
 
 | Metric | Qwen2.5-VL-7B | Qwen3-VL-8B | Difference |
 |--------|---------------|-------------|------------|
 | TKG throughput | 86.4 tok/s | 76.8 tok/s | **+12.5%** |
-| TTFT | 182.8 ms | ~200 ms | ~9% faster |
+| TTFT (short input) | 38.2 ms | ~200 ms | **~5x faster** |
 | HBM per core | 4.2 GB | ~5 GB | 19% smaller |
 
 ### NKI Kernel Compatibility
+
+**Text decoder:**
 
 | Kernel | Status | Notes |
 |--------|--------|-------|
@@ -80,6 +96,13 @@ Full vision-language implementation of Qwen2.5-VL-7B-Instruct on NeuronX Distrib
 | `mlp_kernel_enabled` | FAIL | SBUF OOM: intermediate_size/TP = 4736 > 4096 |
 | `attn_tkg_builtin_kernel_enabled` | FAIL | M-RoPE 3D rotary incompatible |
 | `out_proj_kernel_enabled` | FAIL | hidden_size=3584 not divisible by 1024 |
+
+**Vision encoder:**
+
+| Kernel | Status | Notes |
+|--------|--------|-------|
+| `attn_kernel_enabled` | PASS | Flash attention for bidirectional vision |
+| `qkv_kernel_enabled` | FAIL | Fused RMSNorm+QKV: eps type mismatch with vision RMSNorm |
 
 ## Usage
 
@@ -109,12 +132,16 @@ text_neuron_config = NeuronConfig(
     attn_kernel_enabled=True, attn_tkg_nki_kernel_enabled=True,
     logical_neuron_cores=2, cc_pipeline_tiling_factor=2,
     cast_type="as-declared", save_sharded_checkpoint=True,
+    enable_bucketing=True,  # Multi-bucket CTE for TTFT optimization
+    context_encoding_buckets=[512, 1024, 2048, 4096],  # Min 512 for TKG NKI compat
+    token_generation_buckets=[4096],  # Single TKG bucket at full seq_len
 )
 vision_neuron_config = NeuronConfig(
     batch_size=1, seq_len=4096,
     tp_degree=4, world_size=4,
     torch_dtype=torch.bfloat16,
     fused_qkv=True, enable_bucketing=True, buckets=[2],
+    attn_kernel_enabled=True,  # Flash attention for bidirectional vision
     logical_neuron_cores=2, cc_pipeline_tiling_factor=2,
     cast_type="as-declared", save_sharded_checkpoint=True,
 )
@@ -190,7 +217,7 @@ Note: vllm-neuron requires 4 additional file patches (constants.py, model_loader
 
 | Instance Type | TP=4 | TP=2 | TP=8 |
 |--------------|------|------|------|
-| trn2.3xlarge (LNC=2) | **Validated** (86.4 tok/s) | Validated (28.1 tok/s) | N/A (requires LNC=1) |
+| trn2.3xlarge (LNC=2) | **Validated** (86.4 tok/s, 38ms TTFT) | Validated (28.1 tok/s) | N/A (requires LNC=1) |
 | trn2.48xlarge | Expected working | Expected working | Expected working (LNC=1) |
 | trn1.32xlarge | Not tested | Not tested | Not tested |
 
@@ -232,13 +259,15 @@ pytest test/integration/test_model.py::test_logit_validation -v
 
 ## Known Limitations
 
-1. **Batch size > 1** requires the Chandra batch>1 VLM fix (3 patches to NxDI `image_to_text_model_wrapper.py`). Without it, batch>1 crashes.
+1. **Batch size > 1** requires the VLM batch>1 fix from branch [`fix/qwen3-vl-batch-size-gt1-v2`](https://github.com/jimburtoft/neuronx-distributed-inference/tree/fix/qwen3-vl-batch-size-gt1-v2) (3 patches to NxDI `image_to_text_model_wrapper.py`). Without it, batch>1 crashes.
 2. **MLP kernel** is not compatible (intermediate_size/TP = 4736 exceeds SBUF threshold ~4096).
 3. **Builtin TKG kernel** is not compatible with M-RoPE 3D rotary embeddings.
-4. **Video input** is not tested (the model architecturally supports it via temporal patches).
+4. **Vision qkv_kernel** is not compatible (fused RMSNorm+QKV ISA kernel fails with vision encoder's RMSNorm epsilon type).
+5. **Multi-bucket CTE minimum bucket**: Must be >= 512. Auto-generated small buckets (e.g., 128) cause TKG NKI kernel assertion failure (`sharded_S_ctx % 128 == 0` with LNC=2). Always set `context_encoding_buckets` explicitly.
+6. **Video input** is not tested (the model architecturally supports it via temporal patches).
 
 ## Maintainer
 
-Community contribution
+Jim Burtoft, AWS
 
 **Last Updated:** 2026-03-27

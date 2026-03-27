@@ -84,6 +84,14 @@ def model_and_adapter():
         cc_pipeline_tiling_factor=2,
         on_device_sampling_config=None,
         cast_type="as-declared",
+        enable_bucketing=True,  # Multi-bucket CTE for TTFT optimization
+        context_encoding_buckets=[
+            512,
+            1024,
+            2048,
+            4096,
+        ],  # Min 512 for TKG NKI kernel compat
+        token_generation_buckets=[4096],  # Single TKG bucket at full seq_len
     )
 
     vision_neuron_config = NeuronConfig(
@@ -94,9 +102,9 @@ def model_and_adapter():
         save_sharded_checkpoint=True,
         torch_dtype=torch.bfloat16,
         fused_qkv=True,
-        attn_kernel_enabled=False,
+        attn_kernel_enabled=True,  # Flash attention for bidirectional vision
         mlp_kernel_enabled=False,
-        qkv_kernel_enabled=False,
+        qkv_kernel_enabled=False,  # Fused RMSNorm+QKV fails with vision RMSNorm eps type
         cc_pipeline_tiling_factor=2,
         cast_type="as-declared",
         logical_neuron_cores=2,
