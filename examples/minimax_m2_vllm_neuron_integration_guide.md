@@ -352,7 +352,76 @@ python3 -m vllm.entrypoints.openai.api_server \
 
 > **注意**: 首次启动需要编译，编译时间约 22 分钟。编译产物会缓存到模型目录下的 `neuron-compiled-artifacts/`，后续启动将跳过编译。权重预分片（`save_sharded_checkpoint: true`）约需 20 分钟，峰值内存约 1.2TB。
 
-### 5.2 关键配置参数说明
+### 5.2 优化版启动命令（高吞吐，已验证）
+
+参考 Qwen3 MoE 优化参数，启用 continuous batching + NKI kernel 优化。
+以下所有优化参数已于 2026-03-27 在 trn2.48xlarge 上逐一测试验证输出正确性。
+
+```bash
+python3 -m vllm.entrypoints.openai.api_server \
+    --model "/opt/dlami/nvme/model_hf/MiniMax-M2-BF16" \
+    --tokenizer "/opt/dlami/nvme/model_hf/MiniMax-M2-BF16" \
+    --tensor-parallel-size 64 \
+    --max-model-len 512 \
+    --max-num-seqs 32 \
+    --no-enable-chunked-prefill \
+    --no-enable-prefix-caching \
+    --port 8000 \
+    --trust-remote-code \
+    --additional-config '{
+        "override_neuron_config": {
+            "sequence_parallel_enabled": true,
+            "logical_nc_config": 2,
+            "fused_qkv": true,
+            "is_continuous_batching": true,
+            "batch_size": 32,
+            "ctx_batch_size": 1,
+            "tkg_batch_size": 32,
+            "async_mode": true,
+            "flash_decoding_enabled": false,
+            "enable_bucketing": true,
+            "context_encoding_buckets": [256],
+            "token_generation_buckets": [512],
+            "use_index_calc_kernel": true,
+            "moe_mask_padded_tokens": true,
+            "qkv_kernel_enabled": true,
+            "qkv_nki_kernel_enabled": true,
+            "qkv_cte_nki_kernel_fuse_rope": true,
+            "attn_kernel_enabled": true,
+            "strided_context_parallel_kernel_enabled": false,
+            "router_config": {
+                "act_fn": "sigmoid",
+                "dtype": "float32"
+            },
+            "glu_mlp": true,
+            "save_sharded_checkpoint": true,
+            "blockwise_matmul_config": {
+                "use_shard_on_intermediate_dynamic_while": false,
+                "skip_dma_token": true
+            },
+            "disable_numeric_cc_token": true,
+            "scratchpad_page_size": 1024,
+            "moe_tp_degree": 64,
+            "moe_ep_degree": 1
+        }
+    }'
+```
+
+### 5.3 Qwen3 MoE 优化参数兼容性（已验证）
+
+| 参数 | 值 | 状态 | 备注 |
+|------|-----|------|------|
+| `async_mode` | true | ✅ 已验证 | |
+| `is_continuous_batching` | true | ✅ 已验证 | 需配合 batch_size=32 |
+| `qkv_kernel_enabled` | true | ✅ 已验证 | 需 fused_qkv=true |
+| `qkv_nki_kernel_enabled` | true | ✅ 已验证 | 需 qkv_kernel_enabled=true |
+| `qkv_cte_nki_kernel_fuse_rope` | true | ✅ 已验证 | partial RoPE (rotary_dim=64) 也正常 |
+| `attn_kernel_enabled` | true | ✅ 已验证 | |
+| `strided_context_parallel_kernel_enabled` | true | ❌ 不可用 | 需要 Context Parallelism，报错 "CP must also be enabled" |
+| `attention_dp_degree` | >1 | ❌ 不可用 | 模型未实现 |
+| `cp_degree` | >1 | ❌ 不可用 | 模型未实现 |
+
+### 5.4 关键配置参数说明
 
 | 参数 | 值 | 说明 |
 |------|-----|------|
@@ -360,10 +429,9 @@ python3 -m vllm.entrypoints.openai.api_server \
 | `logical_nc_config` | 2 | 64 TP 需要 logical NC 拆分 |
 | `glu_mlp` | true | MiniMax M2 使用 GLU MLP |
 | `router_config.act_fn` | "sigmoid" | MiniMax M2 使用 sigmoid |
-| `use_index_calc_kernel` | false | 避免 NKI int64 不兼容 |
-| `use_shard_on_intermediate_dynamic_while` | false | 避免 OOM |
+| `use_shard_on_intermediate_dynamic_while` | false | 避免 OOM（intermediate_size=1536 不能被 256 整除） |
 
-### 5.3 使用预编译模型
+### 5.5 使用预编译模型
 
 如果使用 `generation_minimax_m2_v4_demo.py` 预编译的模型：
 
@@ -444,25 +512,49 @@ curl http://localhost:8000/v1/completions \
 | 模型 | MiniMax-M2-BF16 (~434GB) |
 | TP | 64 (moe_tp_degree=64, moe_ep_degree=1) |
 | max_model_len | 512 |
-| max_num_seqs | 1 |
 | 日期 | 2026-03-27 |
 
 ### 7.2 性能结果
+
+**配置 A: 低延迟（单请求）**
+- `is_continuous_batching=false, max_num_seqs=1, async_mode=false`
 
 | 指标 | 值 |
 |------|-----|
 | 单请求吞吐 (BS=1, 256 output tokens) | **62.24 tok/s** |
 
-> **注意**: 当前配置为 `is_continuous_batching=false, max_num_seqs=1`，仅支持单请求。
-> 如需更高吞吐，可启用 continuous batching 并增大 batch_size，但需要重新编译。
+**配置 B: 高吞吐（Continuous Batching + 全优化）**
+- `is_continuous_batching=true, batch_size=32, async_mode=true`
+- `qkv_kernel_enabled=true, qkv_nki_kernel_enabled=true, qkv_cte_nki_kernel_fuse_rope=true, attn_kernel_enabled=true`
+
+| 并发数 | 吞吐量 (tok/s) | 单请求平均延迟 (256 tokens) |
+|----|----|----|
+| BS=1 | 3.06 | 83.78s |
+| BS=8 | 22.85 | 89.65s |
+| BS=32 | **75.35** | 108.72s |
+
+**配置 C: Continuous Batching 无 kernel 优化**（对照组）
+- `is_continuous_batching=true, batch_size=32, async_mode=true`
+- `qkv_kernel_enabled=false, attn_kernel_enabled=false`
+
+| 并发数 | 吞吐量 (tok/s) |
+|----|-----|
+| BS=1 | 2.98 |
+| BS=8 | 21.55 |
+| BS=32 | 73.28 |
+
+> **结论**:
+> - 单请求场景推荐配置 A（62 tok/s），CB 开启后单请求延迟大幅增加（因 token generation 按 BS=32 pad 运算）
+> - 高并发场景推荐配置 B（75 tok/s at BS=32），kernel 优化有约 3% 提升
+> - kernel 优化在长序列场景（>1024 tokens）预期有更大收益
 
 ### 7.3 编译和加载时间
 
-| 阶段 | 时间 |
-|------|------|
-| 编译（首次，-O1） | ~22 分钟 |
-| 权重预分片 (save_sharded_checkpoint=true) | ~20 分钟 |
-| 加载已编译模型 + 已分片权重 | ~5 分钟 |
+| 阶段 | 配置 A (baseline) | 配置 B (全优化) |
+|------|------|------|
+| 编译（首次） | ~22 分钟 | ~30 分钟（NKI kernel HLO 生成较慢） |
+| 权重预分片 (save_sharded_checkpoint=true) | ~20 分钟 | ~20 分钟 |
+| 加载已编译模型 + 已分片权重 | ~5 分钟 | ~5 分钟 |
 
 ---
 

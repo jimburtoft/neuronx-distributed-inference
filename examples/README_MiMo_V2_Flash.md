@@ -341,6 +341,84 @@ curl http://localhost:8000/v1/chat/completions \
 
 **原理**: TP 需要将每个 expert 的权重切分到 64 个 rank 上（需要同时在内存中持有所有分片），而 EP 将完整的 expert 分配到不同 rank（256 experts / 64 ranks = 4 experts/rank），大幅降低分片阶段的内存占用。
 
+### Qwen3 MoE 优化参数兼容性（已验证）
+
+以下参数已于 2026-03-27 在 trn2.48xlarge 上测试验证。
+
+| 参数 | 值 | 状态 | 备注 |
+|------|-----|------|------|
+| `async_mode` | true | ✅ 已验证 | baseline 已启用 |
+| `is_continuous_batching` | true | ✅ 已验证 | baseline 已启用，需配合 batch_size=32 |
+| `attn_kernel_enabled` | true | ✅ 已验证 | 输出正确，可提升注意力计算效率 |
+| `qkv_kernel_enabled` | true | ❌ 不可用 | 需要 `fused_qkv=true`，但 MiMo Q/K head_dim=192, V head_dim=128，不能使用 fused QKV |
+| `qkv_nki_kernel_enabled` | true | ❌ 不可用 | 依赖 `qkv_kernel_enabled` |
+| `qkv_cte_nki_kernel_fuse_rope` | true | ❌ 不可用 | 依赖 `qkv_kernel_enabled` |
+| `strided_context_parallel_kernel_enabled` | true | ❌ 不可用 | 需要 Context Parallelism (CP degree > 1)，模型未实现 |
+
+> **注意**: MiMo-V2-Flash 使用非对称的 Q/K/V 维度（Q/K: head_dim=192, V: head_dim=128），因此不能使用 `fused_qkv=true`，
+> 这导致 QKV kernel 相关的三个优化都不可用。`attn_kernel_enabled` 是唯一可用的 kernel 优化。
+
+### 优化版启动命令（attn_kernel 启用）
+
+```bash
+python3 -m vllm.entrypoints.openai.api_server \
+    --model "/opt/dlami/nvme/models/MiMo-V2-Flash-BF16" \
+    --tokenizer "/opt/dlami/nvme/models/MiMo-V2-Flash-BF16" \
+    --tensor-parallel-size 64 \
+    --max-model-len 1024 \
+    --max-num-seqs 32 \
+    --no-enable-chunked-prefill \
+    --no-enable-prefix-caching \
+    --port 8000 \
+    --trust-remote-code \
+    --additional-config '{
+        "override_neuron_config": {
+            "tp_degree": 64,
+            "moe_tp_degree": 1,
+            "moe_ep_degree": 64,
+            "batch_size": 32,
+            "ctx_batch_size": 1,
+            "tkg_batch_size": 32,
+            "max_context_length": 1024,
+            "seq_len": 1024,
+            "is_continuous_batching": true,
+            "fused_qkv": false,
+            "on_device_sampling_config": {
+                "do_sample": true,
+                "temperature": 0.6,
+                "top_k": 20,
+                "top_p": 0.95
+            },
+            "enable_bucketing": true,
+            "context_encoding_buckets": [1024],
+            "token_generation_buckets": [1024],
+            "flash_decoding_enabled": false,
+            "logical_nc_config": 2,
+            "sequence_parallel_enabled": true,
+            "qkv_kernel_enabled": false,
+            "qkv_nki_kernel_enabled": false,
+            "qkv_cte_nki_kernel_fuse_rope": false,
+            "attn_kernel_enabled": true,
+            "strided_context_parallel_kernel_enabled": false,
+            "async_mode": true,
+            "glu_mlp": true,
+            "normalize_top_k_affinities": true,
+            "router_config": {
+                "act_fn": "sigmoid",
+                "dtype": "float32"
+            },
+            "use_index_calc_kernel": true,
+            "moe_mask_padded_tokens": true,
+            "blockwise_matmul_config": {
+                "use_shard_on_intermediate_dynamic_while": true,
+                "skip_dma_token": true
+            },
+            "disable_numeric_cc_token": true,
+            "scratchpad_page_size": 1024
+        }
+    }'
+```
+
 ## Benchmark 结果
 
 ### 测试环境
@@ -386,7 +464,7 @@ curl http://localhost:8000/v1/chat/completions \
 
 | Date | Changes |
 |------|---------|
-| 2026-03-27 | Added vLLM-Neuron deployment guide with EP=64 config and benchmark results |
+| 2026-03-27 | Added vLLM-Neuron deployment guide with EP=64 config, benchmark results, and Qwen3 MoE optimization compatibility table |
 | 2025-01-28 | Fixed attention_sink_bias missing in token generation path (was causing garbage output) |
 | 2025-01-21 | Simplified to BF16-only mode (native FP8 not supported due to scale format incompatibilities) |
 | 2025-01-20 | Implemented CONVERT_TO_MHA for TP=32 support |
