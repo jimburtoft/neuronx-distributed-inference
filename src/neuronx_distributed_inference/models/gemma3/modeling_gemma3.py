@@ -320,6 +320,14 @@ class NeuronGemma3Attention(NeuronAttentionBase):
         )
         self._needs_chunked_attn = head_dim > _MAX_UNCHUNKED_HEAD_DIM
 
+        # The base class forces k_cache_transposed=False for SWA layers
+        # (attention_base.py line 316).  However, the KV cache manager uses
+        # the NeuronConfig value for ALL layers, so the K cache is BHDS for
+        # every layer when k_cache_transposed=True.  We restore the config
+        # value here so that SWA layers correctly interpret the cache layout.
+        # Our compute_for_token_gen override handles the transposed repeat_kv.
+        self.k_cache_transposed = config.neuron_config.k_cache_transposed
+
     # ------------------------------------------------------------------
     # Overrides for chunked attention (head_dim > 128)
     # ------------------------------------------------------------------
@@ -469,16 +477,23 @@ class NeuronGemma3Attention(NeuronAttentionBase):
         # i. prior (cached) KV
         K_prior = past_key_value[0]
         V_prior = past_key_value[1]
-        K_prior = repeat_kv(K_prior, self.num_key_value_groups)
-        V_prior = repeat_kv(V_prior, self.num_key_value_groups)
-        if not self.k_cache_transposed:
-            # K_prior is BHSD — use standard chunked Q@K^T
-            prior_scores = _chunked_qk(Q, K_prior, scale=math.sqrt(self.head_dim))
-        else:
-            # K_prior is BHDS (already transposed)
+
+        if self.k_cache_transposed:
+            # K_prior is BHDS (B, H_kv, D, S) from the cache.  repeat_kv
+            # expects BHSD layout, so transpose before GQA expansion, then
+            # transpose back for the transposed matmul path.
+            K_prior = K_prior.transpose(2, 3)  # BHDS -> BHSD
+            K_prior = repeat_kv(K_prior, self.num_key_value_groups)  # expand KV heads
+            K_prior = K_prior.transpose(2, 3)  # BHSD -> BHDS
+            V_prior = repeat_kv(V_prior, self.num_key_value_groups)
             prior_scores = _chunked_qk_transposed(
                 Q, K_prior, scale=math.sqrt(self.head_dim)
             )
+        else:
+            # K_prior is BHSD — standard path
+            K_prior = repeat_kv(K_prior, self.num_key_value_groups)
+            V_prior = repeat_kv(V_prior, self.num_key_value_groups)
+            prior_scores = _chunked_qk(Q, K_prior, scale=math.sqrt(self.head_dim))
 
         # pad the attention mask if the KV cache is padded
         if (
