@@ -1,0 +1,5 @@
+input_len,concurrency,completed,errors,total_time_s,throughput_req_s,throughput_output_tok_s,throughput_total_tok_s,mean_latency_s,p50_latency_s,p99_latency_s,mean_ttft_s,p50_ttft_s,p99_ttft_s,mean_tpot_ms
+3700,4,4,0,64.8,0.062,18.5,18.5,64.79,64.79,64.79,1.021,1.183,1.511,216.0
+3700,8,8,0,66.1,0.121,36.3,36.3,66.09,66.09,66.09,1.663,1.829,2.804,220.3
+3700,16,16,0,68.7,0.233,69.8,69.8,68.72,68.72,68.73,2.969,3.136,5.416,229.1
+3700,32,32,0,73.9,0.433,130.0,130.0,73.84,73.84,73.86,5.539,5.699,10.594,246.1

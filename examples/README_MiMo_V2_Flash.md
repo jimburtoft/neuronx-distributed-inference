@@ -353,10 +353,35 @@ curl http://localhost:8000/v1/chat/completions \
 | `qkv_kernel_enabled` | true | ❌ 不可用 | 需要 `fused_qkv=true`，但 MiMo Q/K head_dim=192, V head_dim=128，不能使用 fused QKV |
 | `qkv_nki_kernel_enabled` | true | ❌ 不可用 | 依赖 `qkv_kernel_enabled` |
 | `qkv_cte_nki_kernel_fuse_rope` | true | ❌ 不可用 | 依赖 `qkv_kernel_enabled` |
-| `strided_context_parallel_kernel_enabled` | true | ❌ 不可用 | 需要 Context Parallelism (CP degree > 1)，模型未实现 |
+| `strided_context_parallel_kernel_enabled` | true | ❌ 不可用 | 需要 strided CP NKI kernel，MiMo 的 attention_sink_bias 机制不兼容 |
+| `cp_degree` | >1 | ✅ 已实现 | Context Parallelism 支持已添加，可加速长序列 context encoding |
 
 > **注意**: MiMo-V2-Flash 使用非对称的 Q/K/V 维度（Q/K: head_dim=192, V: head_dim=128），因此不能使用 `fused_qkv=true`，
 > 这导致 QKV kernel 相关的三个优化都不可用。`attn_kernel_enabled` 是唯一可用的 kernel 优化。
+
+### Context Parallelism (CP) 支持
+
+MiMo-V2-Flash 的注意力模块已支持 Context Parallelism，可将序列维度分布到多个 CP rank 上并行计算，
+显著加速长序列的 context encoding 阶段。
+
+**实现原理**:
+- CP 仅在 context encoding 阶段生效（token generation 不受影响）
+- 每个 CP rank 处理 Q 的局部片段（S/CP），但使用完整的 K/V 计算注意力
+- 支持 `sequence_parallel_enabled=True`（推荐）和 `sequence_parallel_enabled=False` 两种模式
+- 与 MiMo 特有的 attention_sink_bias、partial RoPE、hybrid attention (Full+SWA) 完全兼容
+
+**配置方法** (在 `override_neuron_config` 中添加):
+```json
+{
+    "cp_degree": 2,
+    "sequence_parallel_enabled": true
+}
+```
+
+**约束条件**:
+- `tp_degree` 必须能被 `cp_degree` 整除
+- `strided_context_parallel_kernel_enabled` 不可用（MiMo 使用自定义注意力而非 NKI flash attention kernel）
+- CP 不影响 token generation 性能，仅加速 context encoding
 
 ### 优化版启动命令（attn_kernel 启用）
 
@@ -464,6 +489,7 @@ python3 -m vllm.entrypoints.openai.api_server \
 
 | Date | Changes |
 |------|---------|
+| 2026-03-27 | Added Context Parallelism (CP) support to attention module for long-sequence acceleration |
 | 2026-03-27 | Added vLLM-Neuron deployment guide with EP=64 config, benchmark results, and Qwen3 MoE optimization compatibility table |
 | 2025-01-28 | Fixed attention_sink_bias missing in token generation path (was causing garbage output) |
 | 2025-01-21 | Simplified to BF16-only mode (native FP8 not supported due to scale format incompatibilities) |

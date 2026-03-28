@@ -24,8 +24,17 @@ from neuronx_distributed.parallel_layers.layers import (
 )
 from neuronx_distributed.parallel_layers.mappings import (
     gather_from_sequence_parallel_region,
+    gather_from_tensor_model_parallel_region_with_dim,
 )
 from neuronx_distributed.utils import cpu_mode
+
+from neuronx_distributed_inference.utils.distributed import (
+    split_along_dim,
+    get_cp_rank,
+)
+from neuronx_distributed_inference.modules.attention.attention_process_groups import (
+    get_context_parallel_attention_cp_group,
+)
 
 from neuronx_distributed_inference.models.config import (
     InferenceConfig,
@@ -311,6 +320,9 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
         )
 
         # Initialize base attention
+        # NOTE: We pass v_head_dim to base class, but MiMo uses asymmetric Q/K (192) vs V (128).
+        # We override init_gqa_properties() to prevent the base class from creating
+        # incompatible projection layers (which cause crashes when CP > 1).
         super().__init__(
             config=config,
             hidden_size=config.hidden_size,
@@ -322,7 +334,7 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
             use_qk_norm=False,
         )
 
-        # Override projections with correct dimensions
+        # Initialize MiMo-specific projections with correct dimensions
         self._init_projections(config)
 
         # Scaling factor
@@ -348,6 +360,18 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
                 getattr(config, 'swa_num_key_value_heads', config.num_key_value_heads)
             )
             self.local_cache_kv_heads = max(1, self.cache_num_kv_heads // tp_degree)
+
+    def init_gqa_properties(self):
+        """Override base class to prevent creating incompatible QKV projections.
+
+        MiMo-V2-Flash has asymmetric Q/K head_dim (192) vs V head_dim (128),
+        which is incompatible with the base class's GroupQueryAttention_QKV.
+        MiMo uses its own custom projections via _init_projections() instead.
+
+        When CP > 1, the base class would create cte_qkv_proj/tkg_qkv_proj with
+        wrong head_dim=128, causing compilation crashes. This no-op prevents that.
+        """
+        pass
 
     def _init_projections(self, config: MiMoV2InferenceConfig):
         """Initialize projection layers with correct dimensions.
@@ -494,7 +518,25 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
         sin_cache: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """Forward pass for MiMo-V2-Flash attention."""
+        """Forward pass for MiMo-V2-Flash attention with Context Parallelism support."""
+
+        # Context Parallelism: only active during context encoding (no past_key_value)
+        is_context_parallel = past_key_value is None and self.cp_degree > 1
+        cp_rank = None
+
+        if is_context_parallel:
+            cp_rank = get_cp_rank(
+                self.rank_util.get_rank(), self.tp_degree,
+                self.cp_degree, self.neuron_config.switch_cc,
+            )
+            # Split attention_mask (dim=2 = Q rows) and position_ids (dim=1 = seq)
+            attention_mask = split_along_dim(
+                attention_mask, dim=2, rank=cp_rank, num_partitions=self.cp_degree
+            )
+            # Keep full position_ids for RoPE computation on full-length K/V
+            local_position_ids = split_along_dim(
+                position_ids, dim=1, rank=cp_rank, num_partitions=self.cp_degree
+            )
 
         # Handle sequence parallel
         if self.sequence_parallel_enabled and parallel_state.model_parallel_is_initialized():
@@ -502,6 +544,12 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
                 hidden_states,
                 self.sequence_dimension,
                 process_group=parallel_state.get_tensor_model_parallel_group(),
+            )
+
+        # Context Parallelism without sequence parallel: split hidden_states
+        if is_context_parallel and not self.sequence_parallel_enabled:
+            hidden_states = split_along_dim(
+                hidden_states, dim=1, rank=cp_rank, num_partitions=self.cp_degree
             )
 
         bsz, q_len, _ = hidden_states.size()
@@ -531,22 +579,53 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
         # Full attention: rope_theta = 5000000
         # Sliding window: rope_theta = 10000
         # We cannot reuse cached cos/sin from other layers!
-        cos_cache, sin_cache = self.rotary_emb(value_states, position_ids)
+        #
+        # For CP with sequence_parallel: Q/K/V have full S, use full position_ids for RoPE.
+        # For CP without sequence_parallel: Q/K/V have S/CP, use local_position_ids for RoPE
+        # (local_position_ids contain the correct global positions for this CP rank).
+        if is_context_parallel and not self.sequence_parallel_enabled:
+            rope_position_ids = local_position_ids
+        else:
+            rope_position_ids = position_ids
+        cos_cache, sin_cache = self.rotary_emb(value_states, rope_position_ids)
 
         # Apply rotary position embedding to rope parts only
         query_rope, key_rope = apply_rotary_pos_emb(
-            query_rope, key_rope, cos_cache, sin_cache, position_ids
+            query_rope, key_rope, cos_cache, sin_cache, rope_position_ids
         )
 
         # Concatenate rope and non-rope parts
         query_states = torch.cat([query_rope, query_nope], dim=-1)
         key_states = torch.cat([key_rope, key_nope], dim=-1)
 
-        # Store key/value states BEFORE GQA repeat for KV cache
-        # With CONVERT_TO_MHA, the cache stores expanded heads (same as Q heads)
-        # Without CONVERT_TO_MHA, the cache stores original num_kv_heads
-        key_states_for_cache = key_states
-        value_states_for_cache = value_states
+        # Context Parallelism: split Q and save local KV for cache
+        if is_context_parallel:
+            if self.sequence_parallel_enabled:
+                # Q/K/V have full S. Split Q to local portion, save local KV for cache.
+                # Use split_along_dim (torch.index_select) instead of Python slicing
+                # because XLA tracing doesn't support dynamic tensor indices in slice notation.
+                query_states = split_along_dim(query_states, dim=2, rank=cp_rank, num_partitions=self.cp_degree)
+                key_states_for_cache = split_along_dim(key_states, dim=2, rank=cp_rank, num_partitions=self.cp_degree)
+                value_states_for_cache = split_along_dim(value_states, dim=2, rank=cp_rank, num_partitions=self.cp_degree)
+                q_len = q_len // self.cp_degree
+                # K/V stay at full S for attention computation
+            else:
+                # Q/K/V have S/CP. Save local KV for cache, then all-gather K/V.
+                key_states_for_cache = key_states
+                value_states_for_cache = value_states
+                key_states = gather_from_tensor_model_parallel_region_with_dim(
+                    key_states, gather_dim=2,
+                    process_group=get_context_parallel_attention_cp_group(),
+                )
+                value_states = gather_from_tensor_model_parallel_region_with_dim(
+                    value_states, gather_dim=2,
+                    process_group=get_context_parallel_attention_cp_group(),
+                )
+                # Q stays at S/CP
+        else:
+            # Store key/value states BEFORE GQA repeat for KV cache
+            key_states_for_cache = key_states
+            value_states_for_cache = value_states
 
         # WORKAROUND 1: Pad V from v_head_dim (128) to head_dim (192) for KV cache compatibility
         if self.attn_v_head_dim < self.attn_head_dim:
@@ -555,9 +634,6 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
 
         # WORKAROUND 2: Pad KV heads if layer has fewer than cache expects
         # Only needed when NOT using CONVERT_TO_MHA (standard GQA mode)
-        # Full attention has 4 KV heads (1 per rank), sliding window has 8 (2 per rank)
-        # Cache is sized for max (8 heads = 2 per rank)
-        # With CONVERT_TO_MHA, all layers have same num_kv_heads (=num_attention_heads)
         if not self.use_gqa_convert_to_mha and self.local_num_kv_heads < self.local_cache_kv_heads:
             # Pad KV heads by repeating
             repeat_factor = self.local_cache_kv_heads // self.local_num_kv_heads
@@ -653,11 +729,13 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
             attn_output = attn_prior + attn_active
         else:
             # Context encoding: standard attention
-            # Compute attention scores
+            # With CP: Q is local [B, H, S/CP, D], K/V are full [B, H, S, D]
+            # Without CP: Q/K/V all have same seq_len
             attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) * self.scaling
 
             # Apply attention mask (additive mask: 0 = attend, -inf = mask out)
             # The framework creates boolean masks, so we need to convert them
+            # With CP: attention_mask is already split to [B, 1, S/CP, S] (local Q rows, full K cols)
             if attention_mask is not None:
                 # Convert boolean mask to additive mask if needed
                 if attention_mask.dtype == torch.bool:
@@ -671,9 +749,14 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
 
             # Apply sliding window mask for SWA layers
             if self.is_sliding_window and self.sliding_window_size is not None:
-                seq_len = attn_weights.size(-1)
-                row_idx = torch.arange(seq_len, device=attn_weights.device).unsqueeze(1)
-                col_idx = torch.arange(seq_len, device=attn_weights.device).unsqueeze(0)
+                kv_seq_len = attn_weights.size(-1)
+                if is_context_parallel:
+                    # With CP: Q has local seq len, K has full seq len.
+                    # Use local_position_ids for correct global Q positions.
+                    row_idx = local_position_ids[0].unsqueeze(1).to(attn_weights.device)
+                else:
+                    row_idx = torch.arange(kv_seq_len, device=attn_weights.device).unsqueeze(1)
+                col_idx = torch.arange(kv_seq_len, device=attn_weights.device).unsqueeze(0)
                 # Causal: col <= row, and within window: col >= row - window_size + 1
                 sliding_mask = (col_idx <= row_idx) & (col_idx >= row_idx - self.sliding_window_size + 1)
                 sliding_mask = sliding_mask[None, None, :, :]
@@ -713,10 +796,21 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
         # Reshape and project output
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.local_num_heads * self.attn_v_head_dim)
+
+        # Context Parallelism: gather output across CP ranks BEFORE o_proj.
+        # With SP enabled, o_proj scatters along seq dim. The input must have full S
+        # (not S/CP), otherwise the SP-scattered output won't match the residual.
+        # Without SP, gather after o_proj to restore full seq_len for residual.
+        if is_context_parallel:
+            attn_output = gather_from_tensor_model_parallel_region_with_dim(
+                attn_output, gather_dim=1,
+                process_group=get_context_parallel_attention_cp_group(),
+            )
+
         attn_output = self.o_proj(attn_output)
 
         # Prepare KV cache output - return as tuple for KV cache manager
-        # Return ORIGINAL (non-GQA-expanded) key/value states for cache
+        # Return LOCAL key/value states for cache (each CP rank stores its portion)
         new_key_value = (key_states_for_cache, value_states_for_cache)
 
         return attn_output, new_key_value, cos_cache, sin_cache
