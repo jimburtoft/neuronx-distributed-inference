@@ -146,7 +146,7 @@ def generate_hf_reference(
 ):
     """Generate reference outputs using HuggingFace model on CPU."""
     print(f"\n{'=' * 60}")
-    print("Generating HuggingFace reference outputs (CPU)...")
+    print("Generating HuggingFace reference outputs (CPU, bfloat16)...")
     print(f"{'=' * 60}")
 
     from transformers import Qwen2_5_VLForConditionalGeneration
@@ -154,8 +154,7 @@ def generate_hf_reference(
     print("Loading HF model (this may take a few minutes)...")
     hf_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         model_path,
-        torch_dtype=torch.float32,  # CPU needs float32
-        device_map="cpu",
+        torch_dtype=torch.bfloat16,
     )
     hf_model.eval()
     print("HF model loaded.")
