@@ -201,6 +201,30 @@ print(processor.decode(output[0][inputs.input_ids.shape[1]:], skip_special_token
 
 ### vllm-neuron Serving
 
+**Validated on both vllm-neuron 0.4.1 and 0.5.0 (6/6 API tests passed on each).**
+
+#### vllm-neuron 0.5.0 (recommended)
+
+```bash
+# Install: git clone --branch release-0.5.0 https://github.com/vllm-project/vllm-neuron.git
+#          cd vllm-neuron && pip install --extra-index-url=https://pip.repos.neuron.amazonaws.com -e .
+
+# Apply patches (Qwen2.5-VL is not natively supported in 0.5.0):
+python patch_vllm_050_qwen25vl.py --vllm-dir /path/to/vllm-neuron
+
+# Serve:
+NEURON_COMPILED_ARTIFACTS=/path/to/compiled \
+PYTHONPATH=/path/to/qwen25vl:$PYTHONPATH \
+vllm serve /path/to/Qwen2.5-VL-7B-Instruct \
+  --tensor-parallel-size 4 \
+  --max-model-len 4096 \
+  --max-num-seqs 1 \
+  --port 8000 \
+  --no-enable-prefix-caching
+```
+
+#### vllm-neuron 0.4.1
+
 ```bash
 NEURON_COMPILED_ARTIFACTS=/path/to/compiled \
 vllm serve Qwen/Qwen2.5-VL-7B-Instruct \
@@ -211,7 +235,9 @@ vllm serve Qwen/Qwen2.5-VL-7B-Instruct \
   --no-enable-prefix-caching
 ```
 
-Note: vllm-neuron requires 4 additional file patches (constants.py, model_loader.py, model_runner.py, NxDI constants.py). See the `patch_vllm_qwen25vl.py` script in the project repository for details.
+Both versions require 4 file patches (constants.py, model_loader.py, model_runner.py, NxDI constants.py). Patch scripts:
+- **0.5.0**: `patch_vllm_050_qwen25vl.py` (supports `--vllm-dir`, `--nxdi-constants`, `--qwen25vl-dir`)
+- **0.4.1**: `patch_vllm_qwen25vl.py`
 
 ## Compatibility Matrix
 
