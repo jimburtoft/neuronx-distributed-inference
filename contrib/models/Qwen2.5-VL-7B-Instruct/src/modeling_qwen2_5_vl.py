@@ -282,6 +282,12 @@ class NeuronQwen2_5_VLForCausalLM(NeuronBaseForImageToText):
         return Qwen2_5_VLForConditionalGeneration.from_pretrained(model_path, **kwargs)
 
     @staticmethod
+    def update_state_dict_for_tied_weights(state_dict):
+        """Handle tied weights (embed_tokens == lm_head) for models like 3B.
+        Delegates to text model class which clones embed_tokens -> lm_head."""
+        NeuronQwen2_5_VLTextForCausalLM.update_state_dict_for_tied_weights(state_dict)
+
+    @staticmethod
     def convert_hf_to_neuron_state_dict(
         state_dict: dict, inference_config: "Qwen2_5_VLInferenceConfig"
     ) -> dict:

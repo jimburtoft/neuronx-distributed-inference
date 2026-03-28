@@ -247,6 +247,18 @@ Both versions require 4 file patches (constants.py, model_loader.py, model_runne
 | trn2.48xlarge | Expected working | Expected working | Expected working (LNC=1) |
 | trn1.32xlarge | Not tested | Not tested | Not tested |
 
+### Multi-Size Support
+
+The same code works for all Qwen2.5-VL sizes (config-driven). Tested:
+
+| Model | Instance | TP | TKG tok/s | Compile | Weights/Core | Notes |
+|-------|----------|----|-----------|---------|-------------|-------|
+| **7B** | trn2.3xlarge | 4 | 86.4 | 81.6s | 4.2 GB | Primary target |
+| **3B** | trn2.3xlarge | 4 | 104.3 | 56.4s | 2.1 GB | `tie_word_embeddings=True` |
+| 72B | trn2.48xlarge | TBD | TBD | TBD | TBD | Not yet tested |
+
+**3B notes**: The 3B model uses tied weights (`lm_head` = `embed_tokens`). The `update_state_dict_for_tied_weights` override handles this automatically. MLP NKI kernel compiles for 3B (`intermediate/TP=2752`) but is 13% slower than baseline -- not recommended for 3B.
+
 ## Implementation Notes
 
 ### Vision Encoder Differences from Qwen2-VL
