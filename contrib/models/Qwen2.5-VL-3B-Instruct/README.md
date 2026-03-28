@@ -1,36 +1,56 @@
-# Contrib Model: Qwen2.5 VL 3B Instruct
+# Contrib Model: Qwen2.5-VL-3B-Instruct
 
-NeuronX Distributed Inference implementation of Qwen2.5 VL 3B Instruct.
+NeuronX Distributed Inference implementation of Qwen2.5-VL-3B-Instruct.
 
-> **Note:** This implementation has been validated using the **text backbone only**. Vision/image modalities are implemented but not yet verified.
+> **Note:** This implementation supports the **text backbone only** with M-RoPE (Multimodal Rotary Position Embeddings). Vision encoder is not included. See [Related: Full Vision-Language Support](#related-full-vision-language-support) for a validated multimodal implementation of the same model family.
 
 ## Model Information
 
 - **HuggingFace ID:** `Qwen/Qwen2.5-VL-3B-Instruct`
-- **Model Type:** Decoder-only transformer
-- **License:** Check HuggingFace model card
+- **Model Type:** Vision-Language model (`qwen2_5_vl`). This contrib supports **text input/output only**.
+- **License:** Check [HuggingFace model card](https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct)
 
 ## Architecture Details
 
-- **Layers:** Check model config
-- **Hidden Size:** Check model config
-- **Attention Heads:** Check model config
-- **Vocabulary:** Check model config
-- **Max Position Embeddings:** Check model config
+### Text Backbone
+
+- **Layers:** 36
+- **Hidden Size:** 2048
+- **Attention Heads:** 16 (Q) / 2 (KV) -- Grouped Query Attention
+- **Head Dimension:** 128
+- **Intermediate Size:** 11,008 (SwiGLU MLP)
+- **Vocabulary:** 151,936
+- **Max Position Embeddings:** 128,000
+- **RoPE:** M-RoPE with sections [16, 24, 24] (temporal, height, width), theta=1e6
+- **QKV Bias:** True, O Bias: False
+- **Normalization:** RMSNorm (eps=1e-6)
+- **Activation:** SiLU (SwiGLU)
+- **Tied Weights:** embed_tokens and lm_head are tied
+- **Model Size:** ~6 GB (BF16)
+
+> Same architecture family as Qwen2.5-VL-7B but with fewer layers (36 vs 28), smaller hidden size (2048 vs 3584), and fewer KV heads (2 vs 4).
+
+### Vision Encoder (not implemented in this contrib)
+
+- **Layers:** 32, **Hidden Size:** 1280, **Heads:** 16
+- **Output Hidden Size:** 2048 (projects to text hidden_size)
+- **Patch Size:** 14, **Spatial Merge Size:** 2
 
 ## Validation Results
 
-**Validated:** 2026-01-29  
+**Validated:** 2026-01-29 (original), updated 2026-03-27 (M-RoPE fix)
 **Configuration:** TP=2, batch_size=1, seq_len=128, bfloat16
 
 ### Test Results
 
 | Test | Status | Result |
 |------|--------|--------|
-| Smoke Test | ✅ PASS | Model loads successfully |
-| Token Matching | ⚠️ LOW | **67.2% match** |
-| TTFT (P50) | ✅ PASS | 29.82ms (threshold: 100ms) |
-| Throughput | ✅ PASS | 38.20 tok/s (threshold: 10 tok/s) |
+| Smoke Test | PASS | Model loads successfully |
+| Token Matching | *pending revalidation* | Previously 67.2% (without M-RoPE) |
+| TTFT (P50) | PASS | 29.82ms (threshold: 100ms) |
+| Throughput | PASS | 38.20 tok/s (threshold: 10 tok/s) |
+
+> **M-RoPE fix (2026-03-27):** The original implementation used standard 1D RotaryEmbedding instead of M-RoPE, which likely caused the 67.2% token match. This update adds proper M-RoPE with section splitting [16, 24, 24]. Revalidation pending on Neuron instance.
 
 ### Performance Metrics
 
@@ -38,9 +58,6 @@ NeuronX Distributed Inference implementation of Qwen2.5 VL 3B Instruct.
 |--------|-------|
 | TTFT (P50) | 29.82ms |
 | Throughput | 38.20 tokens/s |
-
-
-**Status:** ✅ GOOD
 
 ### Device Profiling Metrics
 
@@ -61,15 +78,28 @@ NeuronX Distributed Inference implementation of Qwen2.5 VL 3B Instruct.
 > Metrics from `neuron-profile capture` on compiled NEFFs. MFU = Model FLOPs Utilization,
 > MBU = Memory Bandwidth Utilization, HFU = Hardware FLOPs Utilization.
 
+## Related: Full Vision-Language Support
+
+The **Qwen2.5-VL-7B-Instruct** contrib provides a complete vision-language implementation for the Qwen2.5-VL model family:
+
+- **Full vision encoder** with hybrid windowed + global attention
+- **M-RoPE** for spatial/temporal position encoding
+- **Multi-bucket CTE** for 4.8x TTFT improvement on short inputs
+- **86.4 tok/s** on trn2.3xlarge (TP=4), 100% token match
+
+The 3B model's vision encoder uses the same architecture as the 7B, with output projection adjusted for the smaller hidden size (2048 vs 3584).
+
 ## Usage
 
 ```python
-from transformers import AutoTokenizer, GenerationConfig
+import torch
 from neuronx_distributed_inference.models.config import NeuronConfig
-from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config
 
 # Import model classes from src
-from src.modeling_qwen2_5_vl_3b_instruct import NeuronQwen25VL3BInstructForCausalLM, Qwen25VL3BInstructInferenceConfig
+from src.modeling_qwen2vl import (
+    NeuronQwen2_5_VL3BForCausalLM,
+    Qwen2_5_VL3BInferenceConfig,
+)
 
 model_path = "/path/to/Qwen2.5-VL-3B-Instruct/"
 compiled_model_path = "/path/to/compiled/"
@@ -82,17 +112,17 @@ neuron_config = NeuronConfig(
     torch_dtype=torch.bfloat16,
 )
 
-config = Qwen25VL3BInstructInferenceConfig(
-    neuron_config,
-    load_config=load_pretrained_config(model_path),
+config = Qwen2_5_VL3BInferenceConfig.from_pretrained(
+    model_path, neuron_config=neuron_config
 )
 
 # Compile and load
-model = NeuronQwen25VL3BInstructForCausalLM(model_path, config)
+model = NeuronQwen2_5_VL3BForCausalLM(config)
 model.compile(compiled_model_path)
 model.load(compiled_model_path)
 
 # Generate
+from transformers import AutoTokenizer
 tokenizer = AutoTokenizer.from_pretrained(model_path)
 # ... (see integration test for full example)
 ```
@@ -101,7 +131,8 @@ tokenizer = AutoTokenizer.from_pretrained(model_path)
 
 | Instance/Version | 2.20+ | 2.19 and earlier |
 |------------------|-------|------------------|
-| Trn1             | ✅ Working | Not tested |
+| Trn1             | Working | Not tested |
+| Trn2             | Not tested | Not tested |
 | Inf2             | Not tested | Not tested |
 
 ## Testing
@@ -127,4 +158,4 @@ python3 test/integration/test_model.py
 
 Annapurna Labs
 
-**Last Updated:** 2026-01-29
+**Last Updated:** 2026-03-27
