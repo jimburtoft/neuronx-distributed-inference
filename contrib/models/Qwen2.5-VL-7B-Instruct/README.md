@@ -255,9 +255,11 @@ The same code works for all Qwen2.5-VL sizes (config-driven). Tested:
 |-------|----------|----|-----------|---------|-------------|-------|
 | **7B** | trn2.3xlarge | 4 | 86.4 | 81.6s | 4.2 GB | Primary target |
 | **3B** | trn2.3xlarge | 4 | 104.3 | 56.4s | 2.1 GB | `tie_word_embeddings=True` |
-| 72B | trn2.48xlarge | TBD | TBD | TBD | TBD | Not yet tested |
+| **72B** | trn2.48xlarge | 32 | 44.3 | 508.4s | ~4.5 GB | 80 layers, 64 heads, 8 KV heads |
 
 **3B notes**: The 3B model uses tied weights (`lm_head` = `embed_tokens`). The `update_state_dict_for_tied_weights` override handles this automatically. MLP NKI kernel compiles for 3B (`intermediate/TP=2752`) but is 13% slower than baseline -- not recommended for 3B.
+
+**72B notes**: Requires trn2.48xlarge with TP=32 (146 GB BF16 weights). Compilation takes ~8.5 minutes. Vision encoder is identical to 3B/7B except `out_hidden_size=8192` and `intermediate_size=3456`. Steady-state TKG is 44.3 tok/s. VL inference works (33.8 tok/s with 672x672 image).
 
 ## Implementation Notes
 
@@ -308,4 +310,4 @@ pytest test/integration/test_model.py::test_logit_validation -v
 
 Jim Burtoft, AWS
 
-**Last Updated:** 2026-03-27
+**Last Updated:** 2026-03-29
