@@ -127,10 +127,25 @@ class Qwen2_5_VLInferenceConfig(ImageToTextInferenceConfig):
                 vnc.buckets = [2]
                 logger.info("Qwen2.5-VL vision: set default buckets=[2]")
 
-        # Copy text config keys
+        # Sync text config keys bidirectionally.
+        # In Qwen2.5-VL, HF's to_dict() nests token IDs (image_token_id, etc.)
+        # inside text_config instead of at the top level. The forward() method
+        # accesses self.config.image_token_id, so we must promote them.
         if hasattr(self, "text_config"):
             for key in QWEN2_5_VL_TEXT_CONFIG_KEYS:
-                if hasattr(self, key):
+                has_top = hasattr(self, key) and getattr(self, key) is not None
+                has_text = (
+                    hasattr(self.text_config, key)
+                    and getattr(self.text_config, key) is not None
+                )
+                if has_top and not has_text:
+                    # Copy top-level -> text_config
+                    setattr(self.text_config, key, getattr(self, key))
+                elif has_text and not has_top:
+                    # Promote text_config -> top-level (Qwen2.5-VL token IDs)
+                    setattr(self, key, getattr(self.text_config, key))
+                elif has_top:
+                    # Both exist: top-level wins, copy to text_config
                     setattr(self.text_config, key, getattr(self, key))
             self.pad_token_id = getattr(self.text_config, "pad_token_id", None)
 
