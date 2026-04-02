@@ -651,7 +651,67 @@ class TrinityInferenceConfig(InferenceConfig):
 
         super().__init__(neuron_config=neuron_config, **kwargs)
 
-        # Adjust num_local_experts for expert parallelism
+        # Bug 5 fix (v3): Correctly derive intermediate sizes after super().__init__().
+        #
+        # There are two paths through super().__init__():
+        #   A) vLLM path: load_config=load_pretrained_config(model_path) is passed.
+        #      load_config does self.__dict__.update(config_dict), setting all HF
+        #      config values (moe_intermediate_size=3072, intermediate_size=12288 for Large).
+        #      In this case, kwargs are EMPTY so the saved locals have DEFAULT values.
+        #      We must read from self after super().__init__().
+        #   B) Direct NxDI path: no load_config passed, base load_config() is a no-op.
+        #      In this case, kwargs contain the HF config values, so saved locals are correct.
+        #
+        # Detection: If load_config ran and updated self, self.intermediate_size will
+        # differ from the moe_intermediate saved local (which was our pre-super value).
+        # For path A: self.intermediate_size = 12288 (HF), moe_intermediate = 1024 (default)
+        # For path B: self.intermediate_size = moe_intermediate (unchanged from our pre-super set)
+        load_config_ran = self.intermediate_size != moe_intermediate
+        if load_config_ran:
+            # Path A: load_config set self attrs from HF config. Read from self.
+            actual_dense = self.intermediate_size  # HF intermediate_size (12288)
+            actual_moe = getattr(
+                self, "moe_intermediate_size", moe_intermediate
+            )  # HF moe_intermediate_size (3072)
+            logger.info(
+                "load_config detected: using HF values dense_intermediate=%d, moe_intermediate=%d",
+                actual_dense,
+                actual_moe,
+            )
+        else:
+            # Path B: no load_config. Use saved locals from kwargs.
+            actual_dense = dense_intermediate
+            actual_moe = moe_intermediate
+
+        self.dense_intermediate_size = actual_dense
+        self.moe_intermediate_size = actual_moe
+        self.intermediate_size = actual_moe  # NxDI initialize_moe_module reads this
+
+        # Bug 10 fix: load_config overwrites num_experts from HF config (256 for Large).
+        # num_local_experts was set to the pre-load_config default (128 for Mini).
+        # Re-derive num_local_experts from the correct (post-load_config) num_experts.
+        if hasattr(self, "num_experts"):
+            old_local = getattr(self, "num_local_experts", None)
+            self.num_local_experts = self.num_experts  # base: all experts are local
+            if old_local != self.num_local_experts:
+                logger.info(
+                    "Re-deriving num_local_experts from %s to %d after load_config overwrite",
+                    old_local,
+                    self.num_local_experts,
+                )
+
+        # Bug 9 fix: load_config overwrites sliding_window from HF config (4096 for Large).
+        # Re-clamp to seq_len after load_config overwrite.
+        if neuron_config is not None and hasattr(neuron_config, "seq_len"):
+            if neuron_config.seq_len < self.sliding_window:
+                logger.info(
+                    "Re-clamping sliding_window from %d to %d after load_config overwrite",
+                    self.sliding_window,
+                    neuron_config.seq_len,
+                )
+                self.sliding_window = neuron_config.seq_len
+
+        # Adjust num_local_experts for expert parallelism (AFTER re-derivation above)
         if hasattr(self, "neuron_config") and self.neuron_config is not None:
             ep_degree = getattr(self.neuron_config, "ep_degree", 1)
             if ep_degree > 1:
@@ -694,8 +754,8 @@ class TrinityInferenceConfig(InferenceConfig):
         fused_requested = getattr(
             self.neuron_config, "moe_fused_nki_kernel_enabled", None
         )
-        if fused_requested is None:
-            return  # Not requested, don't enable
+        if not fused_requested:
+            return  # Not requested or explicitly disabled, don't enable
 
         moe_tp = getattr(self.neuron_config, "moe_tp_degree", None)
         if moe_tp is None:
@@ -1683,12 +1743,16 @@ class NeuronTrinityForCausalLM(NeuronBaseForCausalLM):
                     )
 
             # Attention Q, K, V projections
+            # NOTE: Use HF-style key names (self_attn.q_proj.weight, etc.) —
+            # NOT the NxDI module path (self_attn.qkv_proj.q_proj.weight).
+            # The GQA_QKV preshard_hook automatically renames these to the
+            # correct NxDI module paths and applies padding/replication.
             for proj in ["q_proj", "k_proj", "v_proj"]:
                 hf_key = f"{hf_prefix}.self_attn.{proj}.weight"
                 if hf_key in state_dict:
-                    neuron_state_dict[
-                        f"{neuron_prefix}.self_attn.qkv_proj.{proj}.weight"
-                    ] = state_dict[hf_key].to(target_dtype)
+                    neuron_state_dict[f"{neuron_prefix}.self_attn.{proj}.weight"] = (
+                        state_dict[hf_key].to(target_dtype)
+                    )
 
             # O projection
             hf_key = f"{hf_prefix}.self_attn.o_proj.weight"
@@ -1722,21 +1786,30 @@ class NeuronTrinityForCausalLM(NeuronBaseForCausalLM):
                 tp_degree = neuron_config.tp_degree
                 num_heads = config.num_attention_heads
                 num_kv_heads = config.num_key_value_heads
+                head_dim_val = config.head_dim
                 if num_heads % tp_degree != 0:
                     # Use interleaved padding matching Q layout.
-                    # Gate weight is (num_heads, hidden_size) -- one row per head.
-                    # Split into KV groups, pad each group with zero rows,
-                    # then concatenate back to (padded_total_heads, hidden_size).
+                    # Gate weight shape is (num_heads * head_dim, hidden_size) --
+                    # each head occupies head_dim rows. Split into KV groups of
+                    # (q_heads_per_group * head_dim) rows, pad each group with
+                    # (pad_heads_per_group * head_dim) zero rows, then concatenate
+                    # back to (padded_total_heads * head_dim, hidden_size).
                     padded_total_heads = math.ceil(num_heads / tp_degree) * tp_degree
-                    group_size = num_heads // num_kv_heads  # Q heads per KV group
-                    groups = gate_weight.split(group_size, dim=0)
-                    pad_per_group = (padded_total_heads - num_heads) // num_kv_heads
+                    q_heads_per_group = (
+                        num_heads // num_kv_heads
+                    )  # Q heads per KV group
+                    rows_per_group = q_heads_per_group * head_dim_val
+                    groups = gate_weight.split(rows_per_group, dim=0)
+                    pad_heads_per_group = (
+                        padded_total_heads - num_heads
+                    ) // num_kv_heads
+                    pad_rows_per_group = pad_heads_per_group * head_dim_val
                     interleaved = []
                     for group in groups:
                         interleaved.append(group)
                         interleaved.append(
                             torch.zeros(
-                                pad_per_group,
+                                pad_rows_per_group,
                                 gate_weight.shape[1],
                                 dtype=target_dtype,
                             )
