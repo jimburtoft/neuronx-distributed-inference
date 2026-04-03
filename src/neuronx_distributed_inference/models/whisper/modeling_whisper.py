@@ -9,12 +9,22 @@ from torch import Tensor, nn
 import torch.nn.functional as F
 
 from neuronx_distributed.parallel_layers import parallel_state
-from neuronx_distributed.parallel_layers.layers import ColumnParallelLinear, RowParallelLinear
+from neuronx_distributed.parallel_layers.layers import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+)
 from neuronx_distributed_inference.models.config import InferenceConfig
-from neuronx_distributed_inference.models.model_wrapper import BaseModelInstance, ModelWrapper
+from neuronx_distributed_inference.models.model_wrapper import (
+    BaseModelInstance,
+    ModelWrapper,
+)
 from neuronx_distributed_inference.models.application_base import NeuronApplicationBase
-from neuronx_distributed_inference.models.whisper.utils.config import get_dims_from_config
-from neuronx_distributed_inference.models.whisper.utils.decoding import decode as decode_function
+from neuronx_distributed_inference.models.whisper.utils.config import (
+    get_dims_from_config,
+)
+from neuronx_distributed_inference.models.whisper.utils.decoding import (
+    decode as decode_function,
+)
 from neuronx_distributed_inference.models.whisper.utils.state_dict import (
     convert_hf_state_dict_to_neuron,
     expand_state_dict,
@@ -46,13 +56,25 @@ class LayerNorm(nn.LayerNorm):
 
 
 class NeuronMLP(torch.nn.Module):
-
-    def __init__(self, hidden_size: int, intermediate_size: int, dtype: torch.dtype = torch.float32):
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        dtype: torch.dtype = torch.float32,
+    ):
         super().__init__()
-        assert parallel_state.model_parallel_is_initialized(), "Model parallel not initialized"
-        self.up_proj = ColumnParallelLinear(hidden_size, intermediate_size, bias=True, gather_output=False, dtype=dtype)
+        assert parallel_state.model_parallel_is_initialized(), (
+            "Model parallel not initialized"
+        )
+        self.up_proj = ColumnParallelLinear(
+            hidden_size, intermediate_size, bias=True, gather_output=False, dtype=dtype
+        )
         self.down_proj = RowParallelLinear(
-            intermediate_size, hidden_size, bias=True, input_is_parallel=True, dtype=dtype
+            intermediate_size,
+            hidden_size,
+            bias=True,
+            input_is_parallel=True,
+            dtype=dtype,
         )
 
     def forward(self, x):
@@ -60,16 +82,25 @@ class NeuronMLP(torch.nn.Module):
 
 
 class NeuronAttention(nn.Module):
-
     def __init__(
-        self, n_state: int, n_head: int, batch_size: int, seq_len: int, dtype: torch.dtype = torch.float32, kvcache=True
+        self,
+        n_state: int,
+        n_head: int,
+        batch_size: int,
+        seq_len: int,
+        dtype: torch.dtype = torch.float32,
+        kvcache=True,
     ):
         super().__init__()
 
-        assert n_state % n_head == 0, f"n_state ({n_state}) must be divisible by n_head ({n_head})"
+        assert n_state % n_head == 0, (
+            f"n_state ({n_state}) must be divisible by n_head ({n_head})"
+        )
         self.head_dim = n_state // n_head
 
-        assert parallel_state.model_parallel_is_initialized(), "Model parallel not initialized"
+        assert parallel_state.model_parallel_is_initialized(), (
+            "Model parallel not initialized"
+        )
         tp_degree = parallel_state.get_tensor_model_parallel_group().size()
 
         # head per core
@@ -107,14 +138,20 @@ class NeuronAttention(nn.Module):
 
         self.cache_k = (
             nn.Parameter(
-                torch.zeros((batch_size, self.n_kv_heads, seq_len, self.head_dim), dtype=dtype), requires_grad=False
+                torch.zeros(
+                    (batch_size, self.n_kv_heads, seq_len, self.head_dim), dtype=dtype
+                ),
+                requires_grad=False,
             )
             if kvcache
             else None
         )
         self.cache_v = (
             nn.Parameter(
-                torch.zeros((batch_size, self.n_kv_heads, seq_len, self.head_dim), dtype=dtype), requires_grad=False
+                torch.zeros(
+                    (batch_size, self.n_kv_heads, seq_len, self.head_dim), dtype=dtype
+                ),
+                requires_grad=False,
             )
             if kvcache
             else None
@@ -129,13 +166,27 @@ class NeuronAttention(nn.Module):
         bsz, seq_len, hidden_dim = x.shape
 
         # bs, head, seqlen, head_dim
-        q = self.query(x).view(bsz, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        k = self.key(x).view(bsz, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.value(x).view(bsz, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        q = (
+            self.query(x)
+            .view(bsz, seq_len, self.n_heads, self.head_dim)
+            .transpose(1, 2)
+        )
+        k = (
+            self.key(x)
+            .view(bsz, seq_len, self.n_kv_heads, self.head_dim)
+            .transpose(1, 2)
+        )
+        v = (
+            self.value(x)
+            .view(bsz, seq_len, self.n_kv_heads, self.head_dim)
+            .transpose(1, 2)
+        )
 
         if self.cache_k is not None and self.cache_v is not None:
             if seq_len > 1:  # prefill: save all to cache
-                indices = torch.arange(start=0, end=seq_len, dtype=torch.int64, device=q.device)
+                indices = torch.arange(
+                    start=0, end=seq_len, dtype=torch.int64, device=q.device
+                )
                 indices = indices.view(1, 1, seq_len, 1)
                 indices = indices.expand(bsz, self.n_kv_heads, seq_len, self.head_dim)
             else:  # decode: save only the last token [last_pos] to cache
@@ -162,14 +213,24 @@ class NeuronAttention(nn.Module):
 
 
 class NeuronCrossAttention(nn.Module):
-
-    def __init__(self, n_state: int, n_head: int, batch_size: int, kv_seq_len: int, dtype: torch.dtype = torch.float32):
+    def __init__(
+        self,
+        n_state: int,
+        n_head: int,
+        batch_size: int,
+        kv_seq_len: int,
+        dtype: torch.dtype = torch.float32,
+    ):
         super().__init__()
 
-        assert n_state % n_head == 0, f"n_state ({n_state}) must be divisible by n_head ({n_head})"
+        assert n_state % n_head == 0, (
+            f"n_state ({n_state}) must be divisible by n_head ({n_head})"
+        )
         self.head_dim = n_state // n_head
 
-        assert parallel_state.model_parallel_is_initialized(), "Model parallel not initialized"
+        assert parallel_state.model_parallel_is_initialized(), (
+            "Model parallel not initialized"
+        )
         tp_degree = parallel_state.get_tensor_model_parallel_group().size()
 
         # head per core
@@ -206,10 +267,16 @@ class NeuronCrossAttention(nn.Module):
         )
 
         self.cache_k = nn.Parameter(
-            torch.zeros((batch_size, self.n_kv_heads, kv_seq_len, self.head_dim), dtype=dtype), requires_grad=False
+            torch.zeros(
+                (batch_size, self.n_kv_heads, kv_seq_len, self.head_dim), dtype=dtype
+            ),
+            requires_grad=False,
         )
         self.cache_v = nn.Parameter(
-            torch.zeros((batch_size, self.n_kv_heads, kv_seq_len, self.head_dim), dtype=dtype), requires_grad=False
+            torch.zeros(
+                (batch_size, self.n_kv_heads, kv_seq_len, self.head_dim), dtype=dtype
+            ),
+            requires_grad=False,
         )
 
     def forward(
@@ -222,13 +289,27 @@ class NeuronCrossAttention(nn.Module):
         kv_seq_len = xa.shape[1]
 
         # bs, head, seqlen, head_dim
-        q = self.query(x).view(bsz, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        k = self.key(xa).view(bsz, kv_seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.value(xa).view(bsz, kv_seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        q = (
+            self.query(x)
+            .view(bsz, seq_len, self.n_heads, self.head_dim)
+            .transpose(1, 2)
+        )
+        k = (
+            self.key(xa)
+            .view(bsz, kv_seq_len, self.n_kv_heads, self.head_dim)
+            .transpose(1, 2)
+        )
+        v = (
+            self.value(xa)
+            .view(bsz, kv_seq_len, self.n_kv_heads, self.head_dim)
+            .transpose(1, 2)
+        )
 
         # Save KV Cache
         if is_prefill:
-            indices = torch.arange(start=0, end=kv_seq_len, dtype=torch.int64, device=q.device)
+            indices = torch.arange(
+                start=0, end=kv_seq_len, dtype=torch.int64, device=q.device
+            )
             indices = indices.view(1, 1, kv_seq_len, 1)
             indices = indices.expand(bsz, self.n_kv_heads, kv_seq_len, self.head_dim)
 
@@ -262,11 +343,15 @@ class NeuronResidualAttentionBlock(nn.Module):
     ):
         super().__init__()
 
-        self.attn = NeuronAttention(n_state, n_head, batch_size, seq_len, dtype=dtype, kvcache=cross_attention)
+        self.attn = NeuronAttention(
+            n_state, n_head, batch_size, seq_len, dtype=dtype, kvcache=cross_attention
+        )
         self.attn_ln = LayerNorm(n_state)
 
         self.cross_attn = (
-            NeuronCrossAttention(n_state, n_head, batch_size, cross_attn_seq_len, dtype=dtype)
+            NeuronCrossAttention(
+                n_state, n_head, batch_size, cross_attn_seq_len, dtype=dtype
+            )
             if cross_attention
             else None
         )
@@ -284,7 +369,9 @@ class NeuronResidualAttentionBlock(nn.Module):
         mask: Optional[Tensor] = None,
     ):
         if self.cross_attn:
-            h, self_attn_cache_k, self_attn_cache_v = self.attn(self.attn_ln(x), last_pos=last_pos, mask=mask)
+            h, self_attn_cache_k, self_attn_cache_v = self.attn(
+                self.attn_ln(x), last_pos=last_pos, mask=mask
+            )
         else:
             h = self.attn(self.attn_ln(x), last_pos=last_pos, mask=mask)
         x = x + h
@@ -296,7 +383,13 @@ class NeuronResidualAttentionBlock(nn.Module):
         x = x + self.mlp(self.mlp_ln(x))
 
         if self.cross_attn:
-            return x, self_attn_cache_k, self_attn_cache_v, cross_attn_cache_k, cross_attn_cache_v
+            return (
+                x,
+                self_attn_cache_k,
+                self_attn_cache_v,
+                cross_attn_cache_k,
+                cross_attn_cache_v,
+            )
         else:
             return x
 
@@ -315,11 +408,20 @@ class NeuronAudioEncoder(nn.Module):
         super().__init__()
         seq_len = n_ctx
         self.conv1 = nn.Conv1d(n_mels, n_state, kernel_size=3, padding=1, dtype=dtype)
-        self.conv2 = nn.Conv1d(n_state, n_state, kernel_size=3, stride=2, padding=1, dtype=dtype)
-        self.positional_embedding = nn.Parameter(sinusoids(n_ctx, n_state), requires_grad=False)
+        self.conv2 = nn.Conv1d(
+            n_state, n_state, kernel_size=3, stride=2, padding=1, dtype=dtype
+        )
+        self.positional_embedding = nn.Parameter(
+            sinusoids(n_ctx, n_state), requires_grad=False
+        )
 
         self.blocks: Iterable[NeuronResidualAttentionBlock] = nn.ModuleList(
-            [NeuronResidualAttentionBlock(n_state, n_head, batch_size, seq_len, dtype=dtype) for _ in range(n_layer)]
+            [
+                NeuronResidualAttentionBlock(
+                    n_state, n_head, batch_size, seq_len, dtype=dtype
+                )
+                for _ in range(n_layer)
+            ]
         )
         self.ln_post = LayerNorm(n_state)
 
@@ -378,7 +480,9 @@ class NeuronTextDecoder(nn.Module):
         )
         self.ln = LayerNorm(n_state)
 
-    def forward(self, x: Tensor, xa: Tensor, last_pos: torch.Tensor, pad_mask: torch.Tensor):
+    def forward(
+        self, x: Tensor, xa: Tensor, last_pos: torch.Tensor, pad_mask: torch.Tensor
+    ):
         """
         x : torch.LongTensor, shape = (batch_size, <= n_ctx)
             the text tokens
@@ -389,27 +493,37 @@ class NeuronTextDecoder(nn.Module):
         pad_mask : torch.Tensor, shape = (batch_size, n_ctx)
             boolean mask indicating valid positions (True) vs padded positions (False)
         """
-        assert (
-            x.shape[1] == 1 or x.shape[1] == self.seq_len
-        ), f"Input sequence length {x.shape[1]} must be 1 (decode) or {self.seq_len} (prefill)"
+        assert x.shape[1] == 1 or x.shape[1] == self.seq_len, (
+            f"Input sequence length {x.shape[1]} must be 1 (decode) or {self.seq_len} (prefill)"
+        )
 
         is_prefill = x.shape[1] > 1
         if is_prefill:
             pe = self.positional_embedding.weight
         else:
-            pe = self.positional_embedding(last_pos)  # TODO: check if it's correct when batch_size > 1
+            pe = self.positional_embedding(
+                last_pos
+            )  # TODO: check if it's correct when batch_size > 1
         x = self.token_embedding(x) + pe
         x = x.to(xa.dtype)
 
         mask = None
         if is_prefill:
-            mask = torch.full((self.seq_len, self.seq_len), True, device=pad_mask.device).tril(diagonal=0)
+            mask = torch.full(
+                (self.seq_len, self.seq_len), True, device=pad_mask.device
+            ).tril(diagonal=0)
             input_mask = (
-                pad_mask[:, None, None, :].expand(self.batch_size, 1, self.seq_len, self.seq_len).to(torch.bool)
+                pad_mask[:, None, None, :]
+                .expand(self.batch_size, 1, self.seq_len, self.seq_len)
+                .to(torch.bool)
             )
             mask = torch.logical_and(mask, input_mask)
         else:
-            mask = pad_mask[:, None, None, :].expand(self.batch_size, 1, 1, self.seq_len).to(torch.bool)
+            mask = (
+                pad_mask[:, None, None, :]
+                .expand(self.batch_size, 1, 1, self.seq_len)
+                .to(torch.bool)
+            )
 
         self_attn_k_caches = []
         self_attn_v_caches = []
@@ -424,9 +538,17 @@ class NeuronTextDecoder(nn.Module):
             cross_attn_v_caches.append(cv)
 
         x = self.ln(x)
-        logits = (x @ torch.transpose(self.token_embedding.weight.to(x.dtype), 0, 1)).float()
+        logits = (
+            x @ torch.transpose(self.token_embedding.weight.to(x.dtype), 0, 1)
+        ).float()
 
-        return logits, *self_attn_k_caches, *self_attn_v_caches, *cross_attn_k_caches, *cross_attn_v_caches
+        return (
+            logits,
+            *self_attn_k_caches,
+            *self_attn_v_caches,
+            *cross_attn_k_caches,
+            *cross_attn_v_caches,
+        )
 
 
 class WhisperModelEncoderInstance(BaseModelInstance):
@@ -490,8 +612,18 @@ class WhisperModelDecoderInstance(BaseModelInstance):
 
 
 class ModelWrapperWhisperEncoder(ModelWrapper):
-    def __init__(self, config, model_cls, tag="", compiler_args=None, priority_model_idx=None, model_init_kwargs={}):
-        super().__init__(config, model_cls, tag, compiler_args, priority_model_idx, model_init_kwargs)
+    def __init__(
+        self,
+        config,
+        model_cls,
+        tag="",
+        compiler_args=None,
+        priority_model_idx=None,
+        model_init_kwargs={},
+    ):
+        super().__init__(
+            config, model_cls, tag, compiler_args, priority_model_idx, model_init_kwargs
+        )
         self.bucket_config = None  # Set to None if no bucketing needed
 
     def input_generator(self) -> List[Tuple[torch.Tensor]]:
@@ -513,8 +645,18 @@ class ModelWrapperWhisperEncoder(ModelWrapper):
 
 
 class ModelWrapperWhisperDecoderPrefill(ModelWrapper):
-    def __init__(self, config, model_cls, tag="", compiler_args=None, priority_model_idx=None, model_init_kwargs={}):
-        super().__init__(config, model_cls, tag, compiler_args, priority_model_idx, model_init_kwargs)
+    def __init__(
+        self,
+        config,
+        model_cls,
+        tag="",
+        compiler_args=None,
+        priority_model_idx=None,
+        model_init_kwargs={},
+    ):
+        super().__init__(
+            config, model_cls, tag, compiler_args, priority_model_idx, model_init_kwargs
+        )
         self.bucket_config = None  # Set to None if no bucketing needed
 
     def input_generator(self) -> List[Tuple[torch.Tensor]]:
@@ -525,9 +667,15 @@ class ModelWrapperWhisperDecoderPrefill(ModelWrapper):
             self.config.dims.n_audio_state,
             dtype=self.neuron_config.torch_dtype,
         )
-        padded_tokens = torch.zeros((self.neuron_config.batch_size, self.config.dims.n_text_ctx), dtype=torch.int32)
-        last_pos = torch.zeros(1, dtype=torch.int32)
-        pad_mask = torch.zeros((self.neuron_config.batch_size, self.config.dims.n_text_ctx), dtype=torch.int32)
+        padded_tokens = torch.zeros(
+            (self.neuron_config.batch_size, self.config.dims.n_text_ctx),
+            dtype=torch.int32,
+        )
+        last_pos = torch.zeros(self.neuron_config.batch_size, dtype=torch.int32)
+        pad_mask = torch.zeros(
+            (self.neuron_config.batch_size, self.config.dims.n_text_ctx),
+            dtype=torch.int32,
+        )
         inputs = [
             (padded_tokens, audio_embed, last_pos, pad_mask),
         ]
@@ -541,8 +689,18 @@ class ModelWrapperWhisperDecoderPrefill(ModelWrapper):
 
 
 class ModelWrapperWhisperDecoderDecode(ModelWrapper):
-    def __init__(self, config, model_cls, tag="", compiler_args=None, priority_model_idx=None, model_init_kwargs={}):
-        super().__init__(config, model_cls, tag, compiler_args, priority_model_idx, model_init_kwargs)
+    def __init__(
+        self,
+        config,
+        model_cls,
+        tag="",
+        compiler_args=None,
+        priority_model_idx=None,
+        model_init_kwargs={},
+    ):
+        super().__init__(
+            config, model_cls, tag, compiler_args, priority_model_idx, model_init_kwargs
+        )
         self.bucket_config = None  # Set to None if no bucketing needed
 
     def input_generator(self) -> List[Tuple[torch.Tensor]]:
@@ -553,9 +711,14 @@ class ModelWrapperWhisperDecoderDecode(ModelWrapper):
             self.config.dims.n_audio_state,
             dtype=self.neuron_config.torch_dtype,
         )
-        padded_tokens = torch.zeros((self.neuron_config.batch_size, 1), dtype=torch.int32)
-        last_pos = torch.zeros(1, dtype=torch.int32)
-        pad_mask = torch.zeros((self.neuron_config.batch_size, self.config.dims.n_text_ctx), dtype=torch.int32)
+        padded_tokens = torch.zeros(
+            (self.neuron_config.batch_size, 1), dtype=torch.int32
+        )
+        last_pos = torch.zeros(self.neuron_config.batch_size, dtype=torch.int32)
+        pad_mask = torch.zeros(
+            (self.neuron_config.batch_size, self.config.dims.n_text_ctx),
+            dtype=torch.int32,
+        )
         inputs = [
             (padded_tokens, audio_embed, last_pos, pad_mask),
         ]
@@ -601,9 +764,13 @@ class NeuronApplicationWhisperEncoder(NeuronApplicationBase):
         pass
 
     @staticmethod
-    def convert_hf_to_neuron_state_dict(state_dict: dict, config: WhisperInferenceConfig) -> dict:
+    def convert_hf_to_neuron_state_dict(
+        state_dict: dict, config: WhisperInferenceConfig
+    ) -> dict:
         state_dict = convert_hf_state_dict_to_neuron(state_dict, type="encoder")
-        state_dict = expand_state_dict(state_dict, config.dims, config.neuron_config.tp_degree)
+        state_dict = expand_state_dict(
+            state_dict, config.dims, config.neuron_config.tp_degree
+        )
         return state_dict
 
     def forward(self, audio: torch.Tensor) -> torch.Tensor:
@@ -613,7 +780,9 @@ class NeuronApplicationWhisperEncoder(NeuronApplicationBase):
         :return: Encoded audio features
         """
         # Ensure audio is in the correct dtype, return in the original dtype
-        return self.traced_model(audio.to(self.config.neuron_config.torch_dtype)).to(audio.dtype)
+        return self.traced_model(audio.to(self.config.neuron_config.torch_dtype)).to(
+            audio.dtype
+        )
 
 
 class NeuronApplicationWhisperDecoder(NeuronApplicationBase):
@@ -656,13 +825,21 @@ class NeuronApplicationWhisperDecoder(NeuronApplicationBase):
         pass
 
     @staticmethod
-    def convert_hf_to_neuron_state_dict(state_dict: dict, config: WhisperInferenceConfig) -> dict:
+    def convert_hf_to_neuron_state_dict(
+        state_dict: dict, config: WhisperInferenceConfig
+    ) -> dict:
         state_dict = convert_hf_state_dict_to_neuron(state_dict, type="decoder")
-        state_dict = expand_state_dict(state_dict, config.dims, config.neuron_config.tp_degree)
+        state_dict = expand_state_dict(
+            state_dict, config.dims, config.neuron_config.tp_degree
+        )
         return state_dict
 
     def forward(
-        self, text: torch.Tensor, audio: torch.Tensor, last_pos: torch.Tensor, pad_mask: torch.Tensor
+        self,
+        text: torch.Tensor,
+        audio: torch.Tensor,
+        last_pos: torch.Tensor,
+        pad_mask: torch.Tensor,
     ) -> torch.Tensor:
         """
         Forward pass for the Whisper decoder.
@@ -683,31 +860,52 @@ class NeuronApplicationWhisper(Whisper):
         self.encoder_path_suffix = "encoder"
         self.decoder_path_suffix = "decoder"
         self.encoder = NeuronApplicationWhisperEncoder(
-            model_path=os.path.join(model_path, self.encoder_path_suffix), config=config, *args, **kwargs
+            model_path=os.path.join(model_path, self.encoder_path_suffix),
+            config=config,
+            *args,
+            **kwargs,
         )
         self.decoder = NeuronApplicationWhisperDecoder(
-            model_path=os.path.join(model_path, self.decoder_path_suffix), config=config, *args, **kwargs
+            model_path=os.path.join(model_path, self.decoder_path_suffix),
+            config=config,
+            *args,
+            **kwargs,
         )
 
     def compile(self, compiled_model_path, *args, **kwargs):
-        self.encoder.compile(os.path.join(compiled_model_path, self.encoder_path_suffix), *args, **kwargs)
-        self.decoder.compile(os.path.join(compiled_model_path, self.decoder_path_suffix), *args, **kwargs)
+        self.encoder.compile(
+            os.path.join(compiled_model_path, self.encoder_path_suffix), *args, **kwargs
+        )
+        self.decoder.compile(
+            os.path.join(compiled_model_path, self.decoder_path_suffix), *args, **kwargs
+        )
 
     def load(self, compiled_model_path, *args, **kwargs):
-        self.encoder.load(os.path.join(compiled_model_path, self.encoder_path_suffix), *args, **kwargs)
-        self.decoder.load(os.path.join(compiled_model_path, self.decoder_path_suffix), *args, **kwargs)
+        self.encoder.load(
+            os.path.join(compiled_model_path, self.encoder_path_suffix), *args, **kwargs
+        )
+        self.decoder.load(
+            os.path.join(compiled_model_path, self.decoder_path_suffix), *args, **kwargs
+        )
 
     def logits(self, tokens: torch.Tensor, audio_features: torch.Tensor):
         tokens = tokens.to(torch.int32)
         padded_tokens, last_pos, pad_mask = self._prepare_decoder_inputs(tokens)
         return self.decoder(
-            padded_tokens, audio_features.to(self.config.neuron_config.torch_dtype), last_pos, pad_mask
-        )[:, : last_pos + 1]
+            padded_tokens,
+            audio_features.to(self.config.neuron_config.torch_dtype),
+            last_pos,
+            pad_mask,
+        )[:, : last_pos.max() + 1]
 
     def _prepare_decoder_inputs(self, tokens: torch.Tensor):
         pad_token = -1
-        last_pos = torch.tensor([len(prompt) - 1 for prompt in tokens], dtype=torch.int32)
-        padded_tokens = F.pad(tokens, (0, self.dims.n_text_ctx - tokens.shape[1]), value=pad_token)
+        last_pos = torch.tensor(
+            [len(prompt) - 1 for prompt in tokens], dtype=torch.int32
+        )
+        padded_tokens = F.pad(
+            tokens, (0, self.dims.n_text_ctx - tokens.shape[1]), value=pad_token
+        )
         pad_mask = torch.where(padded_tokens != pad_token, 1, 0).to(torch.int32)
         padded_tokens = torch.where(padded_tokens == pad_token, 0, padded_tokens)
         return padded_tokens, last_pos, pad_mask

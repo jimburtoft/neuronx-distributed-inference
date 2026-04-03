@@ -9,7 +9,9 @@ from torch import Tensor
 from whisper.decoding import DecodingOptions, DecodingResult, DecodingTask, Inference
 
 if TYPE_CHECKING:
-    from neuronx_distributed_inference.models.whisper.modeling_whisper import NeuronApplicationWhisper as Whisper
+    from neuronx_distributed_inference.models.whisper.modeling_whisper import (
+        NeuronApplicationWhisper as Whisper,
+    )
 
 
 class NeuronInference(Inference):
@@ -27,7 +29,9 @@ class NeuronInference(Inference):
             return self.model.decoder(tokens, audio_features, last_pos, pad_mask)
         else:
             tokens = padded_tokens
-        return self.model.decoder(tokens, audio_features, last_pos, pad_mask)[:, : last_pos + 1]
+        return self.model.decoder(tokens, audio_features, last_pos, pad_mask)[
+            :, : last_pos.max() + 1
+        ]
 
 
 class NeuronDecodingTask(DecodingTask):
@@ -38,7 +42,10 @@ class NeuronDecodingTask(DecodingTask):
 
 @torch.no_grad()
 def decode(
-    model: "Whisper", mel: Tensor, options: DecodingOptions = DecodingOptions(), **kwargs
+    model: "Whisper",
+    mel: Tensor,
+    options: DecodingOptions = DecodingOptions(),
+    **kwargs,
 ) -> Union[DecodingResult, List[DecodingResult]]:
     """
     Performs decoding of 30-second audio segment(s), provided as Mel spectrogram(s).
