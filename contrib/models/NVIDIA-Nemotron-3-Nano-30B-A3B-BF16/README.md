@@ -7,6 +7,7 @@ NeuronX Distributed Inference implementation of NVIDIA's [Nemotron-3-Nano-30B-A3
 - **HuggingFace ID:** `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16`
 - **Model Type:** Hybrid Mamba2/Attention with MoE
 - **Parameters:** 31.58B total (~3.5B active per token with top-6 routing)
+- **Architecture:** Mamba-2 SSM + GQA Attention + MoE (128 routed + 1 shared expert, top-6 sigmoid routing)
 - **License:** NVIDIA Open Model License
 
 ## Architecture Details
@@ -44,7 +45,7 @@ The key challenge for hybrid architectures is persisting Mamba2 recurrent state 
 2. `NemotronDecoderModelInstance` (extends `DecoderModelInstance`) adds these parameters to `input_output_aliases` after the standard KV cache entries
 3. `NeuronNemotronMamba2Layer.forward()` accepts and returns state as explicit tensor arguments
 4. The output list is: `[logits, K0, V0, ..., conv_state_0, ssm_state_0, ...]`
-5. Non-attention layers return dummy `(1,1,1,1)` KV tuples to satisfy `KVCacheManager`
+5. Non-attention layers return dummy `(batch_size,1,1,1)` KV tuples to satisfy `KVCacheManager`
 
 ### MoE with TP Sharding
 
@@ -70,9 +71,10 @@ The codebase includes an optional O(L) NKI selective scan kernel (ported from Gr
 
 ## Validation Results
 
-**Validated:** 2026-04-02
+**Validated:** 2026-04-03
 **Configuration:** TP=4, batch_size=1, seq_len=2048, max_context_length=128, bfloat16
-**Instance:** trn2.3xlarge (LNC=2, SDK 2.28)
+**Instance:** trn2.3xlarge (LNC=2)
+**SDK:** Neuron SDK 2.28, PyTorch 2.9
 
 ### Prefill Accuracy (vs HF BF16 CPU, 11 prompts)
 
@@ -95,16 +97,19 @@ Both Neuron and HF reference produce correct first tokens, followed by greedy re
 
 ### Inference Performance
 
-| Metric | Value |
+| Configuration | TTFT (ms) | Decode (tok/s) | TPOT (ms) |
+|--------------|-----------|----------------|-----------|
+| **BS=1, seq_len=2048** | 211 | 18.3 | 54.6 |
+| **BS=2, seq_len=2048** | 263 | 22.0 | — |
+
+All measurements on trn2.3xlarge (TP=4, LNC=2, BF16).
+
+| Metric | Value (BS=1) |
 |--------|-------|
-| TTFT (P50) | 211 ms |
-| Decode throughput (P50) | 18.3 tok/s |
-| TPOT (P50) | 54.6 ms |
 | Model load time | 16.9 s |
 | HBM per core (est.) | ~14.7 GB / 24 GB (61%) |
-| Instance | trn2.3xlarge (TP=4, LNC=2, BF16) |
 
-TPOT is extremely stable: P50-P99 spread < 0.3 ms.
+TPOT is extremely stable at BS=1: P50-P99 spread < 0.3 ms.
 
 ### Compilation
 
@@ -206,28 +211,45 @@ sudo swapon /mnt/models/swapfile
 | Instance Type | SDK 2.28 | SDK 2.27 |
 |--------------|----------|----------|
 | trn2.3xlarge (TP=4, LNC=2) | Validated | Not tested |
-| trn2.48xlarge (TP=4, LNC=2) | Expected compatible | Not tested |
+| trn2.48xlarge (TP=4, LNC=2) | Not tested | Not tested |
 | trn1.32xlarge | Not tested | Not tested |
 
-## Testing
+## Example Checkpoints
+
+* [nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16)
+
+## Testing Instructions
 
 ```bash
-# Run with pytest
-cd contrib/
+# Run standard integration tests (compile + behavioral accuracy + throughput)
+# First compile takes ~32 min; subsequent runs load from cache
 pytest test/integration/test_model.py -v
 
-# Or run directly
+# Run all tests including logit validation against CPU BF16 reference
+# Requires ~60 GB free CPU RAM to load the 30B HF model
+pytest test/integration/test_model.py -v --run-slow
+
+# Or run directly (compiles if needed)
 python test/integration/test_model.py
+
+# Enable logit validation when running directly
+RUN_LOGIT_VALIDATION=1 python test/integration/test_model.py
 
 # Quick smoke test (requires pre-compiled model)
 python test_smoke.py
 ```
 
-## Known Limitations
+**Environment variables:**
+- `NEMOTRON_MODEL_PATH` — Path to HF model (default: `/mnt/models/nemotron-30b`)
+- `NEMOTRON_COMPILED_PATH` — Path for compiled model (default: `/mnt/models/nemotron_compiled_contrib`)
+- `RUN_LOGIT_VALIDATION` — Set to `1` to enable logit validation when running directly
+
+## Known Issues
 
 1. **Maximum context length is 128.** The 23 Mamba layers require persistent state buffers (conv_state + ssm_state) per core. At longer context lengths, per-core I/O tensors exceed the 24 GB HBM bank limit.
-2. **Batch size 1 only.** batch_size > 1 has not been validated.
-3. **No on-device sampling tested.** Current validation uses raw logits (`on_device_sampling_config=None`).
+2. **Maximum batch size is 2 on trn2.3xlarge (LNC=2).** BS=4 compiles successfully but exceeds HBM during model load (CE model allocation fails on 24 GB/core). BS=4 would require trn2.48xlarge or LNC=1 (not tested).
+3. **Maximum seq_len validated is 2048.** Higher seq_len (4096, 8192) not tested due to compilation disk space constraints.
+4. **No on-device sampling tested.** Current validation uses raw logits (`on_device_sampling_config=None`).
 4. **Per-expert loop for MoE.** The 128-expert routing uses a Python loop over selected experts. A fused NKI MoE kernel would improve throughput but requires relu2 activation support not currently available.
 5. **Conv1d workaround.** Manual depthwise convolution avoids TEN404 but may be slower than native conv1d once the SDK issue is fixed.
 6. **Base model behavior.** This is a base (non-instruct) model. Greedy decoding produces repetitive output after the first few correct tokens, consistent with the HF reference.
@@ -244,11 +266,13 @@ During development, we discovered and documented several issues in the original 
 
 | File | Description | Lines |
 |------|-------------|-------|
-| `src/modeling_nemotron_h.py` | Full model implementation (config, Mamba layer, attention, MoE, NKI scan, model wrapper, state dict conversion) | ~1880 |
-| `src/__init__.py` | Public exports | ~28 |
-| `test/integration/test_model.py` | Integration tests (compile, load, generate, coherence, throughput) | ~270 |
-| `test_smoke.py` | Quick smoke test for pre-compiled model | ~70 |
+| `src/modeling_nemotron_h.py` | Full model implementation (config, Mamba layer, attention, MoE, NKI scan, model wrapper, state dict conversion) | ~1893 |
+| `src/__init__.py` | Public exports | ~27 |
+| `test/integration/test_model.py` | Integration tests (compile, load, generate, logit validation, throughput) | ~441 |
+| `test_smoke.py` | Quick smoke test for pre-compiled model | ~79 |
 
 ## Maintainer
 
-**Last Updated:** 2026-04-02
+Jim Burtoft ([@jimburtoft](https://github.com/jimburtoft))
+
+**Last Updated:** 2026-04-03

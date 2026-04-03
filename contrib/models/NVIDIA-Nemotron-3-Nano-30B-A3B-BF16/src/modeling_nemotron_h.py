@@ -619,8 +619,13 @@ class NeuronNemotronMamba2Layer(nn.Module):
             )
 
         # Dummy KV cache for compatibility with attention-based generation loop
-        dummy_k = torch.zeros(1, 1, 1, 1, dtype=output.dtype, device=output.device)
-        dummy_v = torch.zeros(1, 1, 1, 1, dtype=output.dtype, device=output.device)
+        # Must include batch dimension for BS>1 support
+        dummy_k = torch.zeros(
+            batch_size, 1, 1, 1, dtype=output.dtype, device=output.device
+        )
+        dummy_v = torch.zeros(
+            batch_size, 1, 1, 1, dtype=output.dtype, device=output.device
+        )
 
         return (output, (dummy_k, dummy_v), (conv_state_new, ssm_state_new))
 
@@ -1036,8 +1041,14 @@ class NeuronNemotronMoELayer(BaseParallelLinear):
         result = result.reshape(orig_shape).to(dtype)
 
         # Dummy KV cache for compatibility
-        dummy_k = torch.zeros(1, 1, 1, 1, dtype=result.dtype, device=result.device)
-        dummy_v = torch.zeros(1, 1, 1, 1, dtype=result.dtype, device=result.device)
+        # Must include batch dimension for BS>1 support
+        batch_size = orig_shape[0]
+        dummy_k = torch.zeros(
+            batch_size, 1, 1, 1, dtype=result.dtype, device=result.device
+        )
+        dummy_v = torch.zeros(
+            batch_size, 1, 1, 1, dtype=result.dtype, device=result.device
+        )
 
         return (result, (dummy_k, dummy_v), None)
 
