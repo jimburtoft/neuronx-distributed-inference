@@ -97,12 +97,14 @@ Both Neuron and HF reference produce correct first tokens, followed by greedy re
 
 ### Inference Performance
 
-| Configuration | TTFT (ms) | Decode (tok/s) | TPOT (ms) |
-|--------------|-----------|----------------|-----------|
-| **BS=1, seq_len=2048** | 211 | 18.3 | 54.6 |
-| **BS=2, seq_len=2048** | 263 | 22.0 | — |
+| Configuration | TTFT (ms) | Decode (tok/s) | TPOT (ms) | Compile (s) |
+|--------------|-----------|----------------|-----------|-------------|
+| **BS=1, seq_len=2048** | 211 | 18.3 | 54.6 | 1958 |
+| **BS=2, seq_len=2048** | 263 | 22.0 | — | 2426 |
+| **BS=1, seq_len=4096** | 210.5 | 16.0 | — | 2129 |
+| **BS=1, seq_len=8192** | 211.3 | 15.8 | — | 2285 |
 
-All measurements on trn2.3xlarge (TP=4, LNC=2, BF16).
+All measurements on trn2.3xlarge (TP=4, LNC=2, BF16, max_context_length=128).
 
 | Metric | Value (BS=1) |
 |--------|-------|
@@ -248,7 +250,7 @@ python test_smoke.py
 
 1. **Maximum context length is 128.** The 23 Mamba layers require persistent state buffers (conv_state + ssm_state) per core. At longer context lengths, per-core I/O tensors exceed the 24 GB HBM bank limit.
 2. **Maximum batch size is 2 on trn2.3xlarge (LNC=2).** BS=4 compiles successfully but exceeds HBM during model load (CE model allocation fails on 24 GB/core). BS=4 would require trn2.48xlarge or LNC=1 (not tested).
-3. **Maximum seq_len validated is 2048.** Higher seq_len (4096, 8192) not tested due to compilation disk space constraints.
+3. **Validated seq_len up to 8192.** seq_len=4096 and seq_len=8192 both compile, load, and generate correctly with stable throughput (~16 tok/s) and TTFT (~211 ms).
 4. **No on-device sampling tested.** Current validation uses raw logits (`on_device_sampling_config=None`).
 4. **Per-expert loop for MoE.** The 128-expert routing uses a Python loop over selected experts. A fused NKI MoE kernel would improve throughput but requires relu2 activation support not currently available.
 5. **Conv1d workaround.** Manual depthwise convolution avoids TEN404 but may be slower than native conv1d once the SDK issue is fixed.
@@ -275,4 +277,4 @@ During development, we discovered and documented several issues in the original 
 
 Jim Burtoft ([@jimburtoft](https://github.com/jimburtoft))
 
-**Last Updated:** 2026-04-03
+**Last Updated:** 2026-04-04
