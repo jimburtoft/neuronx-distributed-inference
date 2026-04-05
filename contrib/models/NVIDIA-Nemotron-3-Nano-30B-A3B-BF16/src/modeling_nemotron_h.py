@@ -992,36 +992,78 @@ class NeuronNemotronMoELayer(BaseParallelLinear):
 
         # Flatten
         hidden_flat = hidden_states.reshape(-1, self.hidden_size)
+        batch_tokens = hidden_flat.shape[0]
 
         # Route
         topk_indices, topk_weights = self.gate(hidden_flat)
 
-        # Build per-expert affinity mask: (tokens, num_experts)
-        batch_tokens = hidden_flat.shape[0]
-        expert_affinities = torch.zeros(
-            batch_tokens,
-            self.num_experts,
-            device=hidden_flat.device,
-            dtype=topk_weights.dtype,
-        )
-        expert_affinities.scatter_(1, topk_indices, topk_weights)
-
-        # Per-expert loop: compute one expert at a time, accumulate weighted output.
-        # Each expert's weights are TP-sharded: up is (H, I/TP), down is (I/TP, H).
-        # Output is partial sums -- all-reduce happens after combining with shared expert.
         output = torch.zeros(
             batch_tokens,
             self.hidden_size,
             device=hidden_flat.device,
             dtype=dtype,
         )
-        for e in range(self.num_experts):
-            w_up = self.expert_up[e]  # (H, I/TP) after sharding
-            w_down = self.expert_down[e]  # (I/TP, H) after sharding
-            intermediate = relu2(hidden_flat @ w_up)  # (T, I/TP)
-            expert_out = intermediate @ w_down  # (T, H) -- partial sum
-            affinity = expert_affinities[:, e].unsqueeze(-1)  # (T, 1)
-            output = output + expert_out * affinity
+
+        # Dual dispatch strategy based on sequence length:
+        #
+        # DECODE (batch_tokens <= batch_size, i.e. small T):
+        #   Sparse dispatch — only load the 6 selected experts' weights.
+        #   Uses index_select + bmm for each of the top-K expert slots.
+        #   Cuts MoE weight traffic by ~21x (6 vs 128 expert loads).
+        #
+        # PREFILL (batch_tokens = seq_len, i.e. large T):
+        #   Dense dispatch — loop over all 128 experts with affinity masking.
+        #   The index_select + bmm approach explodes the HLO graph at T=128
+        #   because each of 128 tokens may select different experts per slot,
+        #   creating massive gather operations. The dense loop with simple
+        #   matmul + mask is cheaper to compile and equally fast (prefill is
+        #   compute-bound, not bandwidth-bound).
+        #
+        # NxDI traces CE and TG as separate graphs. batch_tokens is a static
+        # shape at trace time, so this if/else is resolved during tracing
+        # and only the relevant branch is compiled into each NEFF.
+
+        if batch_tokens <= 2:
+            # SPARSE DECODE PATH: only 6 experts loaded
+            for k in range(self.gate.top_k):
+                expert_idx = topk_indices[:, k]  # (T,)
+                weight = topk_weights[:, k].unsqueeze(-1)  # (T, 1)
+
+                # Gather selected expert weights
+                w_up = torch.index_select(self.expert_up, 0, expert_idx)  # (T, H, I/TP)
+                w_down = torch.index_select(
+                    self.expert_down, 0, expert_idx
+                )  # (T, I/TP, H)
+
+                # Batched matmul
+                intermediate = torch.bmm(hidden_flat.unsqueeze(1), w_up).squeeze(
+                    1
+                )  # (T, I/TP)
+                intermediate = relu2(intermediate)
+
+                expert_out = torch.bmm(intermediate.unsqueeze(1), w_down).squeeze(
+                    1
+                )  # (T, H) partial sum
+
+                output = output + expert_out * weight
+
+        else:
+            # DENSE PREFILL PATH: loop over all 128 experts with masking
+            expert_affinities = torch.zeros(
+                batch_tokens,
+                self.num_experts,
+                device=hidden_flat.device,
+                dtype=topk_weights.dtype,
+            )
+            expert_affinities.scatter_(1, topk_indices, topk_weights)
+
+            for e in range(self.num_experts):
+                w_up = self.expert_up[e]  # (H, I/TP)
+                w_down = self.expert_down[e]  # (I/TP, H)
+                intermediate = relu2(hidden_flat @ w_up)  # (T, I/TP)
+                expert_out = intermediate @ w_down  # (T, H) partial sum
+                affinity = expert_affinities[:, e].unsqueeze(-1)  # (T, 1)
+                output = output + expert_out * affinity
 
         # Shared expert (also produces partial sums due to TP sharding)
         shared_intermediate = relu2(
@@ -1754,7 +1796,12 @@ def _remap_hf_key(key: str, config) -> Optional[str]:
             return f"layers.{layer_idx}.input_layernorm.weight"
 
         if layer_type == "attention":
-            # Attention: layers.{i}.mixer.q_proj -> layers.{i}.self_attn.q_proj
+            # Attention: NxDI's preshard_hook in GroupQueryAttention_QKV/O
+            # handles the remapping from flat keys to nested module paths.
+            # We just need to replace .mixer. with .self_attn.:
+            #   HF: backbone.layers.{i}.mixer.q_proj.weight
+            #   Our state_dict: layers.{i}.self_attn.q_proj.weight
+            #   preshard_hook: -> layers.{i}.self_attn.qkv_proj.q_proj.weight
             if ".mixer." in layer_key:
                 return layer_key.replace(".mixer.", ".self_attn.")
 
@@ -1785,7 +1832,7 @@ def _convert_nemotron_hf_to_neuron_state_dict(
         embed_tokens.weight
         layers.{i}.input_layernorm.weight
         layers.{i}.mixer.{...}  (Mamba/MoE)
-        layers.{i}.self_attn.{...}  (Attention)
+        layers.{i}.self_attn.{...}  (Attention -- preshard_hook adds nesting)
         norm.weight
         lm_head.weight
     """

@@ -47,7 +47,7 @@ The key challenge for hybrid architectures is persisting Mamba2 recurrent state 
 4. The output list is: `[logits, K0, V0, ..., conv_state_0, ssm_state_0, ...]`
 5. Non-attention layers return dummy `(batch_size,1,1,1)` KV tuples to satisfy `KVCacheManager`
 
-### MoE with TP Sharding
+### MoE with TP Sharding and Sparse Expert Dispatch
 
 The 128-expert MoE layers use tensor-parallel sharding on the intermediate dimension:
 - Expert weights stored at per-TP-rank size: `up (E, H, I/TP)`, `down (E, I/TP, H)`
@@ -55,7 +55,12 @@ The 128-expert MoE layers use tensor-parallel sharding on the intermediate dimen
 - Delayed all-reduce after combining routed + shared expert outputs
 - Sigmoid routing with `e_score_correction_bias` (top-6 selection per token)
 - relu2 activation (non-gated MLP)
-- Per-expert Python loop (avoids HBM allocation failure from batched BMM)
+
+**Dual-path MoE dispatch** optimizes decode throughput by 3.8x:
+- **Decode path** (`batch_tokens <= 2`): Sparse dispatch using `torch.index_select` to load only the 6 selected experts' weights, followed by `torch.bmm`. This reduces HBM bandwidth from 640 MB → 30 MB per MoE layer.
+- **Prefill path** (`batch_tokens > 2`): Dense per-expert Python loop over all 128 experts (sparse dispatch creates HLO graph explosion at `seq_len=128`).
+- NxDI traces CE and TG as separate XLA graphs, so `batch_tokens` is a static compile-time constant. The `if/else` is resolved during tracing — no dynamic control flow at runtime.
+- Output is **bit-for-bit identical** between sparse and dense paths (verified 30/30 tokens).
 
 ### Manual Depthwise Conv1d
 
@@ -99,12 +104,15 @@ Both Neuron and HF reference produce correct first tokens, followed by greedy re
 
 | Configuration | TTFT (ms) | Decode (tok/s) | TPOT (ms) | Compile (s) |
 |--------------|-----------|----------------|-----------|-------------|
-| **BS=1, seq_len=2048** | 211 | 18.3 | 54.6 | 1958 |
-| **BS=2, seq_len=2048** | 263 | 22.0 | — | 2426 |
-| **BS=1, seq_len=4096** | 210.5 | 16.0 | — | 2129 |
-| **BS=1, seq_len=8192** | 211.3 | 15.8 | — | 2285 |
+| **BS=1, seq_len=2048 (sparse MoE)** | 211 | **66.6** | **15.0** | 731 |
+| BS=1, seq_len=2048 (dense MoE) | 211 | 17.4 | 57.5 | 274 |
+| BS=2, seq_len=2048 | 263 | 22.0 | — | 2426 |
+| BS=1, seq_len=4096 | 210.5 | 16.0 | — | 2129 |
+| BS=1, seq_len=8192 | 211.3 | 15.8 | — | 2285 |
 
 All measurements on trn2.3xlarge (TP=4, LNC=2, BF16, max_context_length=128).
+
+**Sparse expert dispatch** (default) achieves **3.83x decode speedup** by loading only the 6 active expert weights per MoE layer during decode, instead of all 128. Output is bit-for-bit identical to the dense path.
 
 | Metric | Value (BS=1) |
 |--------|-------|
@@ -117,7 +125,8 @@ TPOT is extremely stable at BS=1: P50-P99 spread < 0.3 ms.
 
 | Metric | Value |
 |--------|-------|
-| Compile time | ~32 min (trn2.3xlarge, first compile) |
+| Compile time (sparse MoE) | ~12 min (trn2.3xlarge) |
+| Compile time (dense MoE) | ~5 min (trn2.3xlarge) |
 | Compiler flags | `-O1 --auto-cast=none --enable-mixed-precision-accumulation` |
 | Compiler RAM | >88 GB (requires 128 GB swap on NVMe) |
 
@@ -252,9 +261,9 @@ python test_smoke.py
 2. **Maximum batch size is 2 on trn2.3xlarge (LNC=2).** BS=4 compiles successfully but exceeds HBM during model load (CE model allocation fails on 24 GB/core). BS=4 would require trn2.48xlarge or LNC=1 (not tested).
 3. **Validated seq_len up to 8192.** seq_len=4096 and seq_len=8192 both compile, load, and generate correctly with stable throughput (~16 tok/s) and TTFT (~211 ms).
 4. **No on-device sampling tested.** Current validation uses raw logits (`on_device_sampling_config=None`).
-4. **Per-expert loop for MoE.** The 128-expert routing uses a Python loop over selected experts. A fused NKI MoE kernel would improve throughput but requires relu2 activation support not currently available.
 5. **Conv1d workaround.** Manual depthwise convolution avoids TEN404 but may be slower than native conv1d once the SDK issue is fixed.
 6. **Base model behavior.** This is a base (non-instruct) model. Greedy decoding produces repetitive output after the first few correct tokens, consistent with the HF reference.
+7. **Sparse dispatch prefill fallback.** The prefill (context encoding) path uses a dense per-expert loop because sparse `index_select` on 128 experts at `seq_len=128` creates HLO graph explosion exceeding the 5M instruction limit. A fused NKI MoE kernel could address this.
 
 ## HuggingFace Model Issues Found
 
@@ -268,7 +277,7 @@ During development, we discovered and documented several issues in the original 
 
 | File | Description | Lines |
 |------|-------------|-------|
-| `src/modeling_nemotron_h.py` | Full model implementation (config, Mamba layer, attention, MoE, NKI scan, model wrapper, state dict conversion) | ~1893 |
+| `src/modeling_nemotron_h.py` | Full model implementation (config, Mamba layer, attention, MoE with sparse dispatch, NKI scan, model wrapper, state dict conversion) | ~1940 |
 | `src/__init__.py` | Public exports | ~27 |
 | `test/integration/test_model.py` | Integration tests (compile, load, generate, logit validation, throughput) | ~441 |
 | `test_smoke.py` | Quick smoke test for pre-compiled model | ~79 |
@@ -277,4 +286,4 @@ During development, we discovered and documented several issues in the original 
 
 Jim Burtoft ([@jimburtoft](https://github.com/jimburtoft))
 
-**Last Updated:** 2026-04-04
+**Last Updated:** 2026-04-05
