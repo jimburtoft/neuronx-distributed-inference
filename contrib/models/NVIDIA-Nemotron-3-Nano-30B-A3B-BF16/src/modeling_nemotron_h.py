@@ -25,7 +25,7 @@ NVIDIA Nemotron-3-Nano-30B-A3B is a hybrid Mamba2/Attention/MoE architecture:
 Key implementation details:
 - Mamba state persistence via nn.ParameterList + input_output_aliases
   (same mechanism as KV cache, following Granite4 pattern)
-- Manual depthwise conv1d to avoid TEN404 NKI kernel bug on seq_len=1
+- Manual depthwise conv1d to avoid TEN404 NKI kernel issue on seq_len=1
 - Full-sequence parallel scan for prefill (O(L) NKI or O(L^2) quadratic fallback), O(1) recurrence for decode
 - Per-expert Python loop for MoE (avoids HBM allocation failure from batched BMM)
 - NeuronAttentionBase for GQA with RoPE
@@ -339,7 +339,7 @@ class NemotronRMSNormGated(nn.Module):
 
     CRITICAL: Uses group_size for per-group normalization. The CUDA rmsnorm_fn
     normalizes per-group (groups of group_size elements), NOT over the full dim.
-    The HF PyTorch fallback has a bug where it ignores group_size and normalizes
+    The HF PyTorch fallback has an issue where it ignores group_size and normalizes
     over the full dimension, producing garbage decode output.
 
     For Nemotron: intermediate_size=4096, n_groups=8, group_size=512.

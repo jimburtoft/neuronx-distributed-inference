@@ -203,7 +203,7 @@ The original HuggingFace `modeling_nemotron_h.py` has several issues that must b
 
 1. **CUDA import fallbacks** — `rmsnorm_fn`, `selective_state_update`, `causal_conv1d` imports fail without CUDA. Wrap in try/except.
 2. **Per-group RMSNorm** — `MambaRMSNormGated.forward()` PyTorch fallback ignores `group_size`, producing incorrect normalization. Add per-group CPU fallback.
-3. **Cache attribute bugs** — `HybridMambaAttentionDynamicCache` accesses `.device` on Python lists instead of tensor elements.
+3. **Cache attribute issues** — `HybridMambaAttentionDynamicCache` accesses `.device` on Python lists instead of tensor elements.
 4. **`torch.cuda.stream`** — Replace with `if True:` for non-CUDA backends.
 
 ### Swap Space
@@ -270,7 +270,7 @@ python test_smoke.py
 During development, we discovered and documented several issues in the original HuggingFace `modeling_nemotron_h.py`:
 
 1. **`MambaRMSNormGated` ignores `group_size`** — The PyTorch fallback normalizes over the full hidden dimension instead of per-group. The CUDA Triton kernel is correct. This causes incoherent decode output on CPU/non-CUDA backends.
-2. **`HybridMambaAttentionDynamicCache` attribute bugs** — `self.ssm_states` and `self.conv_states` are Python lists but accessed as tensors (`.device`, `.zero_()`).
+2. **`HybridMambaAttentionDynamicCache` attribute issues** — `self.ssm_states` and `self.conv_states` are Python lists but accessed as tensors (`.device`, `.zero_()`).
 3. **Cache key mismatch** — `prepare_inputs_for_generation()` stores cache under `"past_key_values"` but `forward()` expects `"cache_params"`, preventing proper state persistence in HF's `generate()`.
 
 ## Source Files
