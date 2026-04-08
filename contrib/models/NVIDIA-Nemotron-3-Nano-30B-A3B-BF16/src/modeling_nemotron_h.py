@@ -81,7 +81,9 @@ logger = logging.getLogger(__name__)
 # Set USE_NKI_SCAN = False to fall back to the quadratic implementation.
 # Ported from Granite4 contrib (working/Granite4/contrib/src/modeling_granite.py).
 
-USE_NKI_SCAN = False  # NKI scan is 23x slower TTFT at L=128; quadratic O(L^2) is faster in practice
+USE_NKI_SCAN = (
+    False  # O(L^2) quadratic scan: NKI scan produces more instructions at long context
+)
 
 try:
     import nki
@@ -1477,6 +1479,7 @@ class NeuronNemotronModel(NeuronBaseModel):
                 local_mask=local_attn_mask,
                 padding_mask=padding_mask,
                 mamba_state=mamba_state,
+                windowed_context_encoding_window_idx=windowed_context_encoding_window_idx,
                 **kwargs,
             )
 
@@ -1555,10 +1558,6 @@ class NeuronNemotronModel(NeuronBaseModel):
 
         is_for_context_encoding = self._is_context_encoding(input_ids)
 
-        # Derive Mamba padding mask from raw attention_mask BEFORE it's
-        # converted to 4D attn_mask.  attention_mask is (B, S) with 1=real, 0=pad.
-        # NxDI sets position_ids=1 for padding positions, so re-deriving from
-        # position_ids is unreliable.  attention_mask is always correct.
         if attention_mask is not None and is_for_context_encoding:
             padding_mask = attention_mask.float()
         else:
@@ -1589,7 +1588,6 @@ class NeuronNemotronModel(NeuronBaseModel):
             padding_mask=padding_mask,
         )
 
-        # Slice to last token for context encoding
         batch_size = input_ids.shape[0]
         if not self.sliced_hidden:
             if not (
@@ -1682,7 +1680,8 @@ class NeuronNemotronForCausalLM(NeuronBaseForCausalLM):
         return (
             "--enable-saturate-infinity --enable-mixed-precision-accumulation "
             "--model-type transformer -O1 "
-            "--auto-cast=none"
+            "--auto-cast=none "
+            "--internal-max-instruction-limit=15000000"
         )
 
     def get_model_wrapper_cls(self):
