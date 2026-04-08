@@ -1286,11 +1286,15 @@ class NemotronModelWrapper(ModelWrapper):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Disable the HLO verifier instruction count check (NCC_EVRF007).
-        # model_wrapper.py appends --verify-hlo=true; we flip it.
+        # Raise the instruction count limit everywhere to handle the Mamba-2
+        # quadratic scan's ~6.86M instructions at max_context_length>=4224.
+        # Three checks must be bypassed:
+        #   1. HLO verifier (NCC_EVRF007) -- via --tiled-inst-limit in hlo2tensorizer
+        #   2. Backend limit (NCC_EBVF030) -- via --internal-max-instruction-limit
+        #   3. Backend verifier -- via --internal-backend-options --max-instruction-limit
         if hasattr(self, "compiler_args") and self.compiler_args:
             self.compiler_args = self.compiler_args.replace(
-                "--verify-hlo=true", "--verify-hlo=false"
+                "--verify-hlo=true", "--verify-hlo=false --tiled-inst-limit=15000000"
             )
 
     def get_model_instance(self):
@@ -1698,7 +1702,8 @@ class NeuronNemotronForCausalLM(NeuronBaseForCausalLM):
             "--enable-saturate-infinity --enable-mixed-precision-accumulation "
             "--model-type transformer -O1 "
             "--auto-cast=none "
-            "--internal-max-instruction-limit=15000000"
+            "--internal-max-instruction-limit=15000000 "
+            "--internal-backend-options='--max-instruction-limit=15000000'"
         )
 
     def get_model_wrapper_cls(self):
