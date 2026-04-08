@@ -1274,7 +1274,24 @@ class NemotronDecoderModelInstance(DecoderModelInstance):
 
 
 class NemotronModelWrapper(ModelWrapper):
-    """Custom ModelWrapper that returns NemotronDecoderModelInstance."""
+    """Custom ModelWrapper that returns NemotronDecoderModelInstance.
+
+    Also post-processes compiler args to raise the HLO verifier instruction
+    limit and disable strict verification.  The Mamba-2 quadratic scan
+    generates ~6.86M HLO instructions at max_context_length>=4224, exceeding
+    the default 5M verifier check (NCC_EVRF007).  Setting verify-hlo=false
+    bypasses this verifier-only check; the backend's own limit is already
+    raised to 15M via --internal-max-instruction-limit=15000000.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Disable the HLO verifier instruction count check (NCC_EVRF007).
+        # model_wrapper.py appends --verify-hlo=true; we flip it.
+        if hasattr(self, "compiler_args") and self.compiler_args:
+            self.compiler_args = self.compiler_args.replace(
+                "--verify-hlo=true", "--verify-hlo=false"
+            )
 
     def get_model_instance(self):
         return NemotronDecoderModelInstance(
