@@ -646,6 +646,88 @@ class NeuronNemotronMamba2Layer(nn.Module):
         )
         return conv_shape, ssm_shape
 
+    def preshard_hook(self, model_state_dict: dict, prefix: str) -> bool:
+        """Manually shard Mamba parameters that NxDI's shard_children won't handle.
+
+        NxDI's shard_children only processes modules in __SUPPORTED_SHARDED_MODULES
+        (ColumnParallelLinear, RowParallelLinear, etc.). NeuronNemotronMamba2 is a
+        plain nn.Module, so its manually-created nn.Parameters (out_proj_weight,
+        conv_weight, conv_bias, D, dt_bias, A_log) and norm.weight won't be sharded
+        by shard_children.
+
+        This preshard_hook is called by invoke_preshard_hook BEFORE shard_children.
+        By the time it's called, _mock_parallel_state has already set the TP rank.
+        We use the rank to slice full-size checkpoint tensors to per-rank shapes.
+
+        IMPORTANT: invoke_preshard_hook stops recursing into children when it finds
+        a preshard_hook. So we must manually forward to children's preshard_hooks
+        (e.g., ColumnParallelLinear.preshard_hook for padding).
+        """
+        if self.tp_degree <= 1:
+            return True
+
+        # Strip trailing "weight" that invoke_preshard_hook appends
+        # prefix comes in as e.g. "layers.0.mixer.weight" — we need "layers.0.mixer."
+        if prefix.endswith("weight"):
+            module_prefix = prefix[: -len("weight")]
+        elif prefix.endswith("bias"):
+            module_prefix = prefix[: -len("bias")]
+        else:
+            module_prefix = prefix
+
+        rank = parallel_state.get_tensor_model_parallel_rank()
+        tp = self.tp_degree
+
+        # Parameters to shard along dim=0 by num_heads (64 -> 8 per rank at TP=8)
+        # These map: full_size -> full_size // tp
+        head_params = ["dt_bias", "A_log", "D"]
+        for pname in head_params:
+            key = module_prefix + pname
+            if key in model_state_dict:
+                tensor = model_state_dict[key]
+                chunk_size = tensor.shape[0] // tp
+                model_state_dict[key] = tensor[
+                    rank * chunk_size : (rank + 1) * chunk_size
+                ]
+
+        # out_proj_weight: (intermediate_size_full, hidden_size) -> (intermediate_size, hidden_size)
+        # Partition along dim=0
+        key = module_prefix + "out_proj_weight"
+        if key in model_state_dict:
+            tensor = model_state_dict[key]
+            chunk_size = tensor.shape[0] // tp
+            model_state_dict[key] = tensor[rank * chunk_size : (rank + 1) * chunk_size]
+
+        # conv_weight: (conv_dim_full, kernel) -> (conv_dim, kernel)
+        # conv_bias: (conv_dim_full,) -> (conv_dim,)
+        # Partition along dim=0
+        for pname in ["conv_weight", "conv_bias"]:
+            key = module_prefix + pname
+            if key in model_state_dict:
+                tensor = model_state_dict[key]
+                chunk_size = tensor.shape[0] // tp
+                model_state_dict[key] = tensor[
+                    rank * chunk_size : (rank + 1) * chunk_size
+                ]
+
+        # norm.weight: (intermediate_size_full,) -> (intermediate_size,)
+        key = module_prefix + "norm.weight"
+        if key in model_state_dict:
+            tensor = model_state_dict[key]
+            chunk_size = tensor.shape[0] // tp
+            model_state_dict[key] = tensor[rank * chunk_size : (rank + 1) * chunk_size]
+
+        # Forward to children's preshard_hooks (invoke_preshard_hook stops
+        # recursing when it finds our preshard_hook, so we must do it manually).
+        for name, child in self._modules.items():
+            if child is not None and hasattr(child, "preshard_hook"):
+                child_prefix = module_prefix + name + "."
+                child.preshard_hook(model_state_dict, child_prefix + "weight")
+                if getattr(child, "add_bias", False):
+                    child.preshard_hook(model_state_dict, child_prefix + "bias")
+
+        return True
+
     def forward(
         self,
         hidden_states: torch.Tensor,
