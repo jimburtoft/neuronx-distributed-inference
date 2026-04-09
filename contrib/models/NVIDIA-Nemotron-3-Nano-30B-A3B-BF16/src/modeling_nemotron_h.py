@@ -1698,13 +1698,26 @@ class NeuronNemotronForCausalLM(NeuronBaseForCausalLM):
         return _convert_nemotron_hf_to_neuron_state_dict(state_dict, config)
 
     def get_compiler_args(self):
-        return (
+        args = (
             "--enable-saturate-infinity --enable-mixed-precision-accumulation "
             "--model-type transformer -O1 "
             "--auto-cast=none "
             "--internal-max-instruction-limit=15000000 "
             "--internal-backend-options='--max-instruction-limit=15000000'"
         )
+
+        # Scratchpad page size: controls HBM scratchpad allocation granularity.
+        # Must be paired with NEURON_SCRATCHPAD_PAGE_SIZE env var at runtime.
+        if getattr(self.neuron_config, "scratchpad_page_size", None):
+            args += (
+                f" --hbm-scratchpad-page-size={self.neuron_config.scratchpad_page_size}"
+            )
+
+        # Spill-reload DGE: reduces DMA ring memory for long context.
+        if getattr(self.neuron_config, "enable_spill_reload_dge", False):
+            args += " --internal-enable-dge-levels spill_reload"
+
+        return args
 
     def get_model_wrapper_cls(self):
         return NemotronModelWrapper

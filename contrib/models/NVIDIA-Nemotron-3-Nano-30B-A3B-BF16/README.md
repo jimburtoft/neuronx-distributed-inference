@@ -104,13 +104,14 @@ Both Neuron and HF reference produce correct first tokens, followed by greedy re
 
 | Configuration | TTFT (ms) | Decode (tok/s) | TPOT (ms) | Compile (s) |
 |--------------|-----------|----------------|-----------|-------------|
-| **BS=1, seq_len=2048 (sparse MoE)** | 211 | **66.6** | **15.0** | 731 |
-| BS=1, seq_len=2048 (dense MoE) | 211 | 17.4 | 57.5 | 274 |
-| BS=2, seq_len=2048 | 263 | 22.0 | — | 2426 |
-| BS=1, seq_len=4096 | 210.5 | 16.0 | — | 2129 |
-| BS=1, seq_len=8192 | 211.3 | 15.8 | — | 2285 |
+| **BS=1, seq_len=2048, ctx=128 (sparse MoE)** | 211 | **66.6** | **15.0** | 731 |
+| BS=1, seq_len=2048, ctx=128 (dense MoE) | 211 | 17.4 | 57.5 | 274 |
+| **BS=1, seq_len=4096, ctx=256 (sparse MoE)** | **436** | **45.8** | — | 916 |
+| BS=2, seq_len=2048, ctx=128 | 263 | 22.0 | — | 2426 |
+| BS=1, seq_len=4096, ctx=128 | 210.5 | 16.0 | — | 2129 |
+| BS=1, seq_len=8192, ctx=128 | 211.3 | 15.8 | — | 2285 |
 
-All measurements on trn2.3xlarge (TP=4, LNC=2, BF16, max_context_length=128).
+All measurements on trn2.3xlarge (TP=4, LNC=2, BF16).
 
 **Sparse expert dispatch** (default) achieves **3.83x decode speedup** by loading only the 6 active expert weights per MoE layer during decode, instead of all 128. Output is bit-for-bit identical to the dense path.
 
@@ -127,7 +128,7 @@ TPOT is extremely stable at BS=1: P50-P99 spread < 0.3 ms.
 |--------|-------|
 | Compile time (sparse MoE) | ~12 min (trn2.3xlarge) |
 | Compile time (dense MoE) | ~5 min (trn2.3xlarge) |
-| Compiler flags | `-O1 --auto-cast=none --enable-mixed-precision-accumulation` |
+| Compiler flags | `-O1 --auto-cast=none --enable-mixed-precision-accumulation --model-type transformer` |
 | Compiler RAM | >88 GB (requires 128 GB swap on NVMe) |
 
 ## Usage
@@ -257,7 +258,7 @@ python test_smoke.py
 
 ## Known Issues
 
-1. **Maximum context length is 128.** The 23 Mamba layers require persistent state buffers (conv_state + ssm_state) per core. At longer context lengths, per-core I/O tensors exceed the 24 GB HBM bank limit.
+1. **Maximum context length is 256 on trn2.3xlarge (LNC=2).** ctx=128 and ctx=256 are validated. ctx=512 compiles but OOM on load — the CE model's 14.8 GB tensors + 7.5 GB scratchpad (Mamba-2 quadratic scan at 512 tokens) exceed the 24 GB/core HBM limit. Tested compiler scratchpad tuning flags (`--hbm-scratchpad-page-size`, `--internal-enable-dge-levels spill_reload`, removing `--model-type transformer`) — none overcome this fundamental HBM constraint. ctx=512+ requires trn2.48xlarge or model precision reduction.
 2. **Maximum batch size is 2 on trn2.3xlarge (LNC=2).** BS=4 compiles successfully but exceeds HBM during model load (CE model allocation fails on 24 GB/core). BS=4 would require trn2.48xlarge or LNC=1 (not tested).
 3. **Validated seq_len up to 8192.** seq_len=4096 and seq_len=8192 both compile, load, and generate correctly with stable throughput (~16 tok/s) and TTFT (~211 ms).
 4. **No on-device sampling tested.** Current validation uses raw logits (`on_device_sampling_config=None`).
@@ -286,4 +287,4 @@ During development, we discovered and documented several issues in the original 
 
 Jim Burtoft ([@jimburtoft](https://github.com/jimburtoft))
 
-**Last Updated:** 2026-04-05
+**Last Updated:** 2026-04-08
