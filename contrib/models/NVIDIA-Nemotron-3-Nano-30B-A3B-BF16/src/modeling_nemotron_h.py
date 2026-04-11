@@ -464,11 +464,11 @@ class NeuronNemotronMamba2Layer(nn.Module):
     """
     Mamba-2 layer for Nemotron, with NxDI TP support.
 
-    TP sharding strategy: the Mamba scan is sharded across TP ranks by splitting
-    num_heads and n_groups. Each rank processes num_heads/TP heads, reducing the
-    O(L^2) quadratic scan's scratchpad memory by a factor of TP. The in_proj is
-    split into 3 ColumnParallelLinear(gather_output=False) for gate/xBC/dt, and
-    out_proj uses a manual parameter + all-reduce (same pattern as MoE experts).
+    TP sharding strategy (Falcon-H1 pattern): use ColumnParallelLinear with
+    gather_output=True for in_proj and out_proj. All SSM parameters (dt_bias,
+    A_log, D), conv weights, and norm weights are REPLICATED across TP ranks
+    (full size, no sharding). Each rank computes the full SSM on all heads,
+    then the out_proj gather_output=True handles the all-reduce implicitly.
 
     NKI O(L) selective scan for prefill (USE_NKI_SCAN=True) or
     pure PyTorch O(L^2) quadratic fallback. O(1) decode.
@@ -485,92 +485,42 @@ class NeuronNemotronMamba2Layer(nn.Module):
         self.conv_kernel_size = config.conv_kernel
         self.chunk_size = getattr(config, "chunk_size", 128)
 
-        # TP-aware dimensions: shard num_heads and n_groups across TP ranks
-        # so the quadratic scan operates on num_heads/TP heads per rank,
-        # reducing scratchpad memory by TP factor.
+        # Full dimensions — NOT divided by TP (Falcon-H1 replicated pattern)
+        self.num_heads = config.mamba_num_heads  # 64
+        self.n_groups = config.n_groups  # 8
+        self.intermediate_size = self.num_heads * self.head_dim  # 64*64=4096
+        self.groups_time_state_size = self.n_groups * self.ssm_state_size  # 8*128=1024
+        self.conv_dim = self.intermediate_size + 2 * self.groups_time_state_size  # 6144
+
+        # Projection size for in_proj: gate + xBC + dt
+        projection_size = (
+            self.intermediate_size + self.conv_dim + self.num_heads
+        )  # 10304
+
+        # Single ColumnParallelLinear with gather_output=True (Falcon-H1 pattern)
+        # This avoids the scatter bug and produces full-size output on every rank.
         if parallel_state.model_parallel_is_initialized():
-            tp_degree = parallel_state.get_tensor_model_parallel_size()
-        else:
-            tp_degree = 1
-        self.tp_degree = tp_degree
-
-        self.num_heads_full = config.mamba_num_heads  # 64
-        self.n_groups_full = config.n_groups  # 8
-
-        assert self.num_heads_full % tp_degree == 0, (
-            f"mamba_num_heads {self.num_heads_full} must be divisible by tp_degree {tp_degree}"
-        )
-        assert self.n_groups_full % tp_degree == 0, (
-            f"n_groups {self.n_groups_full} must be divisible by tp_degree {tp_degree}"
-        )
-
-        self.num_heads = self.num_heads_full // tp_degree  # per-rank heads
-        self.n_groups = self.n_groups_full // tp_degree  # per-rank groups
-
-        # Full and per-rank sizes
-        self.intermediate_size_full = self.num_heads_full * self.head_dim  # 64*64=4096
-        self.intermediate_size = self.num_heads * self.head_dim  # per-rank
-        self.groups_time_state_size_full = (
-            self.n_groups_full * self.ssm_state_size
-        )  # 8*128=1024
-        self.groups_time_state_size = self.n_groups * self.ssm_state_size  # per-rank
-        self.conv_dim_full = (
-            self.intermediate_size_full + 2 * self.groups_time_state_size_full
-        )  # 6144
-        self.conv_dim = (
-            self.intermediate_size + 2 * self.groups_time_state_size
-        )  # per-rank
-
-        # Split in_proj into 3 separate ColumnParallelLinear(gather_output=False)
-        # so each TP rank gets the correct per-rank slice of each component.
-        # HF in_proj layout: [gate(intermediate_size), xBC(conv_dim), dt(num_heads)]
-        if parallel_state.model_parallel_is_initialized():
-            self.gate_proj = ColumnParallelLinear(
+            self.in_proj = ColumnParallelLinear(
                 self.hidden_size,
-                self.intermediate_size_full,
+                projection_size,
                 bias=config.mamba_proj_bias,
-                gather_output=False,  # per-rank: intermediate_size/TP
+                gather_output=True,
             )
-            self.xBC_proj = ColumnParallelLinear(
+            self.out_proj = ColumnParallelLinear(
+                self.intermediate_size,
                 self.hidden_size,
-                self.conv_dim_full,
-                bias=config.mamba_proj_bias,
-                gather_output=False,  # per-rank: conv_dim/TP
-            )
-            self.dt_proj = ColumnParallelLinear(
-                self.hidden_size,
-                self.num_heads_full,
-                bias=config.mamba_proj_bias,
-                gather_output=False,  # per-rank: num_heads/TP
+                bias=False,
+                gather_output=True,
             )
         else:
-            projection_size = (
-                self.intermediate_size_full + self.conv_dim_full + self.num_heads_full
-            )
             self.in_proj = nn.Linear(
                 self.hidden_size, projection_size, bias=config.mamba_proj_bias
             )
-
-        # out_proj: manual TP parameter (same pattern as MoE expert_down)
-        # Each rank holds (intermediate_size/TP, hidden_size), produces partial sum,
-        # then all-reduce combines results across ranks.
-        # Weight stored transposed for scan_output @ out_proj_weight pattern.
-        if parallel_state.model_parallel_is_initialized():
-            self.out_proj_weight = nn.Parameter(
-                torch.empty(self.intermediate_size, self.hidden_size)
-            )
-            # Mark for TP sharding: full weight is (intermediate_size_full, hidden_size),
-            # partition dim=0 splits intermediate_size across ranks
-            self.out_proj_weight.tensor_model_parallel = True
-            self.out_proj_weight.partition_dim = 0
-            self.out_proj_weight.partition_stride = 1
-            self.out_proj_weight.num_partitions = tp_degree
-        else:
             self.out_proj = nn.Linear(
-                self.intermediate_size_full, self.hidden_size, bias=False
+                self.intermediate_size, self.hidden_size, bias=False
             )
 
-        # Manual depthwise conv1d (TEN404 workaround) — per-rank conv_dim
+        # Manual depthwise conv1d (TEN404 workaround) — FULL conv_dim (replicated)
         self.conv_weight = nn.Parameter(
             torch.randn(self.conv_dim, self.conv_kernel_size)
         )
@@ -578,32 +528,15 @@ class NeuronNemotronMamba2Layer(nn.Module):
             self.conv_bias = nn.Parameter(torch.zeros(self.conv_dim))
         else:
             self.conv_bias = None
-        # Mark conv params for TP sharding (partition along conv_dim)
-        if tp_degree > 1:
-            for param in [self.conv_weight] + (
-                [self.conv_bias] if self.conv_bias is not None else []
-            ):
-                param.tensor_model_parallel = True
-                param.partition_dim = 0
-                param.partition_stride = 1
-                param.num_partitions = tp_degree
 
-        # SSM parameters — per-rank num_heads
+        # SSM parameters — FULL num_heads (replicated, not TP-sharded)
         self.dt_bias = nn.Parameter(torch.ones(self.num_heads))
         A = torch.arange(1, self.num_heads + 1)
         self.A_log = nn.Parameter(torch.log(A))
         self.D = nn.Parameter(torch.ones(self.num_heads))
-        # Mark SSM params for TP sharding
-        if tp_degree > 1:
-            for param in [self.dt_bias, self.A_log, self.D]:
-                param.tensor_model_parallel = True
-                param.partition_dim = 0
-                param.partition_stride = 1
-                param.num_partitions = tp_degree
 
-        # Gated RMSNorm with per-group normalization — per-rank sizes
-        # group_size = intermediate_size_per_rank / n_groups_per_rank
-        # At TP=8: 512 / 1 = 512 (same group_size as unsharded: 4096/8=512)
+        # Gated RMSNorm with per-group normalization — FULL sizes (replicated)
+        # group_size = intermediate_size / n_groups = 4096 / 8 = 512
         self.norm = NemotronRMSNormGated(
             self.intermediate_size,
             group_size=self.intermediate_size // self.n_groups
@@ -611,12 +544,6 @@ class NeuronNemotronMamba2Layer(nn.Module):
             else self.intermediate_size,
             eps=getattr(config, "norm_eps", 1e-5),
         )
-        # Mark norm weight for TP sharding
-        if tp_degree > 1:
-            self.norm.weight.tensor_model_parallel = True
-            self.norm.weight.partition_dim = 0
-            self.norm.weight.partition_stride = 1
-            self.norm.weight.num_partitions = tp_degree
 
         self.time_step_limit = (0.0, float("inf"))
 
@@ -624,19 +551,13 @@ class NeuronNemotronMamba2Layer(nn.Module):
     def get_state_shapes(config, batch_size=1):
         """Return (conv_state_shape, ssm_state_shape) for buffer allocation.
 
-        Returns PER-RANK sizes (sharded by TP degree) so each NeuronCore
-        only allocates its own portion of the Mamba state.
+        Returns FULL sizes (replicated across TP ranks, Falcon-H1 pattern).
+        Every rank holds the full Mamba state since all params are replicated.
         """
-        if parallel_state.model_parallel_is_initialized():
-            tp_degree = parallel_state.get_tensor_model_parallel_size()
-        else:
-            tp_degree = 1
-
-        num_heads = config.mamba_num_heads // tp_degree
-        n_groups = config.n_groups // tp_degree
-        intermediate_size = num_heads * config.mamba_head_dim
-        groups_time_state_size = n_groups * config.ssm_state_size
-        conv_dim = intermediate_size + 2 * groups_time_state_size
+        num_heads = config.mamba_num_heads  # Full: 64
+        intermediate_size = num_heads * config.mamba_head_dim  # 4096
+        groups_time_state_size = config.n_groups * config.ssm_state_size  # 1024
+        conv_dim = intermediate_size + 2 * groups_time_state_size  # 6144
         conv_shape = (batch_size, conv_dim, config.conv_kernel - 1)
         ssm_shape = (
             batch_size,
@@ -645,88 +566,6 @@ class NeuronNemotronMamba2Layer(nn.Module):
             config.ssm_state_size,
         )
         return conv_shape, ssm_shape
-
-    def preshard_hook(self, model_state_dict: dict, prefix: str) -> bool:
-        """Manually shard Mamba parameters that NxDI's shard_children won't handle.
-
-        NxDI's shard_children only processes modules in __SUPPORTED_SHARDED_MODULES
-        (ColumnParallelLinear, RowParallelLinear, etc.). NeuronNemotronMamba2 is a
-        plain nn.Module, so its manually-created nn.Parameters (out_proj_weight,
-        conv_weight, conv_bias, D, dt_bias, A_log) and norm.weight won't be sharded
-        by shard_children.
-
-        This preshard_hook is called by invoke_preshard_hook BEFORE shard_children.
-        By the time it's called, _mock_parallel_state has already set the TP rank.
-        We use the rank to slice full-size checkpoint tensors to per-rank shapes.
-
-        IMPORTANT: invoke_preshard_hook stops recursing into children when it finds
-        a preshard_hook. So we must manually forward to children's preshard_hooks
-        (e.g., ColumnParallelLinear.preshard_hook for padding).
-        """
-        if self.tp_degree <= 1:
-            return True
-
-        # Strip trailing "weight" that invoke_preshard_hook appends
-        # prefix comes in as e.g. "layers.0.mixer.weight" — we need "layers.0.mixer."
-        if prefix.endswith("weight"):
-            module_prefix = prefix[: -len("weight")]
-        elif prefix.endswith("bias"):
-            module_prefix = prefix[: -len("bias")]
-        else:
-            module_prefix = prefix
-
-        rank = parallel_state.get_tensor_model_parallel_rank()
-        tp = self.tp_degree
-
-        # Parameters to shard along dim=0 by num_heads (64 -> 8 per rank at TP=8)
-        # These map: full_size -> full_size // tp
-        head_params = ["dt_bias", "A_log", "D"]
-        for pname in head_params:
-            key = module_prefix + pname
-            if key in model_state_dict:
-                tensor = model_state_dict[key]
-                chunk_size = tensor.shape[0] // tp
-                model_state_dict[key] = tensor[
-                    rank * chunk_size : (rank + 1) * chunk_size
-                ]
-
-        # out_proj_weight: (intermediate_size_full, hidden_size) -> (intermediate_size, hidden_size)
-        # Partition along dim=0
-        key = module_prefix + "out_proj_weight"
-        if key in model_state_dict:
-            tensor = model_state_dict[key]
-            chunk_size = tensor.shape[0] // tp
-            model_state_dict[key] = tensor[rank * chunk_size : (rank + 1) * chunk_size]
-
-        # conv_weight: (conv_dim_full, kernel) -> (conv_dim, kernel)
-        # conv_bias: (conv_dim_full,) -> (conv_dim,)
-        # Partition along dim=0
-        for pname in ["conv_weight", "conv_bias"]:
-            key = module_prefix + pname
-            if key in model_state_dict:
-                tensor = model_state_dict[key]
-                chunk_size = tensor.shape[0] // tp
-                model_state_dict[key] = tensor[
-                    rank * chunk_size : (rank + 1) * chunk_size
-                ]
-
-        # norm.weight: (intermediate_size_full,) -> (intermediate_size,)
-        key = module_prefix + "norm.weight"
-        if key in model_state_dict:
-            tensor = model_state_dict[key]
-            chunk_size = tensor.shape[0] // tp
-            model_state_dict[key] = tensor[rank * chunk_size : (rank + 1) * chunk_size]
-
-        # Forward to children's preshard_hooks (invoke_preshard_hook stops
-        # recursing when it finds our preshard_hook, so we must do it manually).
-        for name, child in self._modules.items():
-            if child is not None and hasattr(child, "preshard_hook"):
-                child_prefix = module_prefix + name + "."
-                child.preshard_hook(model_state_dict, child_prefix + "weight")
-                if getattr(child, "add_bias", False):
-                    child.preshard_hook(model_state_dict, child_prefix + "bias")
-
-        return True
 
     def forward(
         self,
@@ -776,19 +615,21 @@ class NeuronNemotronMamba2Layer(nn.Module):
         # which is always correct regardless of NxDI's position_id padding scheme.
         padding_mask = kwargs.get("padding_mask", None)
 
-        # Project input — TP-sharded: each rank gets per-rank slices
-        if self.tp_degree > 1:
-            gate = self.gate_proj(hidden_states)  # (B, L, intermediate_size/TP)
-            hidden_states_B_C = self.xBC_proj(hidden_states)  # (B, L, conv_dim/TP)
-            dt = self.dt_proj(hidden_states)  # (B, L, num_heads/TP)
-        else:
-            projected_states = self.in_proj(hidden_states)
-            # Explicit slicing (not split) for XLA
-            gate = projected_states[..., : self.intermediate_size]
-            hidden_states_B_C = projected_states[
-                ..., self.intermediate_size : self.intermediate_size + self.conv_dim
-            ]
-            dt = projected_states[..., -self.num_heads :]
+        # Mask hidden_states BEFORE projection (Falcon-H1 pattern)
+        # This ensures padding tokens produce zero projections.
+        if padding_mask is not None:
+            hidden_states = hidden_states * padding_mask[:, :seq_len, None].to(
+                hidden_states.dtype
+            )
+
+        # Single in_proj with gather_output=True (Falcon-H1 pattern)
+        projected_states = self.in_proj(hidden_states)
+        # Explicit slicing (not split) for XLA
+        gate = projected_states[..., : self.intermediate_size]
+        hidden_states_B_C = projected_states[
+            ..., self.intermediate_size : self.intermediate_size + self.conv_dim
+        ]
+        dt = projected_states[..., -self.num_heads :]
 
         if seq_len > 1:
             output, conv_state_new, ssm_state_new = self._forward_prefill(
@@ -952,15 +793,8 @@ class NeuronNemotronMamba2Layer(nn.Module):
         y = y.reshape(batch_size, seq_len, -1)
 
         scan_output = self.norm(y, gate)
-        # out_proj: per-rank partial sum → all-reduce
-        scan_output_typed = scan_output.to(dtype)
-        if self.tp_degree > 1:
-            output = (
-                scan_output_typed @ self.out_proj_weight
-            )  # (B, L, hidden_size) partial
-            output = reduce_from_tensor_model_parallel_region(output)
-        else:
-            output = self.out_proj(scan_output_typed)
+        # out_proj: ColumnParallelLinear(gather_output=True) handles TP all-reduce
+        output = self.out_proj(scan_output.to(dtype))
 
         return output, conv_state_new, ssm_state_new.to(dtype)
 
@@ -1012,15 +846,8 @@ class NeuronNemotronMamba2Layer(nn.Module):
         scan_output = self.norm(y, gate_squeezed)
         if len(scan_output.shape) == 2:
             scan_output = scan_output.unsqueeze(1)
-        # out_proj: per-rank partial sum → all-reduce
-        scan_output_typed = scan_output.to(dtype)
-        if self.tp_degree > 1:
-            output = (
-                scan_output_typed @ self.out_proj_weight
-            )  # (B, 1, hidden_size) partial
-            output = reduce_from_tensor_model_parallel_region(output)
-        else:
-            output = self.out_proj(scan_output_typed)
+        # out_proj: ColumnParallelLinear(gather_output=True) handles TP all-reduce
+        output = self.out_proj(scan_output.to(dtype))
 
         return output, conv_state_new, ssm_state_new.to(dtype)
 
@@ -1994,92 +1821,15 @@ def _convert_mamba_conv_weights(state_dict: Dict[str, Any]) -> Dict[str, Any]:
 def _split_mamba_projections(
     state_dict: Dict[str, Any], config: NemotronHInferenceConfig
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """Split Mamba in_proj into 3 separate projections and transpose out_proj.
+    """No-op: Falcon-H1 pattern uses single ColumnParallelLinear for in_proj/out_proj.
 
-    HF in_proj.weight shape: (projection_size, hidden_size)
-    where projection_size = intermediate_size + conv_dim + num_heads
-                          = 4096 + 6144 + 64 = 10304
-
-    Split into (NxDI key format):
-    - gate_proj.weight: (intermediate_size, hidden_size) = (4096, 2688)
-    - xBC_proj.weight: (conv_dim, hidden_size) = (6144, 2688)
-    - dt_proj.weight: (num_heads, hidden_size) = (64, 2688)
-
-    HF out_proj.weight shape: (hidden_size, intermediate_size) = (2688, 4096)
-    -> out_proj_weight: (intermediate_size, hidden_size) = (4096, 2688) transposed
+    With gather_output=True, the ColumnParallelLinear's own preshard_hook handles
+    TP sharding of the projection weights. No manual splitting or transposing needed.
 
     Returns:
-        (modified state_dict with Mamba proj keys removed,
-         dict of new NxDI-format keys to add to new_state_dict)
+        (unmodified state_dict, empty dict)
     """
-    intermediate_size = config.mamba_num_heads * config.mamba_head_dim  # 4096
-    groups_time_state_size = config.n_groups * config.ssm_state_size  # 1024
-    conv_dim = intermediate_size + 2 * groups_time_state_size  # 6144
-    num_heads = config.mamba_num_heads  # 64
-
-    new_entries = {}
-    keys_to_remove = []
-
-    for key in list(state_dict.keys()):
-        if not key.startswith("backbone.layers."):
-            continue
-
-        parts = key.split(".")
-        layer_idx = int(parts[2])
-        if config.layer_types[layer_idx] != "mamba":
-            continue
-
-        if ".mixer.in_proj.weight" in key:
-            weight = state_dict[key]  # (10304, 2688)
-            # Split along output dimension (dim 0)
-            gate_w = weight[:intermediate_size, :]  # (4096, 2688)
-            xBC_w = weight[
-                intermediate_size : intermediate_size + conv_dim, :
-            ]  # (6144, 2688)
-            dt_w = weight[intermediate_size + conv_dim :, :]  # (64, 2688)
-
-            prefix = f"layers.{layer_idx}.mixer"
-            new_entries[f"{prefix}.gate_proj.weight"] = gate_w
-            new_entries[f"{prefix}.xBC_proj.weight"] = xBC_w
-            new_entries[f"{prefix}.dt_proj.weight"] = dt_w
-            keys_to_remove.append(key)
-            logger.debug(
-                f"Split Mamba in_proj for layer {layer_idx}: "
-                f"gate={gate_w.shape}, xBC={xBC_w.shape}, dt={dt_w.shape}"
-            )
-
-        elif ".mixer.in_proj.bias" in key:
-            bias = state_dict[key]  # (10304,)
-            gate_b = bias[:intermediate_size]
-            xBC_b = bias[intermediate_size : intermediate_size + conv_dim]
-            dt_b = bias[intermediate_size + conv_dim :]
-
-            prefix = f"layers.{layer_idx}.mixer"
-            new_entries[f"{prefix}.gate_proj.bias"] = gate_b
-            new_entries[f"{prefix}.xBC_proj.bias"] = xBC_b
-            new_entries[f"{prefix}.dt_proj.bias"] = dt_b
-            keys_to_remove.append(key)
-
-        elif ".mixer.out_proj.weight" in key:
-            weight = state_dict[key]  # (hidden_size, intermediate_size) = (2688, 4096)
-            # Transpose for x @ w pattern: (intermediate_size, hidden_size) = (4096, 2688)
-            prefix = f"layers.{layer_idx}.mixer"
-            new_entries[f"{prefix}.out_proj_weight"] = weight.t()
-            keys_to_remove.append(key)
-            logger.debug(
-                f"Transposed Mamba out_proj for layer {layer_idx}: "
-                f"{weight.shape} -> {weight.t().shape}"
-            )
-
-    # Remove processed keys from state_dict
-    for key in keys_to_remove:
-        del state_dict[key]
-
-    logger.info(
-        f"Split {len(keys_to_remove)} Mamba projection weights into "
-        f"{len(new_entries)} sharded projections"
-    )
-    return state_dict, new_entries
+    return state_dict, {}
 
 
 def _remap_hf_key(key: str, config) -> Optional[str]:
@@ -2092,14 +1842,9 @@ def _remap_hf_key(key: str, config) -> Optional[str]:
     if ".mixer.shared_experts." in key:
         return None
 
-    # Skip Mamba in_proj and out_proj -- handled by _split_mamba_in_proj()
-    if ".mixer.in_proj." in key or ".mixer.out_proj." in key:
-        # Check if this is a Mamba layer
-        if key.startswith("backbone.layers."):
-            parts = key.split(".")
-            layer_idx = int(parts[2])
-            if config.layer_types[layer_idx] == "mamba":
-                return None
+    # Mamba in_proj and out_proj: pass through (Falcon-H1 pattern).
+    # ColumnParallelLinear(gather_output=True) handles TP sharding via its
+    # own preshard_hook — no manual splitting or transposing needed.
 
     # Embeddings
     if key == "backbone.embeddings.weight":
@@ -2173,9 +1918,8 @@ def _convert_nemotron_hf_to_neuron_state_dict(
     # First pass: convert Mamba conv1d weight shapes
     state_dict = _convert_mamba_conv_weights(state_dict)
 
-    # Split Mamba in_proj into gate_proj/xBC_proj/dt_proj and transpose out_proj.
-    # Returns (modified state_dict, dict of NxDI-format keys to merge).
-    # Must happen before _remap_hf_key since it removes the original HF keys.
+    # Split Mamba in_proj (no-op with Falcon-H1 pattern — returns empty dict).
+    # Kept for code structure compatibility.
     state_dict, mamba_proj_entries = _split_mamba_projections(state_dict, config)
     new_state_dict.update(mamba_proj_entries)
 
