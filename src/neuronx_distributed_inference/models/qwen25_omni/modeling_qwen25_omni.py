@@ -6,7 +6,8 @@
 #
 # Provides two modes:
 #   1. Text-only (Thinker): NeuronQwen25OmniForCausalLM
-#      - Reuses Qwen2 decoder with thinker.model.* prefix remapping
+#      - Reuses Qwen2-VL text model with multimodal RoPE (mrope_section=[16,24,24])
+#      - Weight keys remapped from thinker.model.* prefix
 #   2. Multimodal (Vision + Text): NeuronQwen25OmniMultimodalForCausalLM
 #      - Vision encoder: Qwen2.5-Omni ViT (SwiGLU, RMSNorm, separate QKV)
 #      - Text decoder: Qwen2-VL text model (multimodal RoPE)
@@ -35,6 +36,10 @@ from neuronx_distributed_inference.models.qwen2.modeling_qwen2 import (
     NeuronQwen2Model,
     convert_state_dict_to_fused_qkv,
 )
+from neuronx_distributed_inference.models.qwen2_vl.modeling_qwen2_vl_text import (
+    NeuronQwen2VLTextForCausalLM,
+    NeuronQwen2VLTextModel,
+)
 
 logger = logging.getLogger("Neuron")
 
@@ -49,6 +54,7 @@ _TEXT_CONFIG_ATTRS = [
     "intermediate_size",
     "max_position_embeddings",
     "rope_theta",
+    "rope_scaling",
     "rms_norm_eps",
     "hidden_act",
     "tie_word_embeddings",
@@ -115,16 +121,20 @@ class Qwen25OmniInferenceConfig(InferenceConfig):
         return NeuronConfig
 
 
-class NeuronQwen25OmniForCausalLM(NeuronQwen2ForCausalLM):
+class NeuronQwen25OmniForCausalLM(NeuronQwen2VLTextForCausalLM):
     """Qwen2.5-Omni Thinker text model for Causal LM on Neuron.
 
-    Reuses the Qwen2 model architecture since the Thinker's text backbone
-    is architecturally identical to Qwen2.5. The main differences are:
+    Uses the Qwen2-VL text model (which has M-RoPE support) since the
+    Thinker's text backbone requires multimodal rotary position embeddings
+    with mrope_section=[16, 24, 24]. For text-only input, all three M-RoPE
+    axes receive identical position IDs.
+
+    Key differences from base Qwen2-VL text model:
       - Weight keys are prefixed with 'thinker.model.' / 'thinker.lm_head.'
       - Non-text weights (talker, token2wav, audio_tower, visual) are discarded
     """
 
-    _model_cls = NeuronQwen2Model
+    _model_cls = NeuronQwen2VLTextModel
     _STATE_DICT_MODEL_PREFIX = "thinker.model."
 
     @staticmethod
