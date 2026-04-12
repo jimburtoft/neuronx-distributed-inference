@@ -364,6 +364,10 @@ def _chunked_quadratic_scan(
     dA_log = dt_processed * A.view(1, 1, -1)  # (B, L, H)
 
     # Pre-compute dB and dBx for the full sequence
+    # NOTE: dBx is (B, L, H, D, S) = ~2 GB at L=2048, H=64, D=64, S=128 in float32.
+    # This is the dominant scratchpad contributor. Moving inside the loop does NOT
+    # help because XLA unrolls the chunk loop, creating n_chunks separate allocations
+    # that are all live simultaneously. A single allocation with slicing is cheaper.
     dB = dt_processed.unsqueeze(-1) * B  # (B, L, H, S)
     dBx = dB.unsqueeze(3) * x.unsqueeze(-1)  # (B, L, H, D, S)
 

@@ -76,10 +76,10 @@ The codebase includes an optional O(L) NKI selective scan kernel (ported from Gr
 
 ## Validation Results
 
-**Validated:** 2026-04-03
-**Configuration:** TP=4, batch_size=1, seq_len=2048, max_context_length=128, bfloat16
+**Validated:** 2026-04-12
+**Configuration:** TP=4, batch_size=1, bfloat16
 **Instance:** trn2.3xlarge (LNC=2)
-**SDK:** Neuron SDK 2.28, PyTorch 2.9
+**SDK:** Neuron SDK 2.29, PyTorch 2.9, NxDI 0.9
 
 ### Prefill Accuracy (vs HF BF16 CPU, 11 prompts)
 
@@ -100,27 +100,42 @@ The codebase includes an optional O(L) NKI selective scan kernel (ported from Gr
 
 Both Neuron and HF reference produce correct first tokens, followed by greedy repetition patterns typical of base (non-instruct) models.
 
-### Inference Performance
+### Inference Performance (SDK 2.29, Head-Grouped Scan G=8)
 
 | Configuration | TTFT (ms) | Decode (tok/s) | TPOT (ms) | Compile (s) |
 |--------------|-----------|----------------|-----------|-------------|
-| **BS=1, seq_len=2048, ctx=128 (sparse MoE)** | 211 | **66.6** | **15.0** | 731 |
-| BS=1, seq_len=2048, ctx=128 (dense MoE) | 211 | 17.4 | 57.5 | 274 |
-| **BS=1, seq_len=4096, ctx=256 (sparse MoE)** | **436** | **45.8** | — | 916 |
-| BS=2, seq_len=2048, ctx=128 | 263 | 22.0 | — | 2426 |
-| BS=1, seq_len=4096, ctx=128 | 210.5 | 16.0 | — | 2129 |
-| BS=1, seq_len=8192, ctx=128 | 211.3 | 15.8 | — | 2285 |
+| **BS=1, ctx=512, seq=32768** | **608** | **74.3** | **13.5** | 801 |
+| **BS=1, ctx=640, seq=12288** | **1052** | **73.0** | **13.7** | 1022 |
+| BS=1, ctx=512, seq=4096 | 608 | 73.3 | 13.6 | 794 |
+| BS=1, ctx=640, seq=4096 | 1052 | 72.9 | 13.7 | 1024 |
+| BS=1, ctx=128, seq=2048 (non-grouped) | 220.6 | 73.2 | 13.7 | 543 |
+| BS=1, ctx=256, seq=4096 (non-grouped) | 454.7 | 73.0 | 13.7 | 663 |
+| BS=2, ctx=128, seq=2048 | 263 | 22.0 | — | 2426 |
+
+### Inference Performance (SDK 2.28, Non-Grouped Scan)
+
+| Configuration | TTFT (ms) | Decode (tok/s) | TPOT (ms) | Compile (s) |
+|--------------|-----------|----------------|-----------|-------------|
+| **BS=1, ctx=128, seq=2048 (sparse MoE)** | 211 | **66.6** | **15.0** | 731 |
+| BS=1, ctx=128, seq=2048 (dense MoE) | 211 | 17.4 | 57.5 | 274 |
+| BS=1, ctx=256, seq=4096 (sparse MoE) | 436 | 45.8 | — | 916 |
 
 All measurements on trn2.3xlarge (TP=4, LNC=2, BF16).
 
+**SDK 2.29 delivers ~10% faster decode** (73+ tok/s vs 66.6 tok/s on SDK 2.28).
+
 **Sparse expert dispatch** (default) achieves **3.83x decode speedup** by loading only the 6 active expert weights per MoE layer during decode, instead of all 128. Output is bit-for-bit identical to the dense path.
 
-| Metric | Value (BS=1) |
-|--------|-------|
-| Model load time | 16.9 s |
-| HBM per core (est.) | ~14.7 GB / 24 GB (61%) |
+**Head-grouped quadratic scan** (`SCAN_HEAD_GROUP=8`) processes 8 heads at a time instead of all 64, reducing the `[1,L,L,64]` weight matrix to `[1,L,L,8]` per group. This unlocks ctx=512 and ctx=640 on trn2.3xlarge.
 
-TPOT is extremely stable at BS=1: P50-P99 spread < 0.3 ms.
+### Upper Limits (trn2.3xlarge, LNC=2, TP=4)
+
+| Max context length | Max sequence length | Decode (tok/s) | TTFT (ms) |
+|-------------------|--------------------|--------------------|-----------|
+| **640** | **12,288** | 73.0 | 1,052 |
+| **512** | **32,768** | 74.3 | 608 |
+
+ctx=768+ fails with HBM OOM (34.5 GB required vs 24 GB/core). The quadratic O(L^2) scan scratchpad grows from ~1 GB at ctx=512 to 19.4 GB at ctx=768.
 
 ### Compilation
 
@@ -220,9 +235,9 @@ sudo swapon /mnt/models/swapfile
 
 ## Compatibility Matrix
 
-| Instance Type | SDK 2.28 | SDK 2.27 |
+| Instance Type | SDK 2.29 | SDK 2.28 |
 |--------------|----------|----------|
-| trn2.3xlarge (TP=4, LNC=2) | Validated | Not tested |
+| trn2.3xlarge (TP=4, LNC=2) | Validated | Validated |
 | trn2.48xlarge (TP=4, LNC=2) | Not tested | Not tested |
 | trn1.32xlarge | Not tested | Not tested |
 
@@ -258,13 +273,14 @@ python test_smoke.py
 
 ## Known Issues
 
-1. **Maximum context length is 256 on trn2.3xlarge (LNC=2).** ctx=128 and ctx=256 are validated. ctx=512 compiles but OOM on load — the CE model's 14.8 GB tensors + 7.5 GB scratchpad (Mamba-2 quadratic scan at 512 tokens) exceed the 24 GB/core HBM limit. Tested compiler scratchpad tuning flags (`--hbm-scratchpad-page-size`, `--internal-enable-dge-levels spill_reload`, removing `--model-type transformer`) — none overcome this fundamental HBM constraint. ctx=512+ requires trn2.48xlarge or model precision reduction.
+1. **Maximum context length is 640 on trn2.3xlarge (LNC=2) with head-grouped scan.** ctx up to 640 validated with `SCAN_HEAD_GROUP=8`. ctx=768 requires 34.5 GB HBM per core (19.4 GB scratchpad from quadratic O(L^2) scan) vs 24 GB available. Without head-grouped scan, max ctx is 256 (ctx=512 OOM on load due to 1 GB transpose scratchpad for `[1,L,L,64]` weight matrix). ctx=768+ requires trn2.48xlarge, model quantization, or SSD NKI kernel (O(L) memory).
 2. **Maximum batch size is 2 on trn2.3xlarge (LNC=2).** BS=4 compiles successfully but exceeds HBM during model load (CE model allocation fails on 24 GB/core). BS=4 would require trn2.48xlarge or LNC=1 (not tested).
-3. **Validated seq_len up to 8192.** seq_len=4096 and seq_len=8192 both compile, load, and generate correctly with stable throughput (~16 tok/s) and TTFT (~211 ms).
+3. **Validated seq_len up to 32768 at ctx=512, 12288 at ctx=640.** Higher seq_len at ctx=640 fails with instruction limit exceeded.
 4. **No on-device sampling tested.** Current validation uses raw logits (`on_device_sampling_config=None`).
 5. **Conv1d workaround.** Manual depthwise convolution avoids TEN404 but may be slower than native conv1d once the SDK issue is fixed.
 6. **Base model behavior.** This is a base (non-instruct) model. Greedy decoding produces repetitive output after the first few correct tokens, consistent with the HF reference.
 7. **Sparse dispatch prefill fallback.** The prefill (context encoding) path uses a dense per-expert loop because sparse `index_select` on 128 experts at `seq_len=128` creates HLO graph explosion exceeding the 5M instruction limit. A fused NKI MoE kernel could address this.
+8. **Head-grouped scan TTFT overhead.** At ctx=128, head-grouped scan has ~36% higher TTFT (299 ms vs 220 ms) due to the 8-group loop in the XLA graph. For ctx=128 workloads, disable head grouping by setting `SCAN_HEAD_GROUP = 64` (all heads in one group).
 
 ## HuggingFace Model Issues Found
 
@@ -278,7 +294,7 @@ During development, we discovered and documented several issues in the original 
 
 | File | Description | Lines |
 |------|-------------|-------|
-| `src/modeling_nemotron_h.py` | Full model implementation (config, Mamba layer, attention, MoE with sparse dispatch, NKI scan, model wrapper, state dict conversion) | ~1940 |
+| `src/modeling_nemotron_h.py` | Full model implementation (config, Mamba layer with head-grouped scan, attention, MoE with sparse dispatch, NKI scan, model wrapper, state dict conversion) | ~2230 |
 | `src/__init__.py` | Public exports | ~27 |
 | `test/integration/test_model.py` | Integration tests (compile, load, generate, logit validation, throughput) | ~441 |
 | `test_smoke.py` | Quick smoke test for pre-compiled model | ~79 |
@@ -287,4 +303,4 @@ During development, we discovered and documented several issues in the original 
 
 Jim Burtoft ([@jimburtoft](https://github.com/jimburtoft))
 
-**Last Updated:** 2026-04-08
+**Last Updated:** 2026-04-12
