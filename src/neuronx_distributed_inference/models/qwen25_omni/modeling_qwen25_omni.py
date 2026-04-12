@@ -67,8 +67,12 @@ _TEXT_CONFIG_ATTRS = [
 class Qwen25OmniInferenceConfig(InferenceConfig):
     """Inference config for Qwen2.5-Omni (Thinker text component).
 
-    Handles the nested config structure: the HF config has attributes under
-    thinker_config.text_config that we need at the top level for NxDI.
+    Handles two config layouts:
+    1. Full omni config: text attributes under thinker_config.text_config
+    2. Thinker-only config: text attributes under text_config directly
+
+    In either case, text config attributes are extracted to the top level
+    for NxDI.
     """
 
     def add_derived_config(self):
@@ -77,19 +81,30 @@ class Qwen25OmniInferenceConfig(InferenceConfig):
         self.qkv_bias = True
         self.o_bias = False
 
-        # Extract text config attributes from nested thinker_config
+        # Locate text_config from either full omni or thinker-only layout
+        text_cfg = None
+        pad_token_id_source = None
+
         if hasattr(self, "thinker_config"):
+            # Full omni config: thinker_config.text_config
             thinker_cfg = self.thinker_config
-            # When loaded from saved JSON, thinker_config is a plain dict
             if isinstance(thinker_cfg, dict):
                 thinker_cfg = SimpleNamespace(**thinker_cfg)
                 self.thinker_config = thinker_cfg
-
             text_cfg = thinker_cfg.text_config
             if isinstance(text_cfg, dict):
                 text_cfg = SimpleNamespace(**text_cfg)
                 thinker_cfg.text_config = text_cfg
+            pad_token_id_source = thinker_cfg
+        elif hasattr(self, "text_config"):
+            # Thinker-only config: text_config directly
+            text_cfg = self.text_config
+            if isinstance(text_cfg, dict):
+                text_cfg = SimpleNamespace(**text_cfg)
+                self.text_config = text_cfg
+            pad_token_id_source = self
 
+        if text_cfg is not None:
             # Text config attributes always take precedence over top-level
             # defaults from PretrainedConfig (e.g. tie_word_embeddings defaults
             # to True at the top level but is False in text_config).
@@ -97,10 +112,19 @@ class Qwen25OmniInferenceConfig(InferenceConfig):
                 if hasattr(text_cfg, attr):
                     setattr(self, attr, getattr(text_cfg, attr))
 
-            # Set pad_token_id from thinker_config
-            if hasattr(thinker_cfg, "pad_token_id"):
-                if not hasattr(self, "pad_token_id") or self.pad_token_id is None:
-                    self.pad_token_id = thinker_cfg.pad_token_id
+            # HF serializes rope_scaling as rope_parameters in to_dict().
+            # If rope_scaling wasn't found but rope_parameters exists, use it.
+            if not hasattr(self, "rope_scaling") or self.rope_scaling is None:
+                rope_params = getattr(text_cfg, "rope_parameters", None)
+                if rope_params is not None:
+                    self.rope_scaling = rope_params
+
+        # Set pad_token_id
+        if pad_token_id_source is not None and hasattr(
+            pad_token_id_source, "pad_token_id"
+        ):
+            if not hasattr(self, "pad_token_id") or self.pad_token_id is None:
+                self.pad_token_id = pad_token_id_source.pad_token_id
 
     def get_required_attributes(self) -> List[str]:
         return [
@@ -129,26 +153,27 @@ class NeuronQwen25OmniForCausalLM(NeuronQwen2VLTextForCausalLM):
     with mrope_section=[16, 24, 24]. For text-only input, all three M-RoPE
     axes receive identical position IDs.
 
-    Key differences from base Qwen2-VL text model:
-      - Weight keys are prefixed with 'thinker.model.' / 'thinker.lm_head.'
-      - Non-text weights (talker, token2wav, audio_tower, visual) are discarded
+    Loads via Qwen2_5OmniThinkerForConditionalGeneration and filters the
+    state dict to keep only text model weights (layers, embed_tokens, norm,
+    lm_head), discarding audio_tower and visual weights.
     """
 
     _model_cls = NeuronQwen2VLTextModel
-    _STATE_DICT_MODEL_PREFIX = "thinker.model."
 
     @staticmethod
     def load_hf_model(model_path: str, **kwargs):
-        """Load the full Qwen2.5-Omni model from HuggingFace.
+        """Load the Qwen2.5-Omni Thinker model from HuggingFace.
 
-        Note: We load the full model and filter to thinker text weights
-        in convert_hf_to_neuron_state_dict.
+        Uses the explicit Thinker class instead of AutoModelForCausalLM
+        because qwen2_5_omni is not registered in the CausalLM auto-mapping.
+        The Thinker model includes the text backbone plus vision/audio
+        encoders; convert_hf_to_neuron_state_dict filters to text-only
+        weights.
         """
-        from transformers import AutoModelForCausalLM
+        from transformers import Qwen2_5OmniThinkerForConditionalGeneration
 
-        return AutoModelForCausalLM.from_pretrained(
+        return Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(
             model_path,
-            trust_remote_code=True,
             **kwargs,
         )
 
@@ -161,35 +186,28 @@ class NeuronQwen25OmniForCausalLM(NeuronQwen2VLTextForCausalLM):
         state_dict: Dict[str, Any],
         config: Qwen25OmniInferenceConfig,
     ) -> Dict[str, Any]:
-        """Convert Qwen2.5-Omni state dict to NxDI format.
+        """Convert Qwen2.5-Omni Thinker state dict to NxDI format.
 
-        1. Keep only thinker text model weights (discard talker, token2wav, audio, visual)
-        2. Map 'thinker.lm_head.' -> 'lm_head.'
-        3. Apply standard Qwen2 conversions (fused QKV, rank utils, etc.)
+        After base-class prefix stripping ('model.' -> ''), the state dict
+        has text model keys (layers.*, embed_tokens.*, norm.*), lm_head.*,
+        and non-text keys (audio_tower.*, visual.*).
+
+        This function:
+        1. Removes non-text weights (audio_tower, visual)
+        2. Applies standard Qwen2 conversions (fused QKV, rank utils, etc.)
         """
         neuron_config = config.neuron_config
 
-        # Filter: keep only thinker text weights and lm_head
-        # After base-class prefix stripping, 'thinker.model.*' becomes '*'
-        # but 'thinker.lm_head.*' is NOT stripped, so handle it here.
-        keys_to_remove = []
-        keys_to_rename = {}
-        for key in state_dict:
-            if key.startswith("thinker.lm_head."):
-                # Map thinker.lm_head.weight -> lm_head.weight
-                new_key = key.replace("thinker.lm_head.", "lm_head.", 1)
-                keys_to_rename[key] = new_key
-            elif not key.startswith(("layers.", "embed_tokens.", "norm.", "lm_head.")):
-                # After base-class prefix stripping, valid text keys start with
-                # layers.*, embed_tokens.*, norm.*, or lm_head.*
-                # Everything else (talker, token2wav, audio_tower, visual) should be removed
-                keys_to_remove.append(key)
+        # Filter: keep only text model weights and lm_head.
+        # After base-class prefix stripping of 'model.', valid text keys
+        # start with layers.*, embed_tokens.*, norm.*, or lm_head.*.
+        # Remove everything else (audio_tower, visual, etc.).
+        keys_to_remove = [
+            key
+            for key in state_dict
+            if not key.startswith(("layers.", "embed_tokens.", "norm.", "lm_head."))
+        ]
 
-        # Apply renames
-        for old_key, new_key in keys_to_rename.items():
-            state_dict[new_key] = state_dict.pop(old_key)
-
-        # Remove non-text weights
         for key in keys_to_remove:
             del state_dict[key]
 
@@ -292,25 +310,36 @@ class Qwen25OmniMultimodalInferenceConfig(ImageToTextInferenceConfig):
                 if "text_config" not in kwargs and "text_config" in thinker:
                     tc = thinker["text_config"]
                     kwargs["text_config"] = (
-                        vars(tc) if hasattr(tc, "__dict__") and not isinstance(tc, dict) else tc
+                        vars(tc)
+                        if hasattr(tc, "__dict__") and not isinstance(tc, dict)
+                        else tc
                     )
                 if "vision_config" not in kwargs and "vision_config" in thinker:
                     vc = thinker["vision_config"]
                     kwargs["vision_config"] = (
-                        vars(vc) if hasattr(vc, "__dict__") and not isinstance(vc, dict) else vc
+                        vars(vc)
+                        if hasattr(vc, "__dict__") and not isinstance(vc, dict)
+                        else vc
                     )
                 # Extract audio_config from thinker_config
                 if "audio_config" not in kwargs and "audio_config" in thinker:
                     ac = thinker["audio_config"]
                     kwargs["audio_config"] = (
-                        vars(ac) if hasattr(ac, "__dict__") and not isinstance(ac, dict) else ac
+                        vars(ac)
+                        if hasattr(ac, "__dict__") and not isinstance(ac, dict)
+                        else ac
                     )
                 # Extract special token IDs from thinker_config
                 for token_key in [
-                    "image_token_index", "audio_token_index", "video_token_index",
-                    "audio_start_token_id", "audio_end_token_id",
-                    "vision_start_token_id", "vision_end_token_id",
-                    "vision_token_id", "pad_token_id",
+                    "image_token_index",
+                    "audio_token_index",
+                    "video_token_index",
+                    "audio_start_token_id",
+                    "audio_end_token_id",
+                    "vision_start_token_id",
+                    "vision_end_token_id",
+                    "vision_token_id",
+                    "pad_token_id",
                 ]:
                     if token_key in thinker and token_key not in kwargs:
                         kwargs[token_key] = thinker[token_key]
@@ -382,8 +411,7 @@ class Qwen25OmniMultimodalInferenceConfig(ImageToTextInferenceConfig):
             if getattr(self.text_config.neuron_config, cfg_name, False):
                 setattr(self.text_config.neuron_config, cfg_name, False)
                 logger.warning(
-                    f"Qwen2.5-Omni text model does not support "
-                    f"'{cfg_name}'. Disabled."
+                    f"Qwen2.5-Omni text model does not support '{cfg_name}'. Disabled."
                 )
 
         # Disable unsupported features for vision model
@@ -443,6 +471,7 @@ class NeuronQwen25OmniMultimodalForCausalLM(NeuronBaseForImageToText):
         from neuronx_distributed_inference.models.qwen2_vl.modeling_qwen2_vl_text import (
             NeuronQwen2VLTextModel,
         )
+
         return NeuronQwen2VLTextModel
 
     @staticmethod
@@ -450,6 +479,7 @@ class NeuronQwen25OmniMultimodalForCausalLM(NeuronBaseForImageToText):
         from neuronx_distributed_inference.models.qwen2_vl.modeling_qwen2_vl_text import (
             Qwen2VLTextModelWrapper,
         )
+
         return Qwen2VLTextModelWrapper
 
     @staticmethod
@@ -457,6 +487,7 @@ class NeuronQwen25OmniMultimodalForCausalLM(NeuronBaseForImageToText):
         from neuronx_distributed_inference.models.qwen25_omni.modeling_qwen25_omni_vision import (
             NeuronQwen25OmniVisionModel,
         )
+
         return NeuronQwen25OmniVisionModel
 
     @staticmethod
@@ -464,6 +495,7 @@ class NeuronQwen25OmniMultimodalForCausalLM(NeuronBaseForImageToText):
         from neuronx_distributed_inference.models.qwen25_omni.modeling_qwen25_omni_vision import (
             Qwen25OmniVisionModelWrapper,
         )
+
         return Qwen25OmniVisionModelWrapper
 
     @staticmethod
@@ -471,6 +503,7 @@ class NeuronQwen25OmniMultimodalForCausalLM(NeuronBaseForImageToText):
         from neuronx_distributed_inference.models.qwen25_omni.modeling_qwen25_omni_audio import (
             NeuronQwen25OmniAudioEncoder,
         )
+
         return NeuronQwen25OmniAudioEncoder
 
     @staticmethod
@@ -478,6 +511,7 @@ class NeuronQwen25OmniMultimodalForCausalLM(NeuronBaseForImageToText):
         from neuronx_distributed_inference.models.qwen25_omni.modeling_qwen25_omni_talker import (
             NeuronQwen25OmniTalker,
         )
+
         return NeuronQwen25OmniTalker
 
     @staticmethod
@@ -485,6 +519,7 @@ class NeuronQwen25OmniMultimodalForCausalLM(NeuronBaseForImageToText):
         from neuronx_distributed_inference.models.qwen25_omni.modeling_qwen25_omni_token2wav import (
             NeuronQwen25OmniToken2Wav,
         )
+
         return NeuronQwen25OmniToken2Wav
 
     def __init__(self, *args, **kwargs):
@@ -601,6 +636,7 @@ class NeuronQwen25OmniMultimodalForCausalLM(NeuronBaseForImageToText):
         audio_config = getattr(self.config, "audio_config", None)
         if isinstance(audio_config, dict):
             from types import SimpleNamespace
+
             audio_config = SimpleNamespace(**audio_config)
 
         if audio_neuron_config is None:
@@ -616,7 +652,9 @@ class NeuronQwen25OmniMultimodalForCausalLM(NeuronBaseForImageToText):
 
         audio_inf_config = AudioEncoderInferenceConfig(
             neuron_config=audio_neuron_config,
-            audio_config=vars(audio_config) if hasattr(audio_config, '__dict__') else audio_config,
+            audio_config=vars(audio_config)
+            if hasattr(audio_config, "__dict__")
+            else audio_config,
         )
 
         audio_app = NeuronQwen25OmniForAudioEncoding(audio_inf_config)
@@ -641,6 +679,7 @@ class NeuronQwen25OmniMultimodalForCausalLM(NeuronBaseForImageToText):
                 AudioEncoderInferenceConfig,
                 NeuronQwen25OmniForAudioEncoding,
             )
+
             # Load from compiled artifacts
             audio_app = NeuronQwen25OmniForAudioEncoding.load(compiled_model_path)
 
@@ -766,17 +805,17 @@ class NeuronQwen25OmniMultimodalForCausalLM(NeuronBaseForImageToText):
         token2wav_state = {}
         for key, value in state_dict.items():
             if key.startswith("thinker.model."):
-                remapped["model." + key[len("thinker.model."):]] = value
+                remapped["model." + key[len("thinker.model.") :]] = value
             elif key.startswith("thinker.lm_head."):
-                remapped[key[len("thinker."):]] = value
+                remapped[key[len("thinker.") :]] = value
             elif key.startswith("thinker.visual."):
-                remapped["visual." + key[len("thinker.visual."):]] = value
+                remapped["visual." + key[len("thinker.visual.") :]] = value
             elif key.startswith("thinker.audio_tower."):
-                remapped["audio_tower." + key[len("thinker.audio_tower."):]] = value
+                remapped["audio_tower." + key[len("thinker.audio_tower.") :]] = value
             elif key.startswith("talker.") and include_talker:
-                talker_state[key[len("talker."):]] = value
+                talker_state[key[len("talker.") :]] = value
             elif key.startswith("token2wav.") and include_token2wav:
-                token2wav_state[key[len("token2wav."):]] = value
+                token2wav_state[key[len("token2wav.") :]] = value
 
         del state_dict
         gc.collect()
@@ -794,9 +833,7 @@ class NeuronQwen25OmniMultimodalForCausalLM(NeuronBaseForImageToText):
         )
 
         # Step 3: Audio encoder conversion (strip prefix, cast dtype)
-        audio_dtype = getattr(
-            inference_config, "torch_dtype", torch.bfloat16
-        )
+        audio_dtype = getattr(inference_config, "torch_dtype", torch.bfloat16)
         if hasattr(inference_config, "neuron_config"):
             audio_dtype = getattr(
                 inference_config.neuron_config, "torch_dtype", audio_dtype
@@ -866,9 +903,9 @@ class NeuronQwen25OmniMultimodalForCausalLM(NeuronBaseForImageToText):
             and self.audio_encoder is not None
             and is_context_encoding
         ):
-            audio_token_id = getattr(
-                self.config, "audio_token_id", None
-            ) or getattr(self.config, "audio_token_index", 151646)
+            audio_token_id = getattr(self.config, "audio_token_id", None) or getattr(
+                self.config, "audio_token_index", 151646
+            )
 
             with torch.no_grad():
                 # Prepare audio features (same as HF get_audio_features)
@@ -896,7 +933,7 @@ class NeuronQwen25OmniMultimodalForCausalLM(NeuronBaseForImageToText):
                 )
 
                 # Find audio token positions for scattering
-                audio_mask_bool = (input_ids == audio_token_id)
+                audio_mask_bool = input_ids == audio_token_id
                 if audio_mask_bool.any() and audio_embeddings is not None:
                     audio_positions = generate_positions_from_mask(
                         audio_mask_bool.squeeze()
@@ -913,7 +950,7 @@ class NeuronQwen25OmniMultimodalForCausalLM(NeuronBaseForImageToText):
             image_token_id = getattr(self.config, "image_token_id", None) or getattr(
                 self.config, "image_token_index", 151655
             )
-            vision_mask_bool = (input_ids == image_token_id)
+            vision_mask_bool = input_ids == image_token_id
             if vision_mask_bool.any():
                 vision_positions = generate_positions_from_mask(
                     vision_mask_bool.squeeze()
@@ -930,10 +967,15 @@ class NeuronQwen25OmniMultimodalForCausalLM(NeuronBaseForImageToText):
             # Both audio and vision present
             # audio_embeddings is on CPU, vision_embeddings may be on XLA
             # The model wrapper handles device transfer, so keep on CPU
-            all_embeddings = torch.cat([
-                vision_embeddings.cpu() if vision_embeddings.is_cuda else vision_embeddings,
-                audio_embeddings,
-            ], dim=0)
+            all_embeddings = torch.cat(
+                [
+                    vision_embeddings.cpu()
+                    if vision_embeddings.is_cuda
+                    else vision_embeddings,
+                    audio_embeddings,
+                ],
+                dim=0,
+            )
             all_positions = torch.cat([vision_positions, audio_positions])
             vision_embeddings = all_embeddings
             vision_mask = pad_positions(all_positions, pad_limit, (pad_limit - 1))
@@ -946,11 +988,13 @@ class NeuronQwen25OmniMultimodalForCausalLM(NeuronBaseForImageToText):
             vision_mask = pad_positions(vision_positions, pad_limit, (pad_limit - 1))
         else:
             # No multimodal input - use dummy embeddings
-            vision_embeddings, vision_mask = self._get_text_model_wrapper().get_dummy_vision_inputs(
-                config=self.text_config,
-                input_ids=input_ids,
-                n_active_tokens=pad_limit,
-                fill_value=(pad_limit - 1),
+            vision_embeddings, vision_mask = (
+                self._get_text_model_wrapper().get_dummy_vision_inputs(
+                    config=self.text_config,
+                    input_ids=input_ids,
+                    n_active_tokens=pad_limit,
+                    fill_value=(pad_limit - 1),
+                )
             )
 
         output_token = super().forward(
