@@ -85,6 +85,18 @@ USE_NKI_SCAN = (
     False  # O(L^2) quadratic scan: NKI scan produces more instructions at long context
 )
 
+# Chunked scan: processes seq_len in chunk_size=128 blocks, avoiding O(L^2) memory.
+# Within each chunk: O(chunk^2) quadratic scan (128x128 matrix).
+# Between chunks: O(1) state propagation from previous chunk's final state.
+# Memory: O(chunk^2) instead of O(L^2) — enables ctx=512+ on trn2.3xlarge.
+USE_CHUNKED_SCAN = False  # Disabled: multi-hour compile times + 36x TTFT regression
+
+# Head-grouped quadratic scan: process SCAN_HEAD_GROUP heads at a time instead of
+# all 64 heads simultaneously. Reduces peak intermediate memory by num_heads/SCAN_HEAD_GROUP.
+# At ctx=512 with 64 heads: weight matrix [1,512,512,64] = 67MB → [1,512,512,8] = 8.4MB.
+# The 1GB transpose scratchpad that caused OOM should scale proportionally.
+SCAN_HEAD_GROUP = 8  # Process 8 heads at a time (64/8 = 8 groups)
+
 try:
     import nki
     import nki.language as nl
@@ -295,6 +307,146 @@ def _nki_selective_scan(
         .unsqueeze(0)
         .contiguous()
     )
+
+    return y, final_state
+
+
+def _chunked_quadratic_scan(
+    x,
+    dt_processed,
+    A,
+    B,
+    C,
+    D_param,
+    num_heads,
+    head_dim,
+    ssm_state_size,
+    chunk_size=128,
+    padding_mask=None,
+):
+    """Chunked quadratic scan for Mamba-2 prefill.
+
+    Processes seq_len in chunk_size blocks, avoiding O(L^2) memory.
+    Within each chunk: O(chunk^2) quadratic scan (same math as full scan).
+    Between chunks: propagates SSM state from previous chunk's final state.
+
+    This is mathematically equivalent to the full O(L^2) scan but uses
+    O(chunk^2) memory instead of O(L^2), enabling ctx=512+ on trn2.3xlarge.
+
+    The key insight (Mamba-2 SSD, Section 3.3): the selective scan can be
+    decomposed into intra-chunk computation (structured attention within a
+    chunk) and inter-chunk state propagation (carrying the hidden state
+    forward). Within each chunk, the causal weight matrix is only
+    (chunk_size, chunk_size). Between chunks, the state carry is O(1).
+
+    Args:
+        x: (batch, seq_len, num_heads, head_dim) float32
+        dt_processed: (batch, seq_len, num_heads) float32
+        A: (num_heads,) float32 (negative)
+        B: (batch, seq_len, num_heads, ssm_state_size) float32
+        C: (batch, seq_len, num_heads, ssm_state_size) float32
+        D_param: (num_heads,) float32
+        num_heads, head_dim, ssm_state_size: ints
+        chunk_size: int (default 128)
+        padding_mask: (batch, max_seq_len) or None
+
+    Returns:
+        y: (batch, seq_len, num_heads, head_dim)
+        final_state: (batch, num_heads, head_dim, ssm_state_size)
+    """
+    batch_size, seq_len = x.shape[:2]
+    device = x.device
+
+    # Number of chunks (seq_len must be divisible by chunk_size — NxDI pads)
+    n_chunks = seq_len // chunk_size
+
+    # Pre-compute dA_log for the full sequence, then chunk it
+    dA_log = dt_processed * A.view(1, 1, -1)  # (B, L, H)
+
+    # Pre-compute dB and dBx for the full sequence
+    dB = dt_processed.unsqueeze(-1) * B  # (B, L, H, S)
+    dBx = dB.unsqueeze(3) * x.unsqueeze(-1)  # (B, L, H, D, S)
+
+    # Causal mask for intra-chunk scan (reused for all chunks)
+    causal_mask = torch.tril(
+        torch.ones(chunk_size, chunk_size, device=device, dtype=x.dtype)
+    )
+
+    # Allocate output
+    y = torch.zeros_like(x)  # (B, L, H, D)
+
+    # Initial state: zeros
+    state = torch.zeros(
+        batch_size,
+        num_heads,
+        head_dim,
+        ssm_state_size,
+        device=device,
+        dtype=x.dtype,
+    )
+
+    for chunk_idx in range(n_chunks):
+        t0 = chunk_idx * chunk_size
+        t1 = t0 + chunk_size
+
+        # Slice chunk data
+        dA_log_chunk = dA_log[:, t0:t1, :]  # (B, Q, H)
+        dBx_chunk = dBx[:, t0:t1, :, :, :]  # (B, Q, H, D, S)
+        C_chunk = C[:, t0:t1, :, :]  # (B, Q, H, S)
+        x_chunk = x[:, t0:t1, :, :]  # (B, Q, H, D)
+
+        # --- Intra-chunk quadratic scan ---
+        # Same as the full quadratic scan but only chunk_size x chunk_size
+        log_dA_cumsum_chunk = torch.cumsum(dA_log_chunk, dim=1)  # (B, Q, H)
+
+        log_diff = log_dA_cumsum_chunk.unsqueeze(2) - log_dA_cumsum_chunk.unsqueeze(
+            1
+        )  # (B, Q, Q, H)
+        log_diff = log_diff.masked_fill(
+            causal_mask.unsqueeze(0).unsqueeze(-1) == 0, -1e9
+        )
+        weights = torch.exp(log_diff)  # (B, Q, Q, H)
+
+        # states_intra: (B, Q, H, D, S) — intra-chunk states at each position
+        states_intra = torch.einsum("btih,bihds->bthds", weights, dBx_chunk)
+
+        # --- Inter-chunk state contribution ---
+        # Decay the incoming state by cumulative dA within this chunk.
+        # At position t within chunk: decay = exp(sum of dA_log from 0..t)
+        # = exp(log_dA_cumsum_chunk[:, t, :])
+        decay = torch.exp(log_dA_cumsum_chunk)  # (B, Q, H)
+
+        # Inter-chunk contribution to output:
+        # y_inter[b, t, h, d] = sum_s C[b,t,h,s] * decay[b,t,h] * state[b,h,d,s]
+        # = decay[b,t,h] * (C[b,t,h,:] @ state[b,h,d,:].T)
+        # state: (B, H, D, S), C_chunk: (B, Q, H, S)
+        y_inter = torch.einsum("bths,bhds->bthd", C_chunk, state)  # (B, Q, H, D)
+        y_inter = y_inter * decay.unsqueeze(-1)  # scale by cumulative decay
+
+        # Combine intra + inter + D*x
+        y_intra = torch.einsum("blhs,blhds->blhd", C_chunk, states_intra)
+        y_chunk = y_intra + y_inter + D_param.view(1, 1, -1, 1) * x_chunk
+
+        y[:, t0:t1, :, :] = y_chunk
+
+        # --- Update state for next chunk ---
+        # The state after this chunk is:
+        # state_new = decay_total * state + states_intra[:, -1, :, :, :]
+        # where decay_total = exp(sum of all dA_log in this chunk)
+        decay_total = torch.exp(
+            dA_log_chunk.sum(dim=1)
+        )  # (B, H) — total decay over chunk
+        state = (
+            decay_total.unsqueeze(-1).unsqueeze(-1) * state
+            + states_intra[:, -1, :, :, :]
+        )
+
+    # Final state: for padding_mask handling, we'd need to track which chunk
+    # contains the last real token. Since NxDI pads all sequences to
+    # max_context_length and padding tokens have dt=0 (zeroed out earlier),
+    # the state propagation naturally handles this — padding tokens contribute
+    # nothing to the state update.
+    final_state = state.contiguous()
 
     return y, final_state
 
@@ -740,7 +892,23 @@ class NeuronNemotronMamba2Layer(nn.Module):
         B = B.repeat_interleave(self.num_heads // self.n_groups, dim=2)
         C = C.repeat_interleave(self.num_heads // self.n_groups, dim=2)
 
-        if USE_NKI_SCAN:
+        if USE_CHUNKED_SCAN and seq_len >= self.chunk_size:
+            # Chunked O(chunk^2) scan: processes seq_len in chunk_size blocks.
+            # Memory is O(chunk^2) instead of O(L^2), enabling ctx=512+.
+            y, ssm_state_new = _chunked_quadratic_scan(
+                x,
+                dt_processed,
+                A,
+                B,
+                C,
+                self.D.float(),
+                self.num_heads,
+                self.head_dim,
+                self.ssm_state_size,
+                chunk_size=self.chunk_size,
+                padding_mask=padding_mask,
+            )
+        elif USE_NKI_SCAN:
             # NKI O(L) hardware-accelerated selective scan
             y, ssm_state_new = _nki_selective_scan(
                 x,
@@ -757,39 +925,77 @@ class NeuronNemotronMamba2Layer(nn.Module):
             # padding_mask handling for variable-length is not yet supported
             # with NKI -- assumes padded inputs (NxDI pads to max_context_length).
         else:
-            # O(L^2) quadratic parallel scan (fallback)
-            dA_log = dt_processed * A.view(1, 1, -1)
-            dB = dt_processed.unsqueeze(-1) * B
-            dBx = dB.unsqueeze(3) * x.unsqueeze(-1)
-
-            log_dA_cumsum = torch.cumsum(dA_log, dim=1)
+            # O(L^2) quadratic parallel scan — head-grouped to reduce peak memory.
+            # Process SCAN_HEAD_GROUP heads at a time instead of all num_heads.
+            # This reduces the weight matrix from [B,L,L,num_heads] to [B,L,L,G]
+            # and proportionally reduces the compiler's transpose scratchpad.
+            G = SCAN_HEAD_GROUP  # heads per group
+            n_groups_scan = self.num_heads // G
+            assert self.num_heads % G == 0, (
+                f"num_heads={self.num_heads} not divisible by SCAN_HEAD_GROUP={G}"
+            )
 
             causal_mask = torch.tril(
                 torch.ones(seq_len, seq_len, device=x.device, dtype=x.dtype)
             )
-            log_diff = log_dA_cumsum.unsqueeze(2) - log_dA_cumsum.unsqueeze(1)
-            log_diff = log_diff.masked_fill(
-                causal_mask.unsqueeze(0).unsqueeze(-1) == 0, -1e9
-            )
-            weights = torch.exp(log_diff)
 
-            states = torch.einsum("btih,bihds->bthds", weights, dBx)
+            y_parts = []
+            ssm_state_parts = []
 
-            # Save final SSM state from last REAL token position (Granite4 pattern)
-            if padding_mask is not None:
-                real_len = padding_mask[:, :seq_len].sum(dim=1, keepdim=True).long()
-                last_real_idx = (real_len - 1).clamp(min=0)
-                gather_idx = last_real_idx.view(batch_size, 1, 1, 1, 1).expand(
-                    -1, -1, self.num_heads, self.head_dim, self.ssm_state_size
+            for g in range(n_groups_scan):
+                h_start = g * G
+                h_end = h_start + G
+
+                # Slice head-group tensors: x[B,L,H,D] -> [B,L,G,D]
+                x_g = x[:, :, h_start:h_end, :]
+                B_g = B[:, :, h_start:h_end, :]
+                C_g = C[:, :, h_start:h_end, :]
+                dt_g = dt_processed[:, :, h_start:h_end]
+                A_g = A[h_start:h_end]
+
+                dA_log_g = dt_g * A_g.view(1, 1, -1)
+                dB_g = dt_g.unsqueeze(-1) * B_g  # [B,L,G,S]
+                dBx_g = dB_g.unsqueeze(3) * x_g.unsqueeze(-1)  # [B,L,G,D,S]
+
+                log_dA_cumsum_g = torch.cumsum(dA_log_g, dim=1)  # [B,L,G]
+
+                log_diff_g = log_dA_cumsum_g.unsqueeze(2) - log_dA_cumsum_g.unsqueeze(
+                    1
+                )  # [B,L,L,G]
+                log_diff_g = log_diff_g.masked_fill(
+                    causal_mask.unsqueeze(0).unsqueeze(-1) == 0, -1e9
                 )
-                ssm_state_new = (
-                    torch.gather(states, 1, gather_idx).squeeze(1).contiguous()
-                )
-            else:
-                ssm_state_new = states[:, -1, :, :, :].contiguous()
+                weights_g = torch.exp(log_diff_g)  # [B,L,L,G]
 
-            y = torch.einsum("blhs,blhds->blhd", C, states)
-            y = y + self.D.view(1, 1, -1, 1) * x
+                states_g = torch.einsum(
+                    "btih,bihds->bthds", weights_g, dBx_g
+                )  # [B,L,G,D,S]
+
+                # Extract final state for this head group
+                if padding_mask is not None:
+                    real_len = padding_mask[:, :seq_len].sum(dim=1, keepdim=True).long()
+                    last_real_idx = (real_len - 1).clamp(min=0)
+                    gather_idx = last_real_idx.view(batch_size, 1, 1, 1, 1).expand(
+                        -1, -1, G, self.head_dim, self.ssm_state_size
+                    )
+                    ssm_state_g = torch.gather(states_g, 1, gather_idx).squeeze(
+                        1
+                    )  # [B,G,D,S]
+                else:
+                    ssm_state_g = states_g[:, -1, :, :, :]  # [B,G,D,S]
+
+                y_g = torch.einsum("blhs,blhds->blhd", C_g, states_g)  # [B,L,G,D]
+                D_g = self.D[h_start:h_end].view(1, 1, -1, 1)
+                y_g = y_g + D_g * x_g
+
+                y_parts.append(y_g)
+                ssm_state_parts.append(ssm_state_g)
+
+            # Concatenate head groups back together
+            y = torch.cat(y_parts, dim=2)  # [B,L,num_heads,D]
+            ssm_state_new = torch.cat(
+                ssm_state_parts, dim=1
+            ).contiguous()  # [B,num_heads,D,S]
         y = y.reshape(batch_size, seq_len, -1)
 
         scan_output = self.norm(y, gate)
