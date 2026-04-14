@@ -1129,12 +1129,12 @@ class NeuronMiniMaxM2Attention(NeuronAttentionBase):
         else:
             # Reshape K/V from kernel output layout to the rank-4 [B, N, S, D]
             # layout expected by kv_cache_manager.update_kv_by_layer_id.
-            # K from kernel: [head_dim, bsz, q_len] (dBS)
-            # V from kernel: [bsz, q_len, head_dim] (BSd)
+            # K from kernel: [head_dim, B, S_tkg] (dBS)
+            # V from kernel: [B, 1, S_tkg, head_dim] (BNSd) -- already rank-4
             # Target: [B, 1, S, D] (BNSd) or [B, 1, D, S] (BNdS) for transposed K
             K = K.permute(1, 0, 2) if self.k_cache_transposed else K.permute(1, 2, 0)
             K = K.unsqueeze(1)
-            V = V.unsqueeze(1)
+            # V is already [B, 1, S, D] from kernel -- no unsqueeze needed
             KV = (K, V)
 
         return attn_output, KV, cos_cache, sin_cache
