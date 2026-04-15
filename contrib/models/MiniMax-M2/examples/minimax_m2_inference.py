@@ -117,21 +117,23 @@ def create_config(args) -> MiniMaxM2InferenceConfig:
     # vs ~54 tok/s baseline (the framework cache update path is slower).
     #
     # Recommendation: Use fused_qkv=True without the NKI attention kernel for
-    # best throughput (51 tok/s with correct output). The NKI attention kernel
-    # is currently experimental and only useful for development/testing.
+    # best throughput (51.7 tok/s with correct output). The NKI attention kernel
+    # provides fused QKV + RoPE + attention in a single NEFF with only ~5% overhead.
     #
-    # Performance summary (trn2.48xlarge, TP=32, B=1, ctx=128):
-    #   Baseline (no NKI, fused_qkv=False): 54.0 tok/s, correct
-    #   fused_qkv=True, standard attention: 51.2 tok/s, correct  <-- default
-    #   NKI attention + cache_update=False:  30.4 tok/s, correct
-    #   NKI attention + cache_update=True:   54.3 tok/s, GARBAGE (nkilib issue)
+    # Performance summary (SDK 2.29, trn2.48xlarge, TP=32, B=1, ctx=128):
+    #   Baseline (no NKI, fused_qkv=True):  51.7 tok/s, correct  <-- default
+    #   NKI attention + cache_update=False:  49.0 tok/s, correct
+    #   NKI attention + cache_update=True:   ~49-55 tok/s, GARBAGE (nkilib issue)
+    #
+    # The NKI in-kernel KV cache update (cache_update=True) corrupts output at B=1
+    # due to an issue in nkilib's _update_flat_cache DMA pattern. Using framework
+    # KV cache update (cache_update=False) avoids this with minimal throughput cost.
 
     use_nki_attn = args.enable_nki_attention
     if use_nki_attn:
         print(
-            "WARNING: NKI attention kernel enabled with framework KV cache update "
-            "(cache_update=False). Expect ~30 tok/s due to nkilib _update_flat_cache "
-            "issue. Use without --enable-nki-attention for ~51 tok/s."
+            "INFO: NKI attention kernel enabled with framework KV cache update "
+            "(cache_update=False). Expected ~49 tok/s vs ~52 tok/s baseline."
         )
 
     neuron_config = MoENeuronConfig(
@@ -157,7 +159,7 @@ def create_config(args) -> MiniMaxM2InferenceConfig:
         # NKI attention block kernel (fused QKV + RoPE + attention + KV cache)
         attn_block_tkg_nki_kernel_enabled=use_nki_attn,
         attn_block_tkg_nki_kernel_cascaded_attention=use_nki_attn,
-        # CRITICAL: cache_update must be False — in-kernel update corrupts KV cache
+        # cache_update must be False — in-kernel DMA update corrupts output at B=1
         attn_block_tkg_nki_kernel_cache_update=False,
         qkv_kernel_enabled=use_nki_attn,
         # fused_qkv=True always — uses fused QKV weight for cleaner loading
