@@ -12,7 +12,10 @@ import torch.nn.functional as F
 from torch.distributed import ProcessGroup
 
 from neuronx_distributed_inference.modules.custom_calls import CustomRMSNorm
-from neuronx_distributed_inference.modules.kvcache.kv_cache_manager import KVCacheManager, KV_CACHE_PAD_FOR_SEQ_IDS_MASKING
+from neuronx_distributed_inference.modules.kvcache.kv_cache_manager import (
+    KVCacheManager,
+    KV_CACHE_PAD_FOR_SEQ_IDS_MASKING,
+)
 from neuronx_distributed_inference.modules.attention.sink import LearnedSink
 
 from neuronx_distributed_inference.modules.attention.attention_process_groups import (
@@ -39,19 +42,25 @@ from .utils import (
     order_strided_tensor,
     get_cp8_tp8_rank_ordering,
 )
-from neuronx_distributed.modules.attention.utils import apply_rotary_polar_compatible, precompute_freqs_cis
+from neuronx_distributed.modules.attention.utils import (
+    apply_rotary_polar_compatible,
+    precompute_freqs_cis,
+)
 
 import neuronx_distributed as nxd
 import torch_xla.core.xla_model as xm
 from neuronx_distributed.parallel_layers import utils  # noqa: E402
 from neuronx_distributed.parallel_layers.layers import SPMDRank
-from neuronx_distributed.parallel_layers.parallel_state import get_kv_shared_group, get_tensor_model_parallel_group
+from neuronx_distributed.parallel_layers.parallel_state import (
+    get_kv_shared_group,
+    get_tensor_model_parallel_group,
+)
 from neuronx_distributed.parallel_layers.mappings import (
     gather_from_sequence_parallel_region,
     reduce_from_tensor_model_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
     gather_from_tensor_model_parallel_region_with_dim,
-    reduce_scatter_to_tensor_model_parallel_region_with_dim
+    reduce_scatter_to_tensor_model_parallel_region_with_dim,
 )
 from neuronx_distributed_inference.utils.distributed import (
     split_along_dim,
@@ -108,6 +117,7 @@ class EPDispatchOption(Enum):
     RS_AG: ReduceScatter across local TP group followed by AllGather from global TP group
     AG_AR: AllGather from DP group followed by AllReduce from local TP group
     """
+
     AR_AG = "AR_AG"
     RS_AG = "RS_AG"
     AG_AR = "AG_AR"
@@ -124,7 +134,9 @@ class NeuronAttentionBaseOutput:
 
     # maintain old unpacking behavior
     def __iter__(self):
-        return iter([self.hidden_states, self.present_key_value, self.cos_cache, self.sin_cache])
+        return iter(
+            [self.hidden_states, self.present_key_value, self.cos_cache, self.sin_cache]
+        )
 
     # maintain old tuple indexing behavior
     def __getitem__(self, i):
@@ -141,37 +153,38 @@ class NeuronAttentionBase(nn.Module):
     5. update forward() method to adjust to changes from self.num_head
     """
 
-    def __init__(self,
-                 config: InferenceConfig,
-                 *,
-                 hidden_size: int,
-                 num_attention_heads: int,
-                 num_key_value_heads: int,
-                 head_dim: int = None,
-                 rotary_emb=None,
-                 rope_theta: float = None,
-                 use_scaled_rope: bool = False,
-                 rms_norm_eps: float = None,
-                 use_qk_norm: bool = False,
-                 qk_norm_placement: QKNormPlacement = QKNormPlacement.PRE_ROPE,
-                 q_layernorm: Callable = None,
-                 k_layernorm: Callable = None,
-                 post_transpose_layernorm: bool = False,
-                 clip_qkv: float = None,
-                 qkv_bias: bool = False,
-                 o_bias: bool = False,
-                 softmax_scale: float = None,
-                 num_cores_per_group: int = 1,
-                 sequence_parallel_enabled: bool = None,
-                 attention_chunk_size: int = None,
-                 is_post_global_attn_layer: bool = False,
-                 is_pre_global_attn_layer: bool = False,
-                 sliding_window: int = None,
-                 tensor_model_parallel_group: Optional[ProcessGroup] = None,
-                 o_proj_layer_name: str = "o_proj",
-                 learned_sinks_size: Optional[int] = None,
-                 optimize_interleave_attn: bool = False):
-
+    def __init__(
+        self,
+        config: InferenceConfig,
+        *,
+        hidden_size: int,
+        num_attention_heads: int,
+        num_key_value_heads: int,
+        head_dim: int = None,
+        rotary_emb=None,
+        rope_theta: float = None,
+        use_scaled_rope: bool = False,
+        rms_norm_eps: float = None,
+        use_qk_norm: bool = False,
+        qk_norm_placement: QKNormPlacement = QKNormPlacement.PRE_ROPE,
+        q_layernorm: Callable = None,
+        k_layernorm: Callable = None,
+        post_transpose_layernorm: bool = False,
+        clip_qkv: float = None,
+        qkv_bias: bool = False,
+        o_bias: bool = False,
+        softmax_scale: float = None,
+        num_cores_per_group: int = 1,
+        sequence_parallel_enabled: bool = None,
+        attention_chunk_size: int = None,
+        is_post_global_attn_layer: bool = False,
+        is_pre_global_attn_layer: bool = False,
+        sliding_window: int = None,
+        tensor_model_parallel_group: Optional[ProcessGroup] = None,
+        o_proj_layer_name: str = "o_proj",
+        learned_sinks_size: Optional[int] = None,
+        optimize_interleave_attn: bool = False,
+    ):
         super().__init__()
 
         self.config = config
@@ -182,36 +195,67 @@ class NeuronAttentionBase(nn.Module):
 
         if tensor_model_parallel_group is not None:
             self.tensor_model_parallel_group = tensor_model_parallel_group
-        elif nxd.parallel_layers.parallel_state.model_parallel_is_initialized() and self.config.neuron_config.cp_degree > 1 and self.neuron_config.is_prefill_stage:
+        elif (
+            nxd.parallel_layers.parallel_state.model_parallel_is_initialized()
+            and self.config.neuron_config.cp_degree > 1
+            and self.neuron_config.is_prefill_stage
+        ):
             init_context_parallel_attention_process_groups(config)
             self.tensor_model_parallel_group = get_context_parallel_attention_tp_group()
-        elif nxd.parallel_layers.parallel_state.model_parallel_is_initialized() and self.config.neuron_config.attention_dp_degree > 1 and not self.neuron_config.is_prefill_stage:
+        elif (
+            nxd.parallel_layers.parallel_state.model_parallel_is_initialized()
+            and self.config.neuron_config.attention_dp_degree > 1
+            and not self.neuron_config.is_prefill_stage
+        ):
             init_data_parallel_attention_process_groups(config)
             self.tensor_model_parallel_group = get_data_parallel_attention_tp_group()
         elif nxd.parallel_layers.parallel_state.model_parallel_is_initialized():
-            self.tensor_model_parallel_group = nxd.parallel_layers.parallel_state.get_tensor_model_parallel_group()
+            self.tensor_model_parallel_group = (
+                nxd.parallel_layers.parallel_state.get_tensor_model_parallel_group()
+            )
 
         if self.tensor_model_parallel_group is not None:
             self.rank_util = SPMDRank(config.neuron_config.tp_degree)
 
-        self.tp_degree = self.neuron_config.tp_degree if self.tensor_model_parallel_group is None else self.tensor_model_parallel_group.size()
+        self.tp_degree = (
+            self.neuron_config.tp_degree
+            if self.tensor_model_parallel_group is None
+            else self.tensor_model_parallel_group.size()
+        )
         self.cp_degree = self.neuron_config.cp_degree
         self.dp_degree = self.neuron_config.attention_dp_degree
 
         self.rpl_reduce_dtype = self.neuron_config.rpl_reduce_dtype
-        self.torch_dtype = config.neuron_config.attention_dtype if config.neuron_config.attention_dtype is not None else config.neuron_config.torch_dtype
+        self.torch_dtype = (
+            config.neuron_config.attention_dtype
+            if config.neuron_config.attention_dtype is not None
+            else config.neuron_config.torch_dtype
+        )
         self.fused_qkv = self.neuron_config.fused_qkv
-        self.qkv_cte_nki_kernel_fuse_rope = self.neuron_config.qkv_cte_nki_kernel_fuse_rope
+        self.qkv_cte_nki_kernel_fuse_rope = (
+            self.neuron_config.qkv_cte_nki_kernel_fuse_rope
+        )
 
         # Accounts for cases where some sub-modules always have SP enabled / disabled
-        self.sequence_parallel_enabled = self.neuron_config.sequence_parallel_enabled if sequence_parallel_enabled is None else sequence_parallel_enabled
-        self.qkv_proj_sp_enabled = self.o_proj_sp_enabled = self.sequence_parallel_enabled
+        self.sequence_parallel_enabled = (
+            self.neuron_config.sequence_parallel_enabled
+            if sequence_parallel_enabled is None
+            else sequence_parallel_enabled
+        )
+        self.qkv_proj_sp_enabled = self.o_proj_sp_enabled = (
+            self.sequence_parallel_enabled
+        )
         self.attention_chunk_size = attention_chunk_size
         self.optimize_interleave_attn = optimize_interleave_attn
 
         # Determine if chunked attn needs to be disabled
-        if self.attention_chunk_size and self.attention_chunk_size >= self.config.neuron_config.seq_len:
-            logger.warning(f"attention chunk size {self.attention_chunk_size} is greater than or equal to seq_len {self.config.neuron_config.seq_len}. Chunked attention is disabled")
+        if (
+            self.attention_chunk_size
+            and self.attention_chunk_size >= self.config.neuron_config.seq_len
+        ):
+            logger.warning(
+                f"attention chunk size {self.attention_chunk_size} is greater than or equal to seq_len {self.config.neuron_config.seq_len}. Chunked attention is disabled"
+            )
             self.attention_chunk_size = None
         self.is_post_global_attn_layer = is_post_global_attn_layer
         self.is_pre_global_attn_layer = is_pre_global_attn_layer
@@ -220,37 +264,66 @@ class NeuronAttentionBase(nn.Module):
             self.is_post_global_attn_layer = False
             self.optimize_interleave_attn = False  # turning off the optimal flow because we have to gather and regather again for the [chunked, global, chunked, global ...] attn pattern
 
-        if self.attention_chunk_size and self.cp_degree > 1 and self.neuron_config.is_prefill_stage:
+        if (
+            self.attention_chunk_size
+            and self.cp_degree > 1
+            and self.neuron_config.is_prefill_stage
+        ):
             self.qkv_proj_sp_enabled = False
-            if self.optimize_interleave_attn and self.is_pre_global_attn_layer or not self.optimize_interleave_attn:
+            if (
+                self.optimize_interleave_attn
+                and self.is_pre_global_attn_layer
+                or not self.optimize_interleave_attn
+            ):
                 self.o_proj_sp_enabled = False
 
-        self.windowed_context_encoding_size = config.neuron_config.windowed_context_encoding_size
+        self.windowed_context_encoding_size = (
+            config.neuron_config.windowed_context_encoding_size
+        )
         self.sliding_window = sliding_window
         self.sequence_dimension = 1 if self.sequence_parallel_enabled else None
         self.padding_side = self.neuron_config.padding_side
         self.flash_decoding_enabled = self.neuron_config.flash_decoding_enabled
         self.mlp_kernel_enabled = self.neuron_config.mlp_kernel_enabled
         self.attn_kernel_enabled = self.neuron_config.attn_kernel_enabled
-        self.strided_context_parallel_kernel_enabled = self.neuron_config.strided_context_parallel_kernel_enabled
-        self.attn_block_tkg_nki_kernel_enabled = self.neuron_config.attn_block_tkg_nki_kernel_enabled
-        self.attn_block_tkg_nki_kernel_cache_update = self.neuron_config.attn_block_tkg_nki_kernel_cache_update
-        self.k_cache_transposed = self.neuron_config.k_cache_transposed and self.sliding_window is None
+        self.strided_context_parallel_kernel_enabled = (
+            self.neuron_config.strided_context_parallel_kernel_enabled
+        )
+        self.attn_block_tkg_nki_kernel_enabled = (
+            self.neuron_config.attn_block_tkg_nki_kernel_enabled
+        )
+        self.attn_block_tkg_nki_kernel_cache_update = (
+            self.neuron_config.attn_block_tkg_nki_kernel_cache_update
+        )
+        self.k_cache_transposed = (
+            self.neuron_config.k_cache_transposed and self.sliding_window is None
+        )
         self.logical_nc_config = self.neuron_config.logical_nc_config
         self.qk_layernorm = self.neuron_config.qk_layernorm
         self.post_transpose_layernorm = post_transpose_layernorm
 
         if self.sliding_window and self.neuron_config.enable_fused_speculation:
-            assert self.attn_block_tkg_nki_kernel_enabled and self.neuron_config.attn_block_tkg_nki_kernel_cascaded_attention, 'Currently we only support speculative decoding with sliding window attention when the cascaded tkg attention kernel is enabled'
+            assert (
+                self.attn_block_tkg_nki_kernel_enabled
+                and self.neuron_config.attn_block_tkg_nki_kernel_cascaded_attention
+            ), (
+                "Currently we only support speculative decoding with sliding window attention when the cascaded tkg attention kernel is enabled"
+            )
 
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
         self.num_key_value_heads = num_key_value_heads
-        self.head_dim = head_dim if head_dim is not None else self.hidden_size // self.num_attention_heads
+        self.head_dim = (
+            head_dim
+            if head_dim is not None
+            else self.hidden_size // self.num_attention_heads
+        )
         self.rotary_emb = rotary_emb
         self.rope_theta = rope_theta
         self.use_scaled_rope = use_scaled_rope
-        self.softmax_scale = math.sqrt(self.head_dim) if softmax_scale is None else softmax_scale
+        self.softmax_scale = (
+            math.sqrt(self.head_dim) if softmax_scale is None else softmax_scale
+        )
 
         self.inv_freqs = None
         self.num_cores_per_group = num_cores_per_group
@@ -266,17 +339,23 @@ class NeuronAttentionBase(nn.Module):
         self.k_layernorm = k_layernorm
 
         self.learned_sinks_size = learned_sinks_size
-        self.is_eagle3_draft = self.neuron_config.is_eagle3 and self.neuron_config.is_eagle_draft
+        self.is_eagle3_draft = (
+            self.neuron_config.is_eagle3 and self.neuron_config.is_eagle_draft
+        )
         self.init_gqa_properties()
 
         self.qk_norm = None
         if use_qk_norm:
             self.init_qk_norm()
 
-        self.ep_dispatch_cc_option = EPDispatchOption(self.neuron_config.ep_dispatch_cc_option)
+        self.ep_dispatch_cc_option = EPDispatchOption(
+            self.neuron_config.ep_dispatch_cc_option
+        )
 
     def init_tkg_cp_qkv_o_proj(self, process_group, rank_ordering=None):
-        qkv_hidden_size = self.hidden_size * 2 if self.is_eagle3_draft else self.hidden_size
+        qkv_hidden_size = (
+            self.hidden_size * 2 if self.is_eagle3_draft else self.hidden_size
+        )
         self.tkg_qkv_proj = GroupQueryAttention_QKV(
             hidden_size=qkv_hidden_size,
             head_dim=self.head_dim,
@@ -316,22 +395,41 @@ class NeuronAttentionBase(nn.Module):
             rpl_reduce_dtype=self.rpl_reduce_dtype,
             # Mega kernels include QKV projection, RoPE, attention, and output projection
             # out_proj kernel will be enabled if mega kernel is enabled
-            out_proj_kernel_enabled=self.attn_block_tkg_nki_kernel_enabled or self.neuron_config.out_proj_kernel_enabled,
+            out_proj_kernel_enabled=self.attn_block_tkg_nki_kernel_enabled
+            or self.neuron_config.out_proj_kernel_enabled,
             logical_nc_config=self.neuron_config.logical_nc_config,
             rank_ordering=rank_ordering,
         )
         if self.learned_sinks_size is not None:
-            self.tkg_learned_sinks = LearnedSink(self.learned_sinks_size, self.num_attention_heads, self.torch_dtype, process_group.size(), rank_ordering)
+            self.tkg_learned_sinks = LearnedSink(
+                self.learned_sinks_size,
+                self.num_attention_heads,
+                self.torch_dtype,
+                process_group.size(),
+                rank_ordering,
+            )
 
     def init_gqa_properties(self):
         cte_rank_ordering = None
         if self.cp_degree == 1 and self.dp_degree > 1:
-            validate_tp_prefill_to_dp_decode(self.num_key_value_heads, self.neuron_config.tp_degree, self.dp_degree)
-            cte_rank_ordering = get_context_parallel_reordered_tp_mapping(self.neuron_config.tp_degree, self.dp_degree, self.num_key_value_heads)
-        elif self.cp_degree == 8 and self.neuron_config.tp_degree // self.cp_degree == 8:
-            cte_rank_ordering = get_cp8_tp8_rank_ordering(self.neuron_config.tp_degree, self.cp_degree, switch_cc=self.neuron_config.switch_cc)
+            validate_tp_prefill_to_dp_decode(
+                self.num_key_value_heads, self.neuron_config.tp_degree, self.dp_degree
+            )
+            cte_rank_ordering = get_context_parallel_reordered_tp_mapping(
+                self.neuron_config.tp_degree, self.dp_degree, self.num_key_value_heads
+            )
+        elif (
+            self.cp_degree == 8 and self.neuron_config.tp_degree // self.cp_degree == 8
+        ):
+            cte_rank_ordering = get_cp8_tp8_rank_ordering(
+                self.neuron_config.tp_degree,
+                self.cp_degree,
+                switch_cc=self.neuron_config.switch_cc,
+            )
 
-        qkv_hidden_size = self.hidden_size * 2 if self.is_eagle3_draft else self.hidden_size
+        qkv_hidden_size = (
+            self.hidden_size * 2 if self.is_eagle3_draft else self.hidden_size
+        )
         qkv_proj = GroupQueryAttention_QKV(
             hidden_size=qkv_hidden_size,
             head_dim=self.head_dim,
@@ -353,7 +451,9 @@ class NeuronAttentionBase(nn.Module):
             logical_nc_config=self.neuron_config.logical_nc_config,
             qkv_kernel_nbsd_layout=self.neuron_config.qkv_kernel_nbsd_layout,
             on_cpu=self.neuron_config.on_cpu,
-            tiling_factor=self.neuron_config.cc_pipeline_tiling_factor if self.neuron_config.tile_cc else 1,
+            tiling_factor=self.neuron_config.cc_pipeline_tiling_factor
+            if self.neuron_config.tile_cc
+            else 1,
             seq_len_threshold_for_cc_tiling=self.neuron_config.seq_len_threshold_for_cc_tiling,
             rank_ordering=cte_rank_ordering,
         )
@@ -373,16 +473,28 @@ class NeuronAttentionBase(nn.Module):
             rpl_reduce_dtype=self.rpl_reduce_dtype,
             # Mega kernels include QKV projection, RoPE, attention, and output projection
             # out_proj kernel will be enabled if mega kernel is enabled
-            out_proj_kernel_enabled=self.attn_block_tkg_nki_kernel_enabled or self.neuron_config.out_proj_kernel_enabled,
+            out_proj_kernel_enabled=self.attn_block_tkg_nki_kernel_enabled
+            or self.neuron_config.out_proj_kernel_enabled,
             logical_nc_config=self.neuron_config.logical_nc_config,
-            tiling_factor=self.neuron_config.cc_pipeline_tiling_factor if self.neuron_config.tile_cc else 1,
+            tiling_factor=self.neuron_config.cc_pipeline_tiling_factor
+            if self.neuron_config.tile_cc
+            else 1,
             rank_ordering=cte_rank_ordering,
         )
         self.learned_sinks = None
         if self.learned_sinks_size is not None:
-            self.learned_sinks = LearnedSink(self.learned_sinks_size, self.num_attention_heads, self.torch_dtype, self.tp_degree, cte_rank_ordering)
+            self.learned_sinks = LearnedSink(
+                self.learned_sinks_size,
+                self.num_attention_heads,
+                self.torch_dtype,
+                self.tp_degree,
+                cte_rank_ordering,
+            )
 
-        if self.dp_degree > 1 and nxd.parallel_layers.parallel_state.model_parallel_is_initialized():
+        if (
+            self.dp_degree > 1
+            and nxd.parallel_layers.parallel_state.model_parallel_is_initialized()
+        ):
             init_data_parallel_attention_process_groups(self.config)
 
         # DP > 1 and CP == 1, CTE runs in full TP and Decode in TP + DP
@@ -396,24 +508,46 @@ class NeuronAttentionBase(nn.Module):
             self.cte_qkv_proj = qkv_proj
             self.cte_o_proj = o_proj
 
-            rank_ordering = get_context_parallel_reordered_tp_mapping(self.neuron_config.tp_degree, self.neuron_config.cp_degree, self.num_key_value_heads, cte_rank_ordering=cte_rank_ordering)
+            rank_ordering = get_context_parallel_reordered_tp_mapping(
+                self.neuron_config.tp_degree,
+                self.neuron_config.cp_degree,
+                self.num_key_value_heads,
+                cte_rank_ordering=cte_rank_ordering,
+            )
 
-            self.init_tkg_cp_qkv_o_proj(get_tensor_model_parallel_group(), rank_ordering=rank_ordering)
+            self.init_tkg_cp_qkv_o_proj(
+                get_tensor_model_parallel_group(), rank_ordering=rank_ordering
+            )
         # CP > 1 and DP > 1 and CP != DP, CTE runs in TP + CP and Decode in TP + DP
-        elif self.cp_degree > 1 and self.dp_degree > 1 and self.cp_degree != self.dp_degree:
+        elif (
+            self.cp_degree > 1
+            and self.dp_degree > 1
+            and self.cp_degree != self.dp_degree
+        ):
             self.cte_qkv_proj = qkv_proj
             self.cte_o_proj = o_proj
 
-            rank_ordering = get_context_parallel_reordered_dp_mapping(self.neuron_config.tp_degree, self.cp_degree, self.dp_degree, self.num_key_value_heads, switch_cc=self.neuron_config.switch_cc, cte_rank_ordering=cte_rank_ordering)
+            rank_ordering = get_context_parallel_reordered_dp_mapping(
+                self.neuron_config.tp_degree,
+                self.cp_degree,
+                self.dp_degree,
+                self.num_key_value_heads,
+                switch_cc=self.neuron_config.switch_cc,
+                cte_rank_ordering=cte_rank_ordering,
+            )
 
-            self.init_tkg_cp_qkv_o_proj(get_data_parallel_attention_tp_group(), rank_ordering=rank_ordering)
+            self.init_tkg_cp_qkv_o_proj(
+                get_data_parallel_attention_tp_group(), rank_ordering=rank_ordering
+            )
         # CP == DP OR no CP and DP enabled
         else:
             self.qkv_proj = qkv_proj
             self.o_proj = o_proj
             self.learned_sinks = self.learned_sinks
 
-        self.num_heads = utils.divide(qkv_proj.get_num_attention_heads(), self.tp_degree)
+        self.num_heads = utils.divide(
+            qkv_proj.get_num_attention_heads(), self.tp_degree
+        )
         self._src_num_key_value_heads = self.num_key_value_heads
         self.num_key_value_heads = utils.divide(
             qkv_proj.get_num_key_value_heads(), self.tp_degree
@@ -423,10 +557,16 @@ class NeuronAttentionBase(nn.Module):
 
         # q_layernorm and k_layernorm values passed to __init__ take precedence
         if (self.q_layernorm is None) != (self.k_layernorm is None):
-            raise ValueError("q_layernorm and k_layernorm must both be set or both be None")
+            raise ValueError(
+                "q_layernorm and k_layernorm must both be set or both be None"
+            )
         if (self.q_layernorm is None) and (self.k_layernorm is None):
-            self.q_layernorm = nn.LayerNorm(self.head_dim) if self.qk_layernorm else None
-            self.k_layernorm = nn.LayerNorm(self.head_dim) if self.qk_layernorm else None
+            self.q_layernorm = (
+                nn.LayerNorm(self.head_dim) if self.qk_layernorm else None
+            )
+            self.k_layernorm = (
+                nn.LayerNorm(self.head_dim) if self.qk_layernorm else None
+            )
 
     def init_qk_norm(self):
         if self.use_qk_norm:
@@ -442,7 +582,9 @@ class NeuronAttentionBase(nn.Module):
             return None
         if self.neuron_config.is_prefill_stage and self.cp_degree != self.dp_degree:
             return self.learned_sinks.sink
-        elif not self.neuron_config.is_prefill_stage and self.cp_degree != self.dp_degree:
+        elif (
+            not self.neuron_config.is_prefill_stage and self.cp_degree != self.dp_degree
+        ):
             return self.tkg_learned_sinks.sink
         else:
             return self.learned_sinks.sink
@@ -450,13 +592,17 @@ class NeuronAttentionBase(nn.Module):
     def scaled_qk(self, Q, K, attention_mask):
         QK = torch.matmul(Q, K.transpose(2, 3)) / self.softmax_scale
         if attention_mask is not None:
-            QK = torch.where(attention_mask.to(torch.bool), QK, torch.finfo(QK.dtype).min)
+            QK = torch.where(
+                attention_mask.to(torch.bool), QK, torch.finfo(QK.dtype).min
+            )
         return QK
 
     def get_qkv_proj(self):
         if self.neuron_config.is_prefill_stage and self.cp_degree != self.dp_degree:
             return self.cte_qkv_proj
-        elif not self.neuron_config.is_prefill_stage and self.cp_degree != self.dp_degree:
+        elif (
+            not self.neuron_config.is_prefill_stage and self.cp_degree != self.dp_degree
+        ):
             return self.tkg_qkv_proj
         else:
             return self.qkv_proj
@@ -464,25 +610,33 @@ class NeuronAttentionBase(nn.Module):
     def get_o_proj(self):
         if self.neuron_config.is_prefill_stage and self.cp_degree != self.dp_degree:
             return self.cte_o_proj
-        elif not self.neuron_config.is_prefill_stage and self.cp_degree != self.dp_degree:
+        elif (
+            not self.neuron_config.is_prefill_stage and self.cp_degree != self.dp_degree
+        ):
             return self.tkg_o_proj
         else:
             return self.o_proj
 
-    def apply_rotary_embedding(self, Q, K, V, position_ids, cos_cache, sin_cache, use_polar_compatible_rope):
+    def apply_rotary_embedding(
+        self, Q, K, V, position_ids, cos_cache, sin_cache, use_polar_compatible_rope
+    ):
         if not use_polar_compatible_rope and self.rotary_emb is not None:
             if cos_cache is None or sin_cache is None:
                 cos_cache, sin_cache = self.rotary_emb(V, position_ids)
             Q, K = apply_rotary_pos_emb(Q, K, cos_cache, sin_cache)
 
         elif use_polar_compatible_rope:
-            rotary_freqs = precompute_freqs_cis(self.head_dim,
-                                                self.neuron_config.max_context_length * 2,
-                                                self.rope_theta,
-                                                self.use_scaled_rope,
-                                                device=Q.device)
+            rotary_freqs = precompute_freqs_cis(
+                self.head_dim,
+                self.neuron_config.max_context_length * 2,
+                self.rope_theta,
+                self.use_scaled_rope,
+                device=Q.device,
+            )
             rotary_freqs = rotary_freqs[position_ids]
-            Q, K = apply_rotary_polar_compatible(Q.transpose(1, 2), K.transpose(1, 2), rotary_freqs)
+            Q, K = apply_rotary_polar_compatible(
+                Q.transpose(1, 2), K.transpose(1, 2), rotary_freqs
+            )
             Q, K = Q.transpose(1, 2), K.transpose(1, 2)
         return Q, K, cos_cache, sin_cache
 
@@ -500,18 +654,32 @@ class NeuronAttentionBase(nn.Module):
         use_polar_compatible_rope=False,
     ):
         """take care of the shape, layout, group query, custom position encoding, etc.
-           also return residual for MLP """
-        is_qkv_cte_fuse_rope_nki_kernel_enabled = self.neuron_config.is_prefill_stage and self.qkv_cte_nki_kernel_fuse_rope
-        assert not (is_qkv_cte_fuse_rope_nki_kernel_enabled and self.use_qk_norm and self.qk_norm_placement == QKNormPlacement.PRE_ROPE), "qkv cte nki kernel fuse rope is not compatible with pre rope qk norm"
+        also return residual for MLP"""
+        is_qkv_cte_fuse_rope_nki_kernel_enabled = (
+            self.neuron_config.is_prefill_stage and self.qkv_cte_nki_kernel_fuse_rope
+        )
+        assert not (
+            is_qkv_cte_fuse_rope_nki_kernel_enabled
+            and self.use_qk_norm
+            and self.qk_norm_placement == QKNormPlacement.PRE_ROPE
+        ), "qkv cte nki kernel fuse rope is not compatible with pre rope qk norm"
         if is_qkv_cte_fuse_rope_nki_kernel_enabled:
             if cos_cache is None or sin_cache is None:
                 cos_cache, sin_cache = self.rotary_emb(hidden_states, position_ids)
             Q, K, V, residual = self.get_qkv_proj()(
-                hidden_states=hidden_states, rmsnorm=rmsnorm, adapter_ids=adapter_ids, residual=residual, cos_cache=cos_cache, sin_cache=sin_cache,
+                hidden_states=hidden_states,
+                rmsnorm=rmsnorm,
+                adapter_ids=adapter_ids,
+                residual=residual,
+                cos_cache=cos_cache,
+                sin_cache=sin_cache,
             )
         else:
             Q, K, V, residual = self.get_qkv_proj()(
-                hidden_states=hidden_states, rmsnorm=rmsnorm, adapter_ids=adapter_ids, residual=residual
+                hidden_states=hidden_states,
+                rmsnorm=rmsnorm,
+                adapter_ids=adapter_ids,
+                residual=residual,
             )
 
             if self.use_qk_norm and self.qk_norm_placement == QKNormPlacement.PRE_ROPE:
@@ -524,20 +692,32 @@ class NeuronAttentionBase(nn.Module):
         if self.qkv_proj_sp_enabled:
             q_len *= self.tensor_model_parallel_group.size()
         Q = move_heads_front(
-            Q, bsz, q_len, self.num_heads, self.head_dim, layernorm=self.q_layernorm, post_transpose_layernorm=self.post_transpose_layernorm
+            Q,
+            bsz,
+            q_len,
+            self.num_heads,
+            self.head_dim,
+            layernorm=self.q_layernorm,
+            post_transpose_layernorm=self.post_transpose_layernorm,
         )
         K = move_heads_front(
-            K, bsz, q_len, self.num_key_value_heads, self.head_dim, layernorm=self.k_layernorm, post_transpose_layernorm=self.post_transpose_layernorm
+            K,
+            bsz,
+            q_len,
+            self.num_key_value_heads,
+            self.head_dim,
+            layernorm=self.k_layernorm,
+            post_transpose_layernorm=self.post_transpose_layernorm,
         )
-        V = move_heads_front(V, bsz, q_len, self.num_key_value_heads, self.head_dim, layernorm=None)
+        V = move_heads_front(
+            V, bsz, q_len, self.num_key_value_heads, self.head_dim, layernorm=None
+        )
 
         if not skip_rope and not is_qkv_cte_fuse_rope_nki_kernel_enabled:
             # Rotate Q and K
-            Q, K, cos_cache, sin_cache = self.apply_rotary_embedding(Q, K, V,
-                                                                     position_ids,
-                                                                     cos_cache,
-                                                                     sin_cache,
-                                                                     use_polar_compatible_rope)
+            Q, K, cos_cache, sin_cache = self.apply_rotary_embedding(
+                Q, K, V, position_ids, cos_cache, sin_cache, use_polar_compatible_rope
+            )
 
         if self.use_qk_norm and self.qk_norm_placement == QKNormPlacement.POST_ROPE:
             Q = self.qk_norm(Q)
@@ -555,18 +735,26 @@ class NeuronAttentionBase(nn.Module):
                 process_group=get_context_parallel_attention_cp_group(),
             )
 
-            if self.get_flash_attention_strategy_cp(q_len * self.cp_degree) == FlashAttentionStrategy.STRIDED_CONTEXT_PARALLEL_KERNEL:
+            if (
+                self.get_flash_attention_strategy_cp(q_len * self.cp_degree)
+                == FlashAttentionStrategy.STRIDED_CONTEXT_PARALLEL_KERNEL
+            ):
                 stacked_kv = order_strided_tensor(stacked_kv, 3, self.cp_degree)
 
             K, V = torch.unbind(stacked_kv, dim=0)
 
         return Q, K, V, cos_cache, sin_cache, residual
 
-    def context_parallel_flash_attention_kernel(self, Q, K_active, V_active, q_len, bsz, strategy):
+    def context_parallel_flash_attention_kernel(
+        self, Q, K_active, V_active, q_len, bsz, strategy
+    ):
         Q = Q.reshape(-1, q_len, self.head_dim)  # B * heads, S, d_head
         Q = Q / self.softmax_scale
 
-        if strategy == FlashAttentionStrategy.CONTEXT_PARALLEL_KERNEL and _has_native_gqa_tp_support:
+        if (
+            strategy == FlashAttentionStrategy.CONTEXT_PARALLEL_KERNEL
+            and _has_native_gqa_tp_support
+        ):
             # We perform transpose inside kernel and do not replicate in this case
             K_active = K_active.reshape(
                 -1, q_len * self.cp_degree, self.head_dim
@@ -591,7 +779,12 @@ class NeuronAttentionBase(nn.Module):
         grid = self.logical_nc_config
 
         # tp_degree when using CP is the reduced TP that Attention runs in
-        cp_rank = get_cp_rank(self.rank_util.get_rank(), self.tp_degree, self.cp_degree, self.neuron_config.switch_cc)
+        cp_rank = get_cp_rank(
+            self.rank_util.get_rank(),
+            self.tp_degree,
+            self.cp_degree,
+            self.neuron_config.switch_cc,
+        )
 
         cp_fa_kernel_kwargs = {}
         if self.learned_sinks_size is not None:
@@ -638,7 +831,9 @@ class NeuronAttentionBase(nn.Module):
 
     def perform_prefill(self, Q, K, V, q_len, bsz, attention_mask) -> Tensor:
         """attention computation at prefilling (context encoding) phase"""
-        flash_attn_strategy = self.get_flash_attention_strategy(q_len, attention_mask is not None)
+        flash_attn_strategy = self.get_flash_attention_strategy(
+            q_len, attention_mask is not None
+        )
         logger.debug(f"Flash attention strategy: {flash_attn_strategy}")
 
         # NKI kernel cannot use placeholder tensor directly. Add tensor attributes to it
@@ -647,7 +842,9 @@ class NeuronAttentionBase(nn.Module):
         V = V.as_subclass(torch.Tensor) if type(V) is not torch.Tensor else V
 
         if flash_attn_strategy != FlashAttentionStrategy.NONE and self.cp_degree > 1:
-            attn_output = self.context_parallel_flash_attention_kernel(Q, K, V, q_len, bsz, flash_attn_strategy)
+            attn_output = self.context_parallel_flash_attention_kernel(
+                Q, K, V, q_len, bsz, flash_attn_strategy
+            )
 
         elif flash_attn_strategy != FlashAttentionStrategy.NONE:
             logger.debug(f"ATTN kernel: logical_nc_config={self.logical_nc_config}")
@@ -664,22 +861,22 @@ class NeuronAttentionBase(nn.Module):
             # original Q shape: batch, num_heads, seqlen, d_head
             if _has_native_gqa_tp_support:
                 # do Q and K transpose inside kernel, no need to replicate heads
-                Q = (
-                    Q.reshape((bsz * self.num_heads, q_len, self.head_dim))
-                    .to(self.torch_dtype)
+                Q = Q.reshape((bsz * self.num_heads, q_len, self.head_dim)).to(
+                    self.torch_dtype
                 )
                 tp_q_new_kernel = True
                 K_active = K
                 V_active = V
                 num_kv_heads = self.num_key_value_heads
-                K_active = (
-                    K_active.reshape((bsz * num_kv_heads, q_len, self.head_dim))
-                    .to(self.torch_dtype)
-                )
+                K_active = K_active.reshape(
+                    (bsz * num_kv_heads, q_len, self.head_dim)
+                ).to(self.torch_dtype)
                 tp_k_new_kernel = True
             else:
                 Q = (
-                    Q.permute(0, 1, 3, 2)  # after permute: batch, num_heads, d_head, seqlen
+                    Q.permute(
+                        0, 1, 3, 2
+                    )  # after permute: batch, num_heads, d_head, seqlen
                     .reshape((bsz * self.num_heads, self.head_dim, q_len))
                     .to(self.torch_dtype)
                 )
@@ -699,7 +896,11 @@ class NeuronAttentionBase(nn.Module):
             )
             # shape: (B*H)DS
             attn_output = torch.zeros(
-                bsz * self.num_heads, self.head_dim, q_len, dtype=Q.dtype, device=Q.device
+                bsz * self.num_heads,
+                self.head_dim,
+                q_len,
+                dtype=Q.dtype,
+                device=Q.device,
             )
 
             logger.debug("Input parameter shapes")
@@ -711,10 +912,14 @@ class NeuronAttentionBase(nn.Module):
             fa_kernel_kwargs = {}
             if self.learned_sinks_size is not None:
                 fa_kernel_kwargs["sink"] = self.get_learned_sinks().unsqueeze(-1)
-                assert get_platform_target() != "trn1", "sink argument is not supported by trn1"
+                assert get_platform_target() != "trn1", (
+                    "sink argument is not supported by trn1"
+                )
             if self.sliding_window:
                 fa_kernel_kwargs["sliding_window"] = self.sliding_window
-                assert get_platform_target() != "trn1", "sliding_window argument is not supported by trn1"
+                assert get_platform_target() != "trn1", (
+                    "sliding_window argument is not supported by trn1"
+                )
 
             if flash_attn_strategy == FlashAttentionStrategy.SHARDED_KERNEL:
                 grid = self.logical_nc_config
@@ -743,10 +948,14 @@ class NeuronAttentionBase(nn.Module):
                     **fa_kernel_kwargs,
                 )
             else:
-                raise ValueError(f"Invalid flash attention strategy: {flash_attn_strategy}")
+                raise ValueError(
+                    f"Invalid flash attention strategy: {flash_attn_strategy}"
+                )
 
             # shape: BHDS
-            attn_output = attn_output.reshape((bsz, self.num_heads, self.head_dim, q_len))
+            attn_output = attn_output.reshape(
+                (bsz, self.num_heads, self.head_dim, q_len)
+            )
             logger.debug(f"Attn output after reshape {attn_output.shape}")
         else:
             logger.debug("ATTN: native compiler")
@@ -758,24 +967,32 @@ class NeuronAttentionBase(nn.Module):
             learned_sinks = self.get_learned_sinks()
             if learned_sinks is not None:
                 # Validate the sink is of size one
-                assert learned_sinks.ndim == 1 and learned_sinks.shape[0] == self.num_heads
-                learned_sinks = learned_sinks.reshape(1, self.num_heads, 1, 1).expand(bsz, -1, q_len, -1)
+                assert (
+                    learned_sinks.ndim == 1 and learned_sinks.shape[0] == self.num_heads
+                )
+                learned_sinks = learned_sinks.reshape(1, self.num_heads, 1, 1).expand(
+                    bsz, -1, q_len, -1
+                )
                 active_scores = torch.cat((active_scores, learned_sinks), dim=-1)
-            active_scores = nn.functional.softmax(active_scores, dim=-1, dtype=torch.float32).to(
-                Q.dtype
-            )
+            active_scores = nn.functional.softmax(
+                active_scores, dim=-1, dtype=torch.float32
+            ).to(Q.dtype)
             if learned_sinks is not None:
                 active_scores = active_scores[..., :-1]
             attn_output = torch.matmul(active_scores, V_active)
         return attn_output, flash_attn_strategy
 
-    def perform_prefix_prefill(self, Q, K, V, q_len, bsz, attention_mask, past_key_value, active_mask) -> Tensor:
+    def perform_prefix_prefill(
+        self, Q, K, V, q_len, bsz, attention_mask, past_key_value, active_mask
+    ) -> Tensor:
         """attention computation at prefilling (context encoding) phase"""
         K_prior = past_key_value[0]
         V_prior = past_key_value[1]
         prior_len = K_prior.shape[-2]
 
-        flash_attn_strategy = self.get_flash_attention_strategy(q_len, has_attention_mask=False)
+        flash_attn_strategy = self.get_flash_attention_strategy(
+            q_len, has_attention_mask=False
+        )
         logger.debug(f"Flash attention strategy: {flash_attn_strategy}")
 
         if flash_attn_strategy != FlashAttentionStrategy.NONE:
@@ -793,9 +1010,8 @@ class NeuronAttentionBase(nn.Module):
             # original Q shape: batch, num_heads, seqlen, d_head
             if _has_native_gqa_tp_support:
                 # do Q transpose inside kernel, no need to replicate heads
-                Q = (
-                    Q.reshape(bsz * self.num_heads, q_len, self.head_dim)
-                    .to(self.torch_dtype)
+                Q = Q.reshape(bsz * self.num_heads, q_len, self.head_dim).to(
+                    self.torch_dtype
                 )
                 tp_q_new_kernel = True
                 K_active = K
@@ -821,15 +1037,19 @@ class NeuronAttentionBase(nn.Module):
             V_active = V_active.reshape((bsz * num_kv_heads, q_len, self.head_dim)).to(
                 self.torch_dtype
             )
-            K_prior = K_prior.reshape((bsz * num_kv_heads, prior_len, self.head_dim)).to(
-                self.torch_dtype
-            )
-            V_prior = V_prior.reshape((bsz * num_kv_heads, prior_len, self.head_dim)).to(
-                self.torch_dtype
-            )
+            K_prior = K_prior.reshape(
+                (bsz * num_kv_heads, prior_len, self.head_dim)
+            ).to(self.torch_dtype)
+            V_prior = V_prior.reshape(
+                (bsz * num_kv_heads, prior_len, self.head_dim)
+            ).to(self.torch_dtype)
             # shape: (B*H)DS
             attn_output = torch.zeros(
-                bsz * self.num_heads, self.head_dim, q_len, dtype=Q.dtype, device=Q.device
+                bsz * self.num_heads,
+                self.head_dim,
+                q_len,
+                dtype=Q.dtype,
+                device=Q.device,
             )
 
             logger.debug("Input parameter shapes")
@@ -873,10 +1093,14 @@ class NeuronAttentionBase(nn.Module):
                     sliding_window=self.sliding_window,
                 )
             else:
-                raise ValueError(f"Invalid flash attention strategy: {flash_attn_strategy}")
+                raise ValueError(
+                    f"Invalid flash attention strategy: {flash_attn_strategy}"
+                )
 
             # shape: BHDS
-            attn_output = attn_output.reshape((bsz, self.num_heads, self.head_dim, q_len))
+            attn_output = attn_output.reshape(
+                (bsz, self.num_heads, self.head_dim, q_len)
+            )
             logger.debug(f"Attn output after reshape {attn_output.shape}")
         else:
             logger.debug("ATTN: native compiler")
@@ -896,7 +1120,9 @@ class NeuronAttentionBase(nn.Module):
             prior_scores = prior_scores.to(torch.float32)
 
             # ii. active (current/new) KV
-            active_scores = torch.matmul(Q, K_active.transpose(2, 3)) / self.softmax_scale
+            active_scores = (
+                torch.matmul(Q, K_active.transpose(2, 3)) / self.softmax_scale
+            )
             active_scores = torch.where(
                 active_mask, active_scores, torch.finfo(active_scores.dtype).min
             )
@@ -906,14 +1132,19 @@ class NeuronAttentionBase(nn.Module):
             softmax_prior, softmax_active = manual_softmax(
                 prior_scores, active_scores, True
             )
-            softmax_prior, softmax_active = softmax_prior.to(Q.dtype), softmax_active.to(Q.dtype)
+            softmax_prior, softmax_active = (
+                softmax_prior.to(Q.dtype),
+                softmax_active.to(Q.dtype),
+            )
             attn_prior = torch.matmul(softmax_prior, V_prior)
             attn_active = torch.matmul(softmax_active, V_active)
             attn_output = attn_prior + attn_active
 
         return attn_output, flash_attn_strategy
 
-    def perform_prefill_chunked_attn(self, Q, K, V, q_len, bsz, attention_mask, chunk_size) -> Tensor:
+    def perform_prefill_chunked_attn(
+        self, Q, K, V, q_len, bsz, attention_mask, chunk_size
+    ) -> Tensor:
         """attention computation at prefilling (context encoding) phase using native PyTorch ops"""
         K_active = repeat_kv(K, self.num_key_value_groups)
         V_active = repeat_kv(V, self.num_key_value_groups)
@@ -927,29 +1158,39 @@ class NeuronAttentionBase(nn.Module):
         outputs = []
         for i in range(n_chunks):
             end_q_idx = min((i + 1) * chunk_size, q_len)
-            local_attention_mask = attention_mask[:, :, chunk_size * i:end_q_idx, chunk_size * i:end_q_idx]
-            current_chunk_q = Q[:, :, chunk_size * i:end_q_idx, :]
-            current_chunk_k = K_active[:, :, chunk_size * i:end_q_idx, :]
-            current_chunk_v = V_active[:, :, chunk_size * i:end_q_idx, :]
+            local_attention_mask = attention_mask[
+                :, :, chunk_size * i : end_q_idx, chunk_size * i : end_q_idx
+            ]
+            current_chunk_q = Q[:, :, chunk_size * i : end_q_idx, :]
+            current_chunk_k = K_active[:, :, chunk_size * i : end_q_idx, :]
+            current_chunk_v = V_active[:, :, chunk_size * i : end_q_idx, :]
 
             active_scores = self.scaled_qk(
-                current_chunk_q,
-                current_chunk_k,
-                local_attention_mask
+                current_chunk_q, current_chunk_k, local_attention_mask
             )
-            active_scores = nn.functional.softmax(active_scores, dim=-1, dtype=torch.float32).to(
-                Q.dtype
-            )
-            outputs.append(torch.matmul(
-                active_scores,
-                current_chunk_v
-            ))
+            active_scores = nn.functional.softmax(
+                active_scores, dim=-1, dtype=torch.float32
+            ).to(Q.dtype)
+            outputs.append(torch.matmul(active_scores, current_chunk_v))
         attn_output = torch.cat(outputs, dim=2)
         return attn_output, FlashAttentionStrategy.NONE
 
-    def perform_prefix_prefill_windowed_attn(self, Q, K, V, q_len, bsz, attention_mask, window_size, past_key_value, active_mask) -> Tensor:
+    def perform_prefix_prefill_windowed_attn(
+        self,
+        Q,
+        K,
+        V,
+        q_len,
+        bsz,
+        attention_mask,
+        window_size,
+        past_key_value,
+        active_mask,
+    ) -> Tensor:
         """attention computation at prefilling (context encoding) phase with sliding window"""
-        return self.perform_prefix_prefill(Q, K, V, q_len, bsz, attention_mask, past_key_value, active_mask)
+        return self.perform_prefix_prefill(
+            Q, K, V, q_len, bsz, attention_mask, past_key_value, active_mask
+        )
 
     def get_flash_attention_strategy_cp(self, q_len):
         """
@@ -968,7 +1209,10 @@ class NeuronAttentionBase(nn.Module):
             elif not self.sliding_window:
                 strategy = FlashAttentionStrategy.STRIDED_CONTEXT_PARALLEL_KERNEL
 
-        if self.strided_context_parallel_kernel_enabled and strategy != FlashAttentionStrategy.STRIDED_CONTEXT_PARALLEL_KERNEL:
+        if (
+            self.strided_context_parallel_kernel_enabled
+            and strategy != FlashAttentionStrategy.STRIDED_CONTEXT_PARALLEL_KERNEL
+        ):
             raise ValueError(
                 "Strided context parallel kernel is enabled but cannot be used. "
                 "Ensure cp_degree is > 1, LNC = 2, and (sequence_length // cp_degree) > head_dim, or disable the strided CP kernel. "
@@ -978,11 +1222,15 @@ class NeuronAttentionBase(nn.Module):
 
         return strategy
 
-    def perform_prefill_windowed_attn(self, Q, K, V, q_len, bsz, attention_mask, window_size) -> Tensor:
+    def perform_prefill_windowed_attn(
+        self, Q, K, V, q_len, bsz, attention_mask, window_size
+    ) -> Tensor:
         """attention computation at prefilling (context encoding) phase with sliding window"""
         return self.perform_prefill(Q, K, V, q_len, bsz, attention_mask)
 
-    def get_flash_attention_strategy(self, q_len, has_attention_mask) -> FlashAttentionStrategy:
+    def get_flash_attention_strategy(
+        self, q_len, has_attention_mask
+    ) -> FlashAttentionStrategy:
         """
         Gets the flash attention strategy.
 
@@ -1041,9 +1289,9 @@ class NeuronAttentionBase(nn.Module):
         n_repeat = Q.shape[1]
         K_active = repeat_kv(K, n_repeat)
         V_active = repeat_kv(V, n_repeat)
-        active_scores = (torch.matmul(Q, K_active.transpose(2, 3)) / self.softmax_scale).to(
-            torch.float32
-        )
+        active_scores = (
+            torch.matmul(Q, K_active.transpose(2, 3)) / self.softmax_scale
+        ).to(torch.float32)
         active_scores = torch.where(
             active_mask, active_scores, torch.finfo(active_scores.dtype).min
         )
@@ -1059,7 +1307,10 @@ class NeuronAttentionBase(nn.Module):
 
         # attention scores
         softmax_prior, softmax_active = distributed_softmax(prior_scores, active_scores)
-        softmax_prior, softmax_active = softmax_prior.to(Q.dtype), softmax_active.to(Q.dtype)
+        softmax_prior, softmax_active = (
+            softmax_prior.to(Q.dtype),
+            softmax_active.to(Q.dtype),
+        )
         attn_prior = torch.matmul(softmax_prior, V_prior)
         attn_active = torch.matmul(softmax_active, V_active)
         attn_output = attn_prior + attn_active
@@ -1093,14 +1344,16 @@ class NeuronAttentionBase(nn.Module):
             if self.k_cache_transposed
             else (bsz, kv_head, s_prior_full, self.head_dim)
         )
-        assert (
-            K_prior.shape == expected_k_cache_shape
-        ), f"Expect K cache shape: {expected_k_cache_shape}, got {K_prior.shape}"
+        assert K_prior.shape == expected_k_cache_shape, (
+            f"Expect K cache shape: {expected_k_cache_shape}, got {K_prior.shape}"
+        )
 
         logger.debug(f"TKG Attn kernel: K_cache_transposed = {self.k_cache_transposed}")
 
         if q_len == 1:
-            active_mask = torch.ones((bsz, q_heads, q_len, q_len), dtype=Q.dtype, device=Q.device)
+            active_mask = torch.ones(
+                (bsz, q_heads, q_len, q_len), dtype=Q.dtype, device=Q.device
+            )
         else:
             assert active_mask.shape == (
                 bsz,
@@ -1129,15 +1382,18 @@ class NeuronAttentionBase(nn.Module):
             active_mask,
         )
 
-    def get_rope_cache_for_kernel(self, hidden_states: torch.Tensor,
-                                  rotary_position_ids: Optional[torch.LongTensor],
-                                  cos_cache: Optional[torch.Tensor] = None,
-                                  sin_cache: Optional[torch.Tensor] = None):
+    def get_rope_cache_for_kernel(
+        self,
+        hidden_states: torch.Tensor,
+        rotary_position_ids: Optional[torch.LongTensor],
+        cos_cache: Optional[torch.Tensor] = None,
+        sin_cache: Optional[torch.Tensor] = None,
+    ):
         bsz, q_len, _ = hidden_states.size()
         # Prepare cosine and sine coefficients.
-        assert (
-            self.rotary_emb is not None
-        ), "attn-block-tkg-nki-kernel-enabled always implements RoPE so self.rotary_emb must be specified."
+        assert self.rotary_emb is not None, (
+            "attn-block-tkg-nki-kernel-enabled always implements RoPE so self.rotary_emb must be specified."
+        )
         if cos_cache is None or sin_cache is None:
             cos_cache, sin_cache = self.rotary_emb(hidden_states, rotary_position_ids)
             assert cos_cache.shape == (
@@ -1152,20 +1408,27 @@ class NeuronAttentionBase(nn.Module):
 
         return cos_cache, sin_cache
 
-    def get_attention_mask_for_kernel(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor):
+    def get_attention_mask_for_kernel(
+        self, hidden_states: torch.Tensor, attention_mask: torch.Tensor
+    ):
         bsz, q_len, _ = hidden_states.size()
         q_heads = self.num_heads
         # Prepare causal masks.
         s_prior = attention_mask.shape[-1]  # Current bucket's context length.
-        expected_cache_mask_shape = [(bsz, 1, q_len, s_prior), (bsz, q_heads, q_len, s_prior)]
-        assert (
-            attention_mask.shape in expected_cache_mask_shape
-        ), f"{attention_mask.shape} not matching any of expected shapes of {expected_cache_mask_shape}"
+        expected_cache_mask_shape = [
+            (bsz, 1, q_len, s_prior),
+            (bsz, q_heads, q_len, s_prior),
+        ]
+        assert attention_mask.shape in expected_cache_mask_shape, (
+            f"{attention_mask.shape} not matching any of expected shapes of {expected_cache_mask_shape}"
+        )
         # Duplicate the mask across q_heads, no op if mask already has q_heads in dim-1.
         attention_mask = attention_mask.expand(-1, q_heads, -1, -1)
         return attention_mask
 
-    def get_active_mask_for_kernel(self, hidden_states: torch.Tensor, active_mask: torch.Tensor):
+    def get_active_mask_for_kernel(
+        self, hidden_states: torch.Tensor, active_mask: torch.Tensor
+    ):
         bsz, q_len, _ = hidden_states.size()
         q_heads = self.num_heads
 
@@ -1173,11 +1436,13 @@ class NeuronAttentionBase(nn.Module):
         the_device = hidden_states.device
         expected_active_mask_shape = (bsz, 1, q_len, q_len)
         if q_len == 1 or active_mask is None:
-            active_mask = torch.ones(expected_active_mask_shape, dtype=the_dtype, device=the_device)
+            active_mask = torch.ones(
+                expected_active_mask_shape, dtype=the_dtype, device=the_device
+            )
         else:
-            assert (
-                active_mask.shape == expected_active_mask_shape
-            ), f"{active_mask.shape} != {expected_active_mask_shape}"
+            assert active_mask.shape == expected_active_mask_shape, (
+                f"{active_mask.shape} != {expected_active_mask_shape}"
+            )
 
         # Duplicate the mask across q_heads
         active_mask = active_mask.expand(-1, q_heads, -1, -1)
@@ -1198,7 +1463,10 @@ class NeuronAttentionBase(nn.Module):
         active_block_table: Optional[torch.Tensor] = None,
         use_polar_compatible_rope: bool = False,
     ):
-        if self.sequence_parallel_enabled and self.tensor_model_parallel_group is not None:
+        if (
+            self.sequence_parallel_enabled
+            and self.tensor_model_parallel_group is not None
+        ):
             hidden_states = gather_from_sequence_parallel_region(
                 hidden_states,
                 self.sequence_dimension,
@@ -1223,18 +1491,22 @@ class NeuronAttentionBase(nn.Module):
         if self.rotary_emb is not None:
             # compute cos_cache and sin_cache for the first time and then cache them
             if cos_cache is None or sin_cache is None:
-                cos_cache, sin_cache = self.rotary_emb(hidden_states, rotary_position_ids)
+                cos_cache, sin_cache = self.rotary_emb(
+                    hidden_states, rotary_position_ids
+                )
 
                 # Take first half and reshape to [dim//2, batch_size, seq_len]
                 cos_cache = cos_cache[..., : cos_cache.shape[-1] // 2].permute(2, 0, 1)
                 sin_cache = sin_cache[..., : sin_cache.shape[-1] // 2].permute(2, 0, 1)
         # Llama4, use_polar_compatible_rope flags whether or not do RoPE computation
         elif use_polar_compatible_rope:
-            rotary_freqs = precompute_freqs_cis(self.head_dim,
-                                                self.neuron_config.max_context_length * 2,
-                                                self.rope_theta,
-                                                self.use_scaled_rope,
-                                                device=hidden_states.device)
+            rotary_freqs = precompute_freqs_cis(
+                self.head_dim,
+                self.neuron_config.max_context_length * 2,
+                self.rope_theta,
+                self.use_scaled_rope,
+                device=hidden_states.device,
+            )
             rotary_freqs = rotary_freqs[position_ids]  # (bz, seq_len, dim//2)
             cos_cache = rotary_freqs.cos().permute(2, 0, 1)
             sin_cache = rotary_freqs.sin().permute(2, 0, 1)
@@ -1251,12 +1523,12 @@ class NeuronAttentionBase(nn.Module):
             active_mask = torch.ones(
                 expected_active_mask_shape,
                 dtype=hidden_states.dtype,
-                device=hidden_states.device
+                device=hidden_states.device,
             )
         else:
-            assert (
-                active_mask.shape == expected_active_mask_shape
-            ), f"{active_mask.shape} != {expected_active_mask_shape}"
+            assert active_mask.shape == expected_active_mask_shape, (
+                f"{active_mask.shape} != {expected_active_mask_shape}"
+            )
         # Duplicate the mask across q_heads
         active_mask = active_mask.expand(-1, num_q_heads, -1, -1)
         attention_mask[:, :, :, -s_tkg:] = active_mask
@@ -1266,8 +1538,14 @@ class NeuronAttentionBase(nn.Module):
         K_prior, V_prior = past_key_value[:2]
         K_prior = K_prior.data
         V_prior = V_prior.data
-        update_cache_in_kernel = update_kv_per_layer and self.attn_block_tkg_nki_kernel_cache_update
-        sink = self.get_learned_sinks().data.unsqueeze(-1) if self.learned_sinks_size is not None else None
+        update_cache_in_kernel = (
+            update_kv_per_layer and self.attn_block_tkg_nki_kernel_cache_update
+        )
+        sink = (
+            self.get_learned_sinks().data.unsqueeze(-1)
+            if self.learned_sinks_size is not None
+            else None
+        )
         # start position id, the kernel can only update contiguous sequence
         kv_cache_update_idx = position_ids[:, :1].to(torch.int32)
 
@@ -1284,14 +1562,26 @@ class NeuronAttentionBase(nn.Module):
         qk_norm_eps = self.rms_norm_eps if self.rms_norm_eps else 1e-6
 
         # Pre-RoPE QK RMSNorm weights (enabled for models like Qwen3 with PRE_ROPE placement)
-        is_pre_rope_qk_norm = has_qk_layernorm and self.qk_norm_placement == QKNormPlacement.PRE_ROPE
-        rmsnorm_QK_pre_rope_W_Q = self.q_layernorm.weight.data.unsqueeze(0) if is_pre_rope_qk_norm else None
-        rmsnorm_QK_pre_rope_W_K = self.k_layernorm.weight.data.unsqueeze(0) if is_pre_rope_qk_norm else None
+        is_pre_rope_qk_norm = (
+            has_qk_layernorm and self.qk_norm_placement == QKNormPlacement.PRE_ROPE
+        )
+        rmsnorm_QK_pre_rope_W_Q = (
+            self.q_layernorm.weight.data.unsqueeze(0) if is_pre_rope_qk_norm else None
+        )
+        rmsnorm_QK_pre_rope_W_K = (
+            self.k_layernorm.weight.data.unsqueeze(0) if is_pre_rope_qk_norm else None
+        )
 
         # Post-RoPE QK RMSNorm weights (enabled for models with POST_ROPE placement)
-        is_post_rope_qk_norm = has_qk_layernorm and self.qk_norm_placement == QKNormPlacement.POST_ROPE
-        rmsnorm_QK_post_rope_W_Q = self.q_layernorm.weight.data.unsqueeze(0) if is_post_rope_qk_norm else None
-        rmsnorm_QK_post_rope_W_K = self.k_layernorm.weight.data.unsqueeze(0) if is_post_rope_qk_norm else None
+        is_post_rope_qk_norm = (
+            has_qk_layernorm and self.qk_norm_placement == QKNormPlacement.POST_ROPE
+        )
+        rmsnorm_QK_post_rope_W_Q = (
+            self.q_layernorm.weight.data.unsqueeze(0) if is_post_rope_qk_norm else None
+        )
+        rmsnorm_QK_post_rope_W_K = (
+            self.k_layernorm.weight.data.unsqueeze(0) if is_post_rope_qk_norm else None
+        )
 
         attn_output, K, V = attention_block_tkg[self.logical_nc_config](
             # -- input
@@ -1303,10 +1593,17 @@ class NeuronAttentionBase(nn.Module):
             rmsnorm_X_gamma=W_gamma,
             # -- qkv projections
             W_qkv=self.get_qkv_proj().Wqkv.weight.data,
-            bias_qkv=self.get_qkv_proj().Wqkv.bias.data.unsqueeze(0) if self.qkv_bias else None,
+            bias_qkv=self.get_qkv_proj().Wqkv.bias.data.unsqueeze(0)
+            if self.qkv_bias
+            else None,
             quantization_type_qkv=QuantizationType.NONE,
             weight_dequant_scale_qkv=None,
             input_dequant_scale_qkv=None,
+            # -- Q/K processing: flat QK RMSNorm (disabled in base class)
+            rmsnorm_QK_flat_enabled=False,
+            rmsnorm_QK_flat_eps=0.0,
+            rmsnorm_QK_flat_W_Q=None,
+            rmsnorm_QK_flat_W_K=None,
             # -- Q/K processing: pre-RoPE RMSNorm
             rmsnorm_QK_pre_rope_enabled=is_pre_rope_qk_norm,
             rmsnorm_QK_pre_rope_eps=qk_norm_eps if is_pre_rope_qk_norm else 0.0,
@@ -1316,6 +1613,7 @@ class NeuronAttentionBase(nn.Module):
             cos=cos_cache,
             sin=sin_cache,
             rope_contiguous_layout=rope_contiguous_layout,
+            rotary_dim=None,
             # -- Q/K processing: post-RoPE RMSNorm
             rmsnorm_QK_post_rope_enabled=is_post_rope_qk_norm,
             rmsnorm_QK_post_rope_eps=qk_norm_eps if is_post_rope_qk_norm else 0.0,
@@ -1323,12 +1621,16 @@ class NeuronAttentionBase(nn.Module):
             rmsnorm_QK_post_rope_W_K=rmsnorm_QK_post_rope_W_K,
             # -- attention
             K_cache_transposed=self.k_cache_transposed,
-            active_blocks_table=active_block_table.to(torch.uint32) if active_block_table is not None else None,
+            active_blocks_table=active_block_table.to(torch.uint32)
+            if active_block_table is not None
+            else None,
             K_cache=K_prior,
             V_cache=V_prior,
             attention_mask=attention_mask,
             sink=sink,
-            softmax_scale=None if self.softmax_scale is None else (1 / self.softmax_scale),
+            softmax_scale=None
+            if self.softmax_scale is None
+            else (1 / self.softmax_scale),
             # -- KV cache update
             update_cache=update_cache_in_kernel,
             kv_cache_update_idx=kv_cache_update_idx,
@@ -1340,7 +1642,7 @@ class NeuronAttentionBase(nn.Module):
             input_dequant_scale_out=None,
             transposed_out=False,
             # -- output
-            out_in_sb=False
+            out_in_sb=False,
         )
 
         # Did the output projection in kernel. We need to reduce across TP ranks here.
@@ -1359,15 +1661,21 @@ class NeuronAttentionBase(nn.Module):
             elif self.ep_dispatch_cc_option == EPDispatchOption.RS_AG:
                 # option 2
                 attn_output = reduce_scatter_to_tensor_model_parallel_region_with_dim(
-                    attn_output, partition_dim=0, process_group=self.tensor_model_parallel_group
+                    attn_output,
+                    partition_dim=0,
+                    process_group=self.tensor_model_parallel_group,
                 )
             elif self.ep_dispatch_cc_option == EPDispatchOption.AG_AR:
                 # option 3
                 attn_output = gather_from_tensor_model_parallel_region_with_dim(
-                    attn_output, gather_dim=0, process_group=get_data_parallel_attention_dp_group()
+                    attn_output,
+                    gather_dim=0,
+                    process_group=get_data_parallel_attention_dp_group(),
                 )
             else:
-                raise ValueError(f"Unknown EPDispatchOption: {self.ep_dispatch_cc_option}")
+                raise ValueError(
+                    f"Unknown EPDispatchOption: {self.ep_dispatch_cc_option}"
+                )
 
         if not update_cache_in_kernel:
             # Returned K_new and V_new
@@ -1405,7 +1713,9 @@ class NeuronAttentionBase(nn.Module):
         """
         is_speculation = False if position_ids is None else position_ids.shape[-1] > 1
         if self.attention_chunk_size and is_speculation:
-            raise NotImplementedError("Speculative decoding is not supported by chunked attention yet.")
+            raise NotImplementedError(
+                "Speculative decoding is not supported by chunked attention yet."
+            )
 
         # Attention computation: softmax((Q.K/√dkv) + mask).V
         # i. prior (cached) KV
@@ -1419,8 +1729,16 @@ class NeuronAttentionBase(nn.Module):
         prior_scores = torch.matmul(Q, K_prior) / self.softmax_scale
 
         # pad the attention mask if the KV cache is padded
-        if prior_scores.shape[-1] > attention_mask.shape[-1] and self.neuron_config.apply_seq_ids_mask:
-            attention_mask = F.pad(attention_mask, (0, prior_scores.shape[-1] - attention_mask.shape[-1]), "constant", 0)
+        if (
+            prior_scores.shape[-1] > attention_mask.shape[-1]
+            and self.neuron_config.apply_seq_ids_mask
+        ):
+            attention_mask = F.pad(
+                attention_mask,
+                (0, prior_scores.shape[-1] - attention_mask.shape[-1]),
+                "constant",
+                0,
+            )
 
         prior_scores = torch.where(
             attention_mask, prior_scores, torch.finfo(prior_scores.dtype).min
@@ -1439,7 +1757,9 @@ class NeuronAttentionBase(nn.Module):
         if learned_sinks is not None:
             assert learned_sinks.ndim == 1 and learned_sinks.shape[0] == self.num_heads
             bsz, _, seqlen, _ = active_scores.shape
-            sinks = learned_sinks.reshape(1, self.num_heads, 1, 1).expand(bsz, -1, seqlen, -1)
+            sinks = learned_sinks.reshape(1, self.num_heads, 1, 1).expand(
+                bsz, -1, seqlen, -1
+            )
 
             # For token generation, concatenated learned sinks with prior scores instead of active scores
             # for compatibility with manual_softmax.
@@ -1453,18 +1773,27 @@ class NeuronAttentionBase(nn.Module):
         if learned_sinks is not None:
             softmax_prior = softmax_prior[..., :-1]
 
-        softmax_prior, softmax_active = softmax_prior.to(Q.dtype), softmax_active.to(Q.dtype)
+        softmax_prior, softmax_active = (
+            softmax_prior.to(Q.dtype),
+            softmax_active.to(Q.dtype),
+        )
         attn_prior = torch.matmul(softmax_prior, V_prior)
         attn_active = torch.matmul(softmax_active, V_active)
         attn_output = attn_prior + attn_active
 
         return attn_output
 
-    def attention_context_encode(self, Q, K, V, q_len, bsz, attention_mask, past_key_value=None, active_mask=None):
+    def attention_context_encode(
+        self, Q, K, V, q_len, bsz, attention_mask, past_key_value=None, active_mask=None
+    ):
         if past_key_value is None:
-            attn_output, flash_attn_strategy = self.perform_prefill(Q, K, V, q_len, bsz, attention_mask)
+            attn_output, flash_attn_strategy = self.perform_prefill(
+                Q, K, V, q_len, bsz, attention_mask
+            )
         else:
-            attn_output, flash_attn_strategy = self.perform_prefix_prefill(Q, K, V, q_len, bsz, attention_mask, past_key_value, active_mask)
+            attn_output, flash_attn_strategy = self.perform_prefix_prefill(
+                Q, K, V, q_len, bsz, attention_mask, past_key_value, active_mask
+            )
         if self.flash_decoding_enabled:
             K, V = self._filter_kv_for_flash_decoding(K, V, q_len, Q)
 
@@ -1481,13 +1810,17 @@ class NeuronAttentionBase(nn.Module):
         return attn_output, K, V
 
     def _filter_kv_for_flash_decoding(self, K, V, q_len, Q):
-        assert not self.k_cache_transposed, 'Transposed K cache is not yet supported by flash decoding feature.'
+        assert not self.k_cache_transposed, (
+            "Transposed K cache is not yet supported by flash decoding feature."
+        )
         assert self.qkv_proj.sharding_strategy == GQA.REPLICATE_TO_TP_DEGREE, (
             "Flash decoding lives in the context of GQA (grouped query attention) and traditional MHA "
             "multi-head attention) won't work!"
         )
         rank_id = self.rank_util.get_rank()
-        rank_id_in_kv_group = torch.remainder(rank_id, self.num_cores_per_group).to(torch.int64)
+        rank_id_in_kv_group = torch.remainder(rank_id, self.num_cores_per_group).to(
+            torch.int64
+        )
         # shard KV by seq len and pick the values based on rank
         assert q_len == Q.shape[2], f"Q shape is {Q.shape}"
         # selecting positions (on S dim) that belongs to the current rank
@@ -1499,27 +1832,60 @@ class NeuronAttentionBase(nn.Module):
         V = torch.index_select(input=V, dim=2, index=selected_seq_pos)
         return K, V
 
-    def attention_context_encode_chunked_attention(self, Q, K, V, q_len, bsz, attention_mask, chunk_size=None):
-        attn_output, flash_attn_strategy = self.perform_prefill_chunked_attn(Q, K, V, q_len, bsz, attention_mask, chunk_size)
+    def attention_context_encode_chunked_attention(
+        self, Q, K, V, q_len, bsz, attention_mask, chunk_size=None
+    ):
+        attn_output, flash_attn_strategy = self.perform_prefill_chunked_attn(
+            Q, K, V, q_len, bsz, attention_mask, chunk_size
+        )
         if flash_attn_strategy != FlashAttentionStrategy.NONE:
             n_chunks = q_len // chunk_size
             attn_output = attn_output.permute(0, 3, 1, 2)
-            attn_output = attn_output.reshape(n_chunks * chunk_size, self.num_heads, self.head_dim).unsqueeze(0)
+            attn_output = attn_output.reshape(
+                n_chunks * chunk_size, self.num_heads, self.head_dim
+            ).unsqueeze(0)
         else:
             # transpose BHSD -> BSHD
             attn_output = attn_output.transpose(1, 2).contiguous()
         return attn_output, K, V
 
-    def attention_context_encode_windowed_attention(self, Q, K, V, q_len, bsz, attention_mask, window_size=None, past_key_value=None, active_mask=None):
+    def attention_context_encode_windowed_attention(
+        self,
+        Q,
+        K,
+        V,
+        q_len,
+        bsz,
+        attention_mask,
+        window_size=None,
+        past_key_value=None,
+        active_mask=None,
+    ):
         if past_key_value is None:
-            attn_output, flash_attn_strategy = self.perform_prefill_windowed_attn(Q, K, V, q_len, bsz, attention_mask, window_size)
+            attn_output, flash_attn_strategy = self.perform_prefill_windowed_attn(
+                Q, K, V, q_len, bsz, attention_mask, window_size
+            )
             if flash_attn_strategy not in [FlashAttentionStrategy.NONE]:
                 attn_output = attn_output.permute(0, 3, 1, 2)  # transpose BHDS -> BSHD
             else:
-                attn_output = attn_output.transpose(1, 2).contiguous()  # transpose BHSD -> BSHD
+                attn_output = attn_output.transpose(
+                    1, 2
+                ).contiguous()  # transpose BHSD -> BSHD
         else:
-            attn_output, _ = self.perform_prefix_prefill_windowed_attn(Q, K, V, q_len, bsz, attention_mask, window_size, past_key_value, active_mask)
-            attn_output = attn_output.transpose(1, 2).contiguous()  # transpose BHSD -> BSHD
+            attn_output, _ = self.perform_prefix_prefill_windowed_attn(
+                Q,
+                K,
+                V,
+                q_len,
+                bsz,
+                attention_mask,
+                window_size,
+                past_key_value,
+                active_mask,
+            )
+            attn_output = attn_output.transpose(
+                1, 2
+            ).contiguous()  # transpose BHSD -> BSHD
         return attn_output, K, V
 
     def attention_tokengen(
@@ -1533,7 +1899,6 @@ class NeuronAttentionBase(nn.Module):
         active_mask,
         **kwargs,
     ):
-
         if self.neuron_config.is_prefix_caching:
             return self.compute_for_token_gen(
                 Q,
@@ -1547,7 +1912,9 @@ class NeuronAttentionBase(nn.Module):
             )
 
         if self.flash_decoding_enabled:
-            assert active_mask is not None, "Flash decoding requires active mask is not None!"
+            assert active_mask is not None, (
+                "Flash decoding requires active mask is not None!"
+            )
             # gather Q from all cores in its KV group
             groups = get_kv_shared_group(as_list=True)
             Q = xm.all_gather(Q, dim=1, groups=groups, pin_layout=False)
@@ -1704,11 +2071,20 @@ class NeuronAttentionBase(nn.Module):
         if is_context_parallel:
             # split all inputs into S/CP pieces based on the cp_rank, each specified dim is the 'S' dim
 
-            attention_mask, hidden_states, position_ids, cos_cache, sin_cache = self._split_inputs_for_context_parallel(attention_mask, hidden_states, position_ids, cos_cache, sin_cache)
+            attention_mask, hidden_states, position_ids, cos_cache, sin_cache = (
+                self._split_inputs_for_context_parallel(
+                    attention_mask, hidden_states, position_ids, cos_cache, sin_cache
+                )
+            )
 
         if is_data_parallel:
             # split hidden_states into B/DP pieces based on the dp_rank
-            dp_rank = get_dp_rank(self.rank_util.get_rank(), self.tp_degree, self.dp_degree, self.neuron_config.switch_cc)
+            dp_rank = get_dp_rank(
+                self.rank_util.get_rank(),
+                self.tp_degree,
+                self.dp_degree,
+                self.neuron_config.switch_cc,
+            )
             hidden_states = split_along_dim0_kernel_wrapper(
                 tensor=hidden_states,
                 rank=dp_rank,
@@ -1752,37 +2128,58 @@ class NeuronAttentionBase(nn.Module):
 
         if self.attn_block_tkg_nki_kernel_enabled and is_token_gen:
             if self.neuron_config.is_block_kv_layout:
-                position_ids = kwargs['scatter_index']
-            if self.attn_block_tkg_nki_kernel_cache_update and self.neuron_config.apply_seq_ids_mask:
+                position_ids = kwargs["scatter_index"]
+            if (
+                self.attn_block_tkg_nki_kernel_cache_update
+                and self.neuron_config.apply_seq_ids_mask
+            ):
                 # In the KV cache manager, the S dimension of the KV cache was extended by 128
                 # as a  create a "padding zone" for invalid seq id writes.
                 # If we set position_ids to S + 128 - 1 for invalid seq_ids, we see an OOB error in the NKI kernel.
                 # As a workaround, we set it to different values: S + [1..K] which lands in the "padding zone",
                 # where K is the speculation length, or 1 during token gen.
-                position_ids_invalid = (past_key_value[1].shape[2] - KV_CACHE_PAD_FOR_SEQ_IDS_MASKING) + \
-                    torch.arange(position_ids.shape[-1], device=position_ids.device, dtype=position_ids.dtype).reshape(1, -1).broadcast_to(position_ids.shape)
+                position_ids_invalid = (
+                    past_key_value[1].shape[2] - KV_CACHE_PAD_FOR_SEQ_IDS_MASKING
+                ) + torch.arange(
+                    position_ids.shape[-1],
+                    device=position_ids.device,
+                    dtype=position_ids.dtype,
+                ).reshape(1, -1).broadcast_to(position_ids.shape)
                 seq_ids_mask = torch.ge(seq_ids, torch.full_like(seq_ids, 0))
-                seq_ids_mask = seq_ids_mask.reshape(-1, 1).broadcast_to(position_ids.shape)
-                position_ids = torch.where(seq_ids_mask, position_ids, position_ids_invalid)
+                seq_ids_mask = seq_ids_mask.reshape(-1, 1).broadcast_to(
+                    position_ids.shape
+                )
+                position_ids = torch.where(
+                    seq_ids_mask, position_ids, position_ids_invalid
+                )
 
             if is_data_parallel:
-                kv_cache = kv_mgr.get_kv_by_layer_id(idx=kwargs['idx'], kvcache_buffer=kwargs['kvcache_buffer'], seq_len=q_len, skip_slice=True)
+                kv_cache = kv_mgr.get_kv_by_layer_id(
+                    idx=kwargs["idx"],
+                    kvcache_buffer=kwargs["kvcache_buffer"],
+                    seq_len=q_len,
+                    skip_slice=True,
+                )
             else:
-                kv_cache = kv_mgr._fetch_cache(idx=kwargs['idx'], kvcache_buffer=kwargs['kvcache_buffer'])
+                kv_cache = kv_mgr._fetch_cache(
+                    idx=kwargs["idx"], kvcache_buffer=kwargs["kvcache_buffer"]
+                )
 
-            attn_output, KV, cos_cache, sin_cache = self.attention_block_tokengen_nki_kernel(
-                hidden_states,
-                attention_mask,
-                position_ids,
-                kv_cache,
-                active_mask,
-                cos_cache,
-                sin_cache,
-                rmsnorm,
-                rotary_position_ids,
-                update_kv_per_layer,
-                kwargs['active_block_table'],
-                use_polar_compatible_rope=use_polar_compatible_rope
+            attn_output, KV, cos_cache, sin_cache = (
+                self.attention_block_tokengen_nki_kernel(
+                    hidden_states,
+                    attention_mask,
+                    position_ids,
+                    kv_cache,
+                    active_mask,
+                    cos_cache,
+                    sin_cache,
+                    rmsnorm,
+                    rotary_position_ids,
+                    update_kv_per_layer,
+                    kwargs["active_block_table"],
+                    use_polar_compatible_rope=use_polar_compatible_rope,
+                )
             )
             if update_kv_per_layer and not self.attn_block_tkg_nki_kernel_cache_update:
                 assert kv_mgr is not None
@@ -1796,12 +2193,16 @@ class NeuronAttentionBase(nn.Module):
                 if self.ep_dispatch_cc_option == EPDispatchOption.AR_AG:
                     # option 1
                     attn_output = gather_from_tensor_model_parallel_region_with_dim(
-                        attn_output, gather_dim=0, process_group=get_data_parallel_attention_dp_group()
+                        attn_output,
+                        gather_dim=0,
+                        process_group=get_data_parallel_attention_dp_group(),
                     )
                 elif self.ep_dispatch_cc_option == EPDispatchOption.RS_AG:
                     # option 2
                     attn_output = gather_from_tensor_model_parallel_region_with_dim(
-                        attn_output, gather_dim=0, process_group=nxd.parallel_layers.parallel_state.get_tensor_model_parallel_group()
+                        attn_output,
+                        gather_dim=0,
+                        process_group=nxd.parallel_layers.parallel_state.get_tensor_model_parallel_group(),
                     )
                 elif self.ep_dispatch_cc_option == EPDispatchOption.AG_AR:
                     # option 3
@@ -1809,7 +2210,9 @@ class NeuronAttentionBase(nn.Module):
                         attn_output, process_group=self.tensor_model_parallel_group
                     )
                 else:
-                    raise ValueError(f"Unknown EPDispatchOption: {self.ep_dispatch_cc_option}")
+                    raise ValueError(
+                        f"Unknown EPDispatchOption: {self.ep_dispatch_cc_option}"
+                    )
             return NeuronAttentionBaseOutput(attn_output, KV, cos_cache, sin_cache)
 
         Q, K, V, cos_cache, sin_cache, residual = self.prep_qkv_tensors(
@@ -1827,13 +2230,22 @@ class NeuronAttentionBase(nn.Module):
 
         if is_token_gen:
             attn_output = self.attention_tokengen(
-                Q, K, V, attention_mask, position_ids, past_key_value, active_mask, **kwargs
+                Q,
+                K,
+                V,
+                attention_mask,
+                position_ids,
+                past_key_value,
+                active_mask,
+                **kwargs,
             )
 
             # transpose BHSD -> BSHD
             attn_output = attn_output.transpose(1, 2).contiguous()
         else:
-            attn_output, K, V = self.attention_context_encode(Q, K, V, q_len, bsz, attention_mask, past_key_value, active_mask)
+            attn_output, K, V = self.attention_context_encode(
+                Q, K, V, q_len, bsz, attention_mask, past_key_value, active_mask
+            )
 
         # merge multi head hidden
         attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim)
@@ -1857,17 +2269,23 @@ class NeuronAttentionBase(nn.Module):
 
         if is_context_parallel and not self.sequence_parallel_enabled:
             attn_output = gather_from_tensor_model_parallel_region_with_dim(
-                attn_output, gather_dim=1, process_group=get_context_parallel_attention_cp_group()
+                attn_output,
+                gather_dim=1,
+                process_group=get_context_parallel_attention_cp_group(),
             )
 
         if is_data_parallel:
             attn_output = gather_from_tensor_model_parallel_region_with_dim(
-                attn_output, gather_dim=0, process_group=get_data_parallel_attention_dp_group()
+                attn_output,
+                gather_dim=0,
+                process_group=get_data_parallel_attention_dp_group(),
             )
 
         attn_output = attn_output.to(original_dtype)
 
-        return NeuronAttentionBaseOutput(attn_output, kv, cos_cache, sin_cache, residual)
+        return NeuronAttentionBaseOutput(
+            attn_output, kv, cos_cache, sin_cache, residual
+        )
 
     def _should_split_hidden_states_for_context_parallel(self):
         if not self.sequence_parallel_enabled:
@@ -1880,8 +2298,15 @@ class NeuronAttentionBase(nn.Module):
         else:
             return False
 
-    def _split_inputs_for_context_parallel(self, attention_mask, hidden_states, position_ids, cos, sin):
-        cp_rank = get_cp_rank(self.rank_util.get_rank(), self.tp_degree, self.cp_degree, self.neuron_config.switch_cc)
+    def _split_inputs_for_context_parallel(
+        self, attention_mask, hidden_states, position_ids, cos, sin
+    ):
+        cp_rank = get_cp_rank(
+            self.rank_util.get_rank(),
+            self.tp_degree,
+            self.cp_degree,
+            self.neuron_config.switch_cc,
+        )
         attention_mask = split_along_dim(
             attention_mask, dim=2, rank=cp_rank, num_partitions=self.cp_degree
         )
@@ -1949,13 +2374,22 @@ class NeuronAttentionBase(nn.Module):
 
         if is_token_gen:
             attn_output = self.attention_tokengen(
-                Q, K, V, attention_mask, position_ids, past_key_value, active_mask, **kwargs
+                Q,
+                K,
+                V,
+                attention_mask,
+                position_ids,
+                past_key_value,
+                active_mask,
+                **kwargs,
             )
 
             # transpose BHSD -> BSHD
             attn_output = attn_output.transpose(1, 2).contiguous()
         else:
-            attn_output, K, V = self.attention_context_encode_chunked_attention(Q, K, V, q_len, bsz, attention_mask, self.attention_chunk_size)
+            attn_output, K, V = self.attention_context_encode_chunked_attention(
+                Q, K, V, q_len, bsz, attention_mask, self.attention_chunk_size
+            )
             K, V = get_last_kv_chunk(self.attention_chunk_size, position_ids, K, V)
 
         # merge multi head hidden
@@ -1978,7 +2412,9 @@ class NeuronAttentionBase(nn.Module):
                 **kwargs,
             )
 
-        return NeuronAttentionBaseOutput(attn_output, kv, cos_cache, sin_cache, residual)
+        return NeuronAttentionBaseOutput(
+            attn_output, kv, cos_cache, sin_cache, residual
+        )
 
     def chunked_attention_with_context_parallel_forward(
         self,
@@ -2014,7 +2450,12 @@ class NeuronAttentionBase(nn.Module):
 
         is_token_gen = past_key_value is not None
 
-        if self.optimize_interleave_attn and not self.is_post_global_attn_layer and not self.is_pre_global_attn_layer and not is_token_gen:
+        if (
+            self.optimize_interleave_attn
+            and not self.is_post_global_attn_layer
+            and not self.is_pre_global_attn_layer
+            and not is_token_gen
+        ):
             attn_input_hidden_states = hidden_states.clone()
 
         hidden_states = hidden_states.to(self.torch_dtype)
@@ -2031,13 +2472,17 @@ class NeuronAttentionBase(nn.Module):
                 hidden_states = gather_from_sequence_parallel_region(
                     hidden_states,
                     1,
-                    process_group=self.tensor_model_parallel_group  # this is partial gather over tp group. Shape after gather will be (B, S/cp, H)
+                    process_group=self.tensor_model_parallel_group,  # this is partial gather over tp group. Shape after gather will be (B, S/cp, H)
                 )
 
         bsz, q_len, _ = hidden_states.size()
 
         # if the layer is not post global attn, the input that will be chunked has a (B, S/cp, H) shape
-        chunk_slice_size = self.attention_chunk_size if (self.is_post_global_attn_layer or not self.optimize_interleave_attn) else self.attention_chunk_size // self.cp_degree
+        chunk_slice_size = (
+            self.attention_chunk_size
+            if (self.is_post_global_attn_layer or not self.optimize_interleave_attn)
+            else self.attention_chunk_size // self.cp_degree
+        )
 
         n_chunks = math.ceil(q_len / chunk_slice_size)
 
@@ -2049,7 +2494,9 @@ class NeuronAttentionBase(nn.Module):
 
         if not is_token_gen:
             if self.rotary_emb is not None and (cos_cache is None or sin_cache is None):
-                cos_cache, sin_cache = self.rotary_emb(hidden_states, rotary_position_ids)  # calculate cos sin cache for CTE once before chunked attn flow
+                cos_cache, sin_cache = self.rotary_emb(
+                    hidden_states, rotary_position_ids
+                )  # calculate cos sin cache for CTE once before chunked attn flow
             attention_outputs = []
             input_hidden_states = []
             Ks = []
@@ -2057,7 +2504,12 @@ class NeuronAttentionBase(nn.Module):
 
             for chunk_idx in range(n_chunks):
                 # split inputs into chunks
-                chunked_attn_output, chunked_K, chunked_V, chunked_attn_input_hidden_states = self.compute_attention_per_chunk_with_context_parallel(
+                (
+                    chunked_attn_output,
+                    chunked_K,
+                    chunked_V,
+                    chunked_attn_input_hidden_states,
+                ) = self.compute_attention_per_chunk_with_context_parallel(
                     chunk_idx,
                     chunk_slice_size,
                     hidden_states,
@@ -2071,15 +2523,21 @@ class NeuronAttentionBase(nn.Module):
                     residual,
                     active_mask,
                     bsz,
-                    use_polar_compatible_rope
+                    use_polar_compatible_rope,
                 )
                 if self.optimize_interleave_attn and self.is_pre_global_attn_layer:
-                    chunked_attn_output = self.get_o_proj()(chunked_attn_output, adapter_ids=adapter_ids)
-                    chunked_attn_output = chunked_attn_output + chunked_attn_input_hidden_states
-                    chunked_attn_output = gather_from_tensor_model_parallel_region_with_dim(
-                        chunked_attn_output,
-                        gather_dim=1,
-                        process_group=get_context_parallel_attention_cp_group(),
+                    chunked_attn_output = self.get_o_proj()(
+                        chunked_attn_output, adapter_ids=adapter_ids
+                    )
+                    chunked_attn_output = (
+                        chunked_attn_output + chunked_attn_input_hidden_states
+                    )
+                    chunked_attn_output = (
+                        gather_from_tensor_model_parallel_region_with_dim(
+                            chunked_attn_output,
+                            gather_dim=1,
+                            process_group=get_context_parallel_attention_cp_group(),
+                        )
                     )
 
                 # append compute results to lists
@@ -2094,30 +2552,38 @@ class NeuronAttentionBase(nn.Module):
             K = torch.cat(Ks, dim=2)
             V = torch.cat(Vs, dim=2)
             if len(input_hidden_states) > 0:
-                attn_input_hidden_states = torch.cat(input_hidden_states, dim=1).contiguous()
+                attn_input_hidden_states = torch.cat(
+                    input_hidden_states, dim=1
+                ).contiguous()
 
             if not self.optimize_interleave_attn or not self.is_pre_global_attn_layer:
                 attn_output = self.get_o_proj()(attn_output, adapter_ids=adapter_ids)
 
             # scatter again into SP region
-            if (not self.optimize_interleave_attn or self.is_pre_global_attn_layer) and self.sequence_parallel_enabled:
+            if (
+                not self.optimize_interleave_attn or self.is_pre_global_attn_layer
+            ) and self.sequence_parallel_enabled:
                 attn_output = split_along_dim(
                     attn_output,
                     dim=1,
                     rank=self.rank_util.get_rank(),
                     num_partitions=self.cp_degree * self.tp_degree,
                 )
-            if self.optimize_interleave_attn and self.is_post_global_attn_layer and self.sequence_parallel_enabled:
+            if (
+                self.optimize_interleave_attn
+                and self.is_post_global_attn_layer
+                and self.sequence_parallel_enabled
+            ):
                 attn_input_hidden_states = split_along_dim(
                     attn_input_hidden_states,
                     dim=1,
-                    rank=get_kv_head_group_number(self.rank_util.get_rank(), self.tp_degree),
+                    rank=get_kv_head_group_number(
+                        self.rank_util.get_rank(), self.tp_degree
+                    ),
                     num_partitions=self.tp_degree,
                 )
             # Get the latest chunk of KV to update KV cache
-            K, V = get_last_kv_chunk(
-                self.attention_chunk_size, position_ids, K, V
-            )
+            K, V = get_last_kv_chunk(self.attention_chunk_size, position_ids, K, V)
         else:
             Q, K, V, cos_cache, sin_cache, residual = self.prep_qkv_tensors(
                 rotary_position_ids,
@@ -2181,7 +2647,7 @@ class NeuronAttentionBase(nn.Module):
         residual=None,
         active_mask=None,
         bsz=1,
-        use_polar_compatible_rope=False
+        use_polar_compatible_rope=False,
     ):
         """
         Process a single chunk of the chunked attention mechanism with context parallelism.
@@ -2203,7 +2669,10 @@ class NeuronAttentionBase(nn.Module):
         if self.is_post_global_attn_layer or not self.optimize_interleave_attn:
             chunk_end = min((chunk_idx + 1) * chunk_slice_size, hidden_states.shape[1])
         else:
-            chunk_end = min((chunk_idx + 1) * self.attention_chunk_size, hidden_states.shape[1] * self.cp_degree)
+            chunk_end = min(
+                (chunk_idx + 1) * self.attention_chunk_size,
+                hidden_states.shape[1] * self.cp_degree,
+            )
 
         chunked_hidden_states = torch.ops.aten.slice(
             hidden_states, dim=1, start=cp_chunk_start, end=cp_chunk_end
@@ -2243,7 +2712,9 @@ class NeuronAttentionBase(nn.Module):
             chunked_sin,
         )
         chunked_attn_input_hidden_states = None
-        if self.optimize_interleave_attn and (self.is_post_global_attn_layer or self.is_pre_global_attn_layer):
+        if self.optimize_interleave_attn and (
+            self.is_post_global_attn_layer or self.is_pre_global_attn_layer
+        ):
             chunked_attn_input_hidden_states = chunked_hidden_states.clone()
 
         Q, K, V, chunked_cos, chunked_sin, residual = self.prep_qkv_tensors(
@@ -2287,46 +2758,55 @@ class NeuronAttentionBase(nn.Module):
         return attn_output, K, V, chunked_attn_input_hidden_states
 
     def attention_block_tokengen_nki_kernel_sliding_window_attn(
-            self, hidden_states,
-            attention_mask, position_ids,
-            kv_mgr, active_mask, cos_cache,
-            sin_cache, rmsnorm,
-            rotary_position_ids, update_kv_per_layer,
-            is_data_parallel,
-            **kwargs
+        self,
+        hidden_states,
+        attention_mask,
+        position_ids,
+        kv_mgr,
+        active_mask,
+        cos_cache,
+        sin_cache,
+        rmsnorm,
+        rotary_position_ids,
+        update_kv_per_layer,
+        is_data_parallel,
+        **kwargs,
     ):
-
         if self.attn_block_tkg_nki_kernel_cache_update:
             if self.neuron_config.enable_fused_speculation:
-                kv_cache_size = self.sliding_window - 2 + self.neuron_config.speculation_length
+                kv_cache_size = (
+                    self.sliding_window - 2 + self.neuron_config.speculation_length
+                )
                 position_ids = position_ids % kv_cache_size
             else:
                 position_ids = position_ids % (self.sliding_window - 1)
 
         if is_data_parallel:
             kv_cache = kv_mgr.get_kv_by_layer_id(
-                idx=kwargs['idx'],
-                kvcache_buffer=kwargs['kvcache_buffer'],
+                idx=kwargs["idx"],
+                kvcache_buffer=kwargs["kvcache_buffer"],
                 seq_len=self.sliding_window,
                 skip_slice=True,
             )
         else:
             kv_cache = kv_mgr._fetch_cache(
-                idx=kwargs['idx'],
-                kvcache_buffer=kwargs['kvcache_buffer'],
+                idx=kwargs["idx"],
+                kvcache_buffer=kwargs["kvcache_buffer"],
             )
 
-        attn_output, KV, cos_cache, sin_cache = self.attention_block_tokengen_nki_kernel(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_value=kv_cache,
-            active_mask=active_mask,
-            cos_cache=cos_cache,
-            sin_cache=sin_cache,
-            rmsnorm=rmsnorm,
-            rotary_position_ids=rotary_position_ids,
-            update_kv_per_layer=update_kv_per_layer,
+        attn_output, KV, cos_cache, sin_cache = (
+            self.attention_block_tokengen_nki_kernel(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=kv_cache,
+                active_mask=active_mask,
+                cos_cache=cos_cache,
+                sin_cache=sin_cache,
+                rmsnorm=rmsnorm,
+                rotary_position_ids=rotary_position_ids,
+                update_kv_per_layer=update_kv_per_layer,
+            )
         )
 
         if not self.attn_block_tkg_nki_kernel_cache_update and update_kv_per_layer:
@@ -2341,12 +2821,16 @@ class NeuronAttentionBase(nn.Module):
             if self.ep_dispatch_cc_option == EPDispatchOption.AR_AG:
                 # option 1
                 attn_output = gather_from_tensor_model_parallel_region_with_dim(
-                    attn_output, gather_dim=0, process_group=get_data_parallel_attention_dp_group()
+                    attn_output,
+                    gather_dim=0,
+                    process_group=get_data_parallel_attention_dp_group(),
                 )
             elif self.ep_dispatch_cc_option == EPDispatchOption.RS_AG:
                 # option 2
                 attn_output = gather_from_tensor_model_parallel_region_with_dim(
-                    attn_output, gather_dim=0, process_group=nxd.parallel_layers.parallel_state.get_tensor_model_parallel_group()
+                    attn_output,
+                    gather_dim=0,
+                    process_group=nxd.parallel_layers.parallel_state.get_tensor_model_parallel_group(),
                 )
             elif self.ep_dispatch_cc_option == EPDispatchOption.AG_AR:
                 # option 3
@@ -2354,7 +2838,9 @@ class NeuronAttentionBase(nn.Module):
                     attn_output, process_group=self.tensor_model_parallel_group
                 )
             else:
-                raise ValueError(f"Unknown EPDispatchOption: {self.ep_dispatch_cc_option}")
+                raise ValueError(
+                    f"Unknown EPDispatchOption: {self.ep_dispatch_cc_option}"
+                )
 
         return NeuronAttentionBaseOutput(attn_output, KV, cos_cache, sin_cache)
 
@@ -2385,11 +2871,20 @@ class NeuronAttentionBase(nn.Module):
 
         if is_context_parallel:
             # split all inputs into S/CP pieces based on the cp_rank
-            attention_mask, hidden_states, position_ids, cos_cache, sin_cache = self._split_inputs_for_context_parallel(attention_mask, hidden_states, position_ids, cos_cache, sin_cache)
+            attention_mask, hidden_states, position_ids, cos_cache, sin_cache = (
+                self._split_inputs_for_context_parallel(
+                    attention_mask, hidden_states, position_ids, cos_cache, sin_cache
+                )
+            )
 
         if is_data_parallel:
             # split hidden_states into B/DP pieces based on the dp_rank
-            dp_rank = get_dp_rank(self.rank_util.get_rank(), self.tp_degree, self.dp_degree, self.neuron_config.switch_cc)
+            dp_rank = get_dp_rank(
+                self.rank_util.get_rank(),
+                self.tp_degree,
+                self.dp_degree,
+                self.neuron_config.switch_cc,
+            )
             hidden_states = split_along_dim0_kernel_wrapper(
                 tensor=hidden_states,
                 rank=dp_rank,
@@ -2424,12 +2919,18 @@ class NeuronAttentionBase(nn.Module):
 
         if self.attn_block_tkg_nki_kernel_enabled and is_token_gen:
             return self.attention_block_tokengen_nki_kernel_sliding_window_attn(
-                hidden_states=hidden_states, attention_mask=attention_mask,
-                position_ids=position_ids, kv_mgr=kv_mgr, active_mask=active_mask,
-                cos_cache=cos_cache, sin_cache=sin_cache, rmsnorm=rmsnorm,
-                rotary_position_ids=rotary_position_ids, update_kv_per_layer=update_kv_per_layer,
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                kv_mgr=kv_mgr,
+                active_mask=active_mask,
+                cos_cache=cos_cache,
+                sin_cache=sin_cache,
+                rmsnorm=rmsnorm,
+                rotary_position_ids=rotary_position_ids,
+                update_kv_per_layer=update_kv_per_layer,
                 is_data_parallel=is_data_parallel,
-                **kwargs
+                **kwargs,
             )
 
         Q, K, V, cos_cache, sin_cache, residual = self.prep_qkv_tensors(
@@ -2445,14 +2946,38 @@ class NeuronAttentionBase(nn.Module):
 
         if is_token_gen:
             attn_output = self.attention_tokengen(
-                Q, K, V, attention_mask, position_ids, past_key_value, active_mask, **kwargs
+                Q,
+                K,
+                V,
+                attention_mask,
+                position_ids,
+                past_key_value,
+                active_mask,
+                **kwargs,
             )
 
             # transpose BHSD -> BSHD
             attn_output = attn_output.transpose(1, 2).contiguous()
         else:
-            attn_output, K, V = self.attention_context_encode_windowed_attention(Q, K, V, q_len, bsz, attention_mask, self.sliding_window, past_key_value, active_mask)
-            K, V = get_last_kv_window(self.sliding_window, full_position_ids, K, V, windowed_context_encoding_window_idx, self.neuron_config.speculation_length)
+            attn_output, K, V = self.attention_context_encode_windowed_attention(
+                Q,
+                K,
+                V,
+                q_len,
+                bsz,
+                attention_mask,
+                self.sliding_window,
+                past_key_value,
+                active_mask,
+            )
+            K, V = get_last_kv_window(
+                self.sliding_window,
+                full_position_ids,
+                K,
+                V,
+                windowed_context_encoding_window_idx,
+                self.neuron_config.speculation_length,
+            )
 
         # merge multi head hidden
         attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim)
@@ -2476,13 +3001,19 @@ class NeuronAttentionBase(nn.Module):
 
         if is_context_parallel and not self.sequence_parallel_enabled:
             attn_output = gather_from_tensor_model_parallel_region_with_dim(
-                attn_output, gather_dim=1, process_group=get_context_parallel_attention_cp_group()
+                attn_output,
+                gather_dim=1,
+                process_group=get_context_parallel_attention_cp_group(),
             )
 
         # Gather the attention output which is sharded on batch_dimension if data-parallel is enabled
         if is_data_parallel:
             attn_output = gather_from_tensor_model_parallel_region_with_dim(
-                attn_output, gather_dim=0, process_group=get_data_parallel_attention_dp_group()
+                attn_output,
+                gather_dim=0,
+                process_group=get_data_parallel_attention_dp_group(),
             )
 
-        return NeuronAttentionBaseOutput(attn_output, kv, cos_cache, sin_cache, residual)
+        return NeuronAttentionBaseOutput(
+            attn_output, kv, cos_cache, sin_cache, residual
+        )
