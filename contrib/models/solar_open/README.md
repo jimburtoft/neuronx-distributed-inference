@@ -6,15 +6,15 @@ NeuronX Distributed Inference implementation of [upstage/Solar-Open-100B](https:
 
 - **HuggingFace ID:** `upstage/Solar-Open-100B`
 - **Model Type:** Decoder-only MoE transformer
-- **Architecture:** 64 routed experts + 1 shared expert per layer, top-2 routing
+- **Architecture:** 128 routed experts + 1 shared expert per layer, top-8 routing with sigmoid activation
 - **Parameters:** ~100B total, ~22B active per token
 - **License:** Check HuggingFace model card
 
-> **Note:** Solar Open is **not** available in the `transformers` library. The model config and weights are loaded directly from the HuggingFace checkpoint using custom loaders (`load_solar_open_config`).
+> **Note:** Solar Open is available in `transformers` 4.57+ as a built-in model type (`SolarOpenForCausalLM`). `trust_remote_code` is NOT required.
 
 ## Architecture Details
 
-Solar Open shares the same MoE routing architecture as GLM-4.5 MoE, with the following key differences:
+Solar Open is derived from the same author's GLM-4.5 MoE contrib (PR #58). Key differences from GLM-4.5 MoE:
 
 | Property | Solar Open | GLM-4.5 MoE |
 |----------|-----------|-------------|
@@ -22,31 +22,33 @@ Solar Open shares the same MoE routing architecture as GLM-4.5 MoE, with the fol
 | `attention_bias` | False | True |
 | `use_qk_norm` | False | True |
 | `first_k_dense_replace` | **0** (ALL layers MoE) | > 0 (some dense layers) |
-| `rope_scaling` | None or `yarn` | None |
-| In `transformers` | ❌ No | ✅ Yes |
+| `rope_scaling` | `yarn` (factor 2.0, 128K context) | None |
+| In `transformers` | Yes (4.57+) | Yes |
 
 ### MoE Configuration (100B model)
 
-- `n_routed_experts`: 64
+- `n_routed_experts`: 128
 - `n_shared_experts`: 1
-- `num_experts_per_tok`: 2 (top-2 routing)
-- `n_group`: 8, `topk_group`: 2
+- `num_experts_per_tok`: 8 (top-8 routing)
+- `n_group`: 1, `topk_group`: 1 (global top-8, no group constraint)
 - `norm_topk_prob`: True
 - `routed_scaling_factor`: 1.0
-- Router: sigmoid + group-limited routing + `e_score_correction_bias`
+- Router: **sigmoid** + `e_score_correction_bias` (same as DeepSeek-V3/GPT-OSS)
 
-### Expert Parallelism Limitation
+### Expert Parallelism
 
-> ⚠️ **EP (Expert Parallelism) is currently limited to `moe_ep_degree=1`** due to a known issue with the MoE EP group initialization when `n_group > 1`. Use TP-only parallelism for now.
-
-Recommended production config: `tp_degree=32, moe_tp_degree=4, moe_ep_degree=8` (requires trn2.48xlarge or equivalent).
+EP support requires `n_group == 1` (which Solar Open satisfies). Recommended production config: `tp_degree=64` on trn2.48xlarge (128 NeuronCores).
 
 ## Hardware Requirements
 
-| Configuration | Instance |
-|--------------|----------|
-| Development / testing | trn1.32xlarge (32 NeuronCores) |
-| Production (100B, seq_len=65536) | trn2.48xlarge (128 NeuronCores) |
+| Configuration | Instance | TP Degree | Notes |
+|--------------|----------|-----------|-------|
+| Production (100B, full model) | **trn2.48xlarge** (128 NeuronCores) | 64 | Validated on SDK 2.29 |
+| Development (unit tests only) | Any machine with Python 3.10+ | N/A | No Neuron hardware needed |
+
+> **Note:** trn2.48xlarge is required for the full 100B model due to NEFF I/O constraints at 128 experts. Smaller instances (trn2.3xlarge) cannot fit the expert weights at lower TP degrees.
+
+> **Note:** NxD Inference 0.9.x (SDK 2.29) drops trn1/inf2 support. trn2 only going forward.
 
 ## Usage
 
@@ -66,18 +68,19 @@ model_path = "/path/to/upstage/Solar-Open-100B"
 traced_model_path = "/path/to/traced_model"
 
 neuron_config = MoENeuronConfig(
-    tp_degree=32,
-    moe_tp_degree=4,
-    moe_ep_degree=8,
-    batch_size=4,
-    seq_len=65536,
+    tp_degree=64,
+    batch_size=1,
+    seq_len=4096,
+    n_active_tokens=128,
     torch_dtype=torch.bfloat16,
     on_device_sampling_config=OnDeviceSamplingConfig(
         do_sample=True, temperature=0.6, top_k=20, top_p=0.95
     ),
     fused_qkv=True,
-    qkv_kernel_enabled=True,
+    qkv_kernel_enabled=True,         # Attention NKI ON (recommended)
+    qkv_nki_kernel_enabled=True,
     attn_kernel_enabled=True,
+    moe_fused_nki_kernel_enabled=False,  # MoE NKI OFF (see Known Issues)
 )
 
 config = SolarOpenInferenceConfig(
@@ -94,7 +97,14 @@ model = NeuronSolarOpenForCausalLM(traced_model_path)
 model.load(traced_model_path)
 ```
 
-See `examples/generation_solar_open_demo.py` for a full end-to-end example, or `../../examples/generation_solar_open.py` for the production benchmark script.
+See `examples/generation_solar_open_demo.py` for a full end-to-end example.
+
+## Environment Setup (SDK 2.29)
+
+```bash
+# Activate the pre-installed NxD Inference venv on the Neuron DLAMI (Ubuntu 24.04, 20260410)
+source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
+```
 
 ## Testing
 
@@ -102,7 +112,7 @@ See `examples/generation_solar_open_demo.py` for a full end-to-end example, or `
 
 ```bash
 cd contrib/models/solar_open
-source /path/to/neuronx_venv/bin/activate
+source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
 python -m pytest test/unit/ -v
 ```
 
@@ -118,16 +128,52 @@ Integration tests compile a 2-layer tiny random model and verify:
 2. **Output shape** — generated token IDs have correct shape
 3. **Determinism** — same input produces same output across runs
 
+## Performance (SDK 2.29, trn2.48xlarge)
+
+Validated on `Deep Learning AMI Neuron (Ubuntu 24.04) 20260410` with NxD Inference 0.9.x and neuronx-cc 2.24.
+
+| Metric | SDK 2.29 | SDK 2.28 | Change |
+|--------|----------|----------|--------|
+| TKG throughput | **82.4 tok/s** | 12.6 tok/s | **6.54x faster** |
+| TKG latency | 12.1 ms/tok | 79.4 ms/tok | 6.54x |
+| Compile time | 11.2 min | 10.5 min | +7% |
+| Model load time | 4.0 min | 3.8 min | +5% |
+| `check_accuracy_logits_v2` | PASS (0 divergence) | N/A | Logit validation confirmed |
+
+The 6.54x TKG improvement comes from `neuronx-cc` 2.24 compiler optimizations for NKI attention kernels on trn2 architecture, not from kernel code changes.
+
+### Recommended NKI Kernel Configuration
+
+| Kernel | Setting | Reason |
+|--------|---------|--------|
+| Attention NKI (`qkv_kernel_enabled`, `qkv_nki_kernel_enabled`) | **ON** | 82.4 tok/s — sole optimization path |
+| MoE fused NKI (`moe_fused_nki_kernel_enabled`) | **OFF** | 71.9 tok/s — 13% slower than ISA path |
+
+## Known Issues
+
+### MoE NKI Kernels Not Beneficial
+
+The fused MoE NKI kernel (`moe_fused_nki_kernel_enabled`) compiles successfully on SDK 2.29 (the tripcount=1 issue from 2.28 is fixed), but produces **13% lower throughput** (71.9 tok/s vs 82.4 tok/s) compared to the ISA path.
+
+**Root cause:** Solar Open's narrow expert dimension (moe_intermediate_size=1280) results in only 20 elements per TP shard at tp_degree=64 (1280/64=20). This is too small to benefit from NKI's SBUF tiling optimizations. Keep `moe_fused_nki_kernel_enabled=False`.
+
+### Sigmoid Router and Fused TKG Kernel
+
+The fused MoE TKG kernel's built-in router only supports softmax activation. Solar Open uses sigmoid routing. This model includes a runtime patch (`_patch_fused_tkg_for_sigmoid()`) that forces the ISA router fallback when the fused TKG kernel is active, ensuring correct routing behavior. No user action needed — the patch is applied automatically at import time.
+
 ## Compatibility Matrix
 
-| Instance | NxDI Version | Status |
-|----------|-------------|--------|
-| trn1.32xlarge | 2.20+ | ✅ Validated (unit tests) |
-| trn2.48xlarge | 2.20+ | 🔧 Integration pending |
-| Inf2 | Any | Not tested |
+| Instance | NxDI Version | SDK | Status |
+|----------|-------------|-----|--------|
+| trn2.48xlarge | 0.9.x | 2.29 | **Validated** — 82.4 tok/s, logits verified |
+| trn2.48xlarge | 0.7.x | 2.28 | Validated — 12.6 tok/s |
+| trn1.32xlarge | 0.7.x | 2.28 | Unit tests only |
+| trn1 / inf2 | 0.9.x | 2.29 | **Not supported** (NxDI 0.9.x drops trn1/inf2) |
 
 ## Maintainer
 
 Contributed by: gmkim (lifelongeeek)
 
-**Last Updated:** 2026-03-06
+SDK 2.29 validation, NKI kernel optimization, and hf_adapter fix contributed by: jimburtoft
+
+**Last Updated:** 2026-04-19
