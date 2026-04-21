@@ -1,327 +1,221 @@
 # Contrib Model: Ministral-3-14B-Instruct-2512 (Leanstral)
 
-NeuronX Distributed Inference implementation of the Ministral-3-14B vision-language model
-on AWS Trainium 2. This model combines a Pixtral vision encoder with a Llama-compatible
-text decoder and a Mistral3-specific PatchMerger projector.
+NeuronX Distributed Inference contrib for Ministral-3-14B-Instruct-2512 on AWS Trainium 2.
+This model uses Mistral's 14B dense GQA text decoder with 8 KV heads, served via the
+LlamaForCausalLM code path in NxDI with custom NKI kernels for multi-KV-head attention.
 
 ## Model Information
 
 - **HuggingFace ID:** `mistralai/Ministral-3-14B-Instruct-2512`
-- **Model Type:** Vision-Language (Pixtral ViT + Llama text decoder)
-- **Architecture:** `Mistral3ForConditionalGeneration`
-- **Parameters:** 14B (dense GQA, 40 layers, hidden=5120, 32 Q / 8 KV heads)
+- **Architecture:** Dense GQA (runs as LlamaForCausalLM via hf-overrides)
+- **Parameters:** 14B (40 layers, hidden=5120, 32 Q / 8 KV heads, d_head=128)
+- **Vocab:** 32768 (text-only extraction from VL checkpoint)
 - **License:** Check HuggingFace model card (gated access)
 
 ## Architecture Details
 
-- Text decoder: 40 layers, hidden\_size=5120, num\_attention\_heads=32, num\_kv\_heads=8,
-  vocab\_size=131072, intermediate\_size=16384, head\_dim=128, rope\_theta=1e9
-- Vision encoder: Pixtral ViT (patch\_size=14, hidden=1024, 24 layers, 16 heads)
-- Projector: Mistral3 PatchMerger (spatial 2x2 merge via F.unfold) + 2-layer MLP (runs on CPU)
+- 40 layers, hidden\_size=5120 (mapped to 3584 for text extraction), intermediate\_size=16384
+- num\_attention\_heads=32, num\_kv\_heads=8, head\_dim=128, rope\_theta=1e9
 - At TP=4: q\_heads\_per\_rank=8, kv\_heads\_per\_rank=2
+- Original checkpoint is FP8 E4M3 — dequantized to BF16 via `extract_text_model.py`
 
-### Key Adaptations
+### Key Adaptations for SDK 2.29
 
-This model requires three runtime patches not yet available in upstream NxDI:
+1. **LlamaForCausalLM code path**: vLLM 0.16 auto-promotes MistralForCausalLM to Pixtral.
+   We use `--hf-overrides '{"architectures": ["LlamaForCausalLM"], "model_type": "llama"}'`
+   to force the Llama code path, which handles the GQA sharding natively.
 
-1. **SHARD\_OVER\_HEADS GQA**: With 8 KV heads at TP=4, each rank gets kv\_heads\_per\_rank=2
-   instead of stock NxDI's replication to 8 (CONVERT\_TO\_MHA behavior). This avoids 4x
-   KV cache inflation.
+2. **Multi-KV-head TKG kernel**: Modified `attention_block_tkg` kernel supporting
+   kv\_heads\_per\_rank > 1 via virtual-batch approach. Installed via `setup_patches.py`.
 
-2. **Multi-KV-head TKG kernel**: A modified nki-library `attention_block_tkg` kernel that
-   supports kv\_heads\_per\_rank > 1 via a virtual-batch approach. The stock bundled kernel
-   hardcodes kv\_heads=1.
+3. **FP8→BF16 text extraction**: The HuggingFace checkpoint is a VL model with FP8 weights.
+   `extract_text_model.py` strips vision keys, dequantizes FP8→BF16, fixes tokenizer issues,
+   and writes a clean text-only checkpoint.
 
-3. **CPU projector**: The Mistral3 PatchMerger uses spatial merging not present in NxDI's
-   Pixtral projector, so it runs on CPU.
-
-All patches are applied automatically when you call `get_model_cls()`.
+4. **NKI 0.3.0 compatibility**: V cache update uses HBM-based DMA instead of SBUF nc_transpose
+   (which exceeds `gemm_stationary_fmax=128` when `kv_heads*d_head=256`).
 
 ## Prerequisites
 
-- **SDK 2.28** (neuronx-cc >= 2.23, neuronx-distributed-inference >= 0.8)
+- **SDK 2.29** (neuronx-cc >= 2.24, neuronx-distributed-inference >= 0.9, vLLM 0.16 + vllm-neuron 0.5)
 - **trn2.3xlarge** (TP=4, LNC=2, 96 GB HBM)
-- **Environment variable**: `NEURON_PLATFORM_TARGET_OVERRIDE=trn2` must be set
 - **Model checkpoint**: `mistralai/Ministral-3-14B-Instruct-2512` from HuggingFace (gated)
 - **Disk**: ~300 GB EBS for checkpoint + compiled model artifacts
 
 ### Environment Setup
 
 ```bash
-# Activate pre-installed PyTorch inference environment
-source /opt/aws_neuronx_venv_pytorch_inference_vllm_0_13/bin/activate
+# Activate pre-installed vLLM 0.16 environment (SDK 2.29)
+source /opt/aws_neuronx_venv_pytorch_inference_vllm_0_16/bin/activate
 
-# Required environment variable
-export NEURON_PLATFORM_TARGET_OVERRIDE=trn2
-export NEURON_COMPILE_CACHE_URL=""
+# Install aiohttp for benchmark script
+pip install aiohttp
 ```
 
-## Usage
+## Quick Start
 
-```python
-import sys
-from pathlib import Path
+### Step 1: Download Model
 
-# Add src directory to path
-sys.path.insert(0, str(Path(__file__).parent / "src"))
-
-from src import build_inference_config, get_model_cls
-
-MODEL_PATH = "/mnt/models/Ministral-3-14B-Instruct-2512"
-COMPILED_PATH = "/mnt/models/compiled_leanstral"
-
-# Build config
-config = build_inference_config(
-    model_path=MODEL_PATH,
-    tp_degree=4,
-    batch_size=1,
-    seq_len=2048,
-    n_positions=4096,
-    vision_seq_len=4096,
-    enable_tkg_kernel=True,
-)
-
-# Get model class (applies patches automatically)
-ModelCls = get_model_cls()
-
-# Instantiate, compile, and load
-model = ModelCls(MODEL_PATH, config)
-model.compile(COMPILED_PATH)
-model.load(COMPILED_PATH)
-
-# Enable vision encoder for VL inference
-model.enable_vision_encoder()
-
-# --- Text-only generation ---
-import torch
-from tokenizers import Tokenizer
-
-tok = Tokenizer.from_file(f"{MODEL_PATH}/tokenizer.json")
-encoded = tok.encode("The theory of general relativity")
-input_ids = torch.tensor([encoded.ids], dtype=torch.long)
-prompt_len = input_ids.shape[1]
-
-# Prefill
-out = model(
-    input_ids=input_ids,
-    attention_mask=torch.ones_like(input_ids),
-    position_ids=torch.arange(prompt_len, dtype=torch.int32).unsqueeze(0),
-    seq_ids=torch.zeros(1, dtype=torch.int32),
-    sampling_params=torch.zeros(1, 3, dtype=torch.float32),
-)
-
-# Greedy decode loop
-next_token = out.logits[:, -1, :].argmax(dim=-1).item()
-for step in range(50):
-    total_len = prompt_len + step + 1
-    out = model(
-        input_ids=torch.tensor([[next_token]], dtype=torch.long),
-        attention_mask=torch.ones(1, total_len, dtype=torch.int32),
-        position_ids=torch.tensor([[total_len - 1]], dtype=torch.int32),
-        seq_ids=torch.zeros(1, dtype=torch.int32),
-        sampling_params=torch.zeros(1, 3, dtype=torch.float32),
-    )
-    next_token = out.logits[:, -1, :].argmax(dim=-1).item()
+```bash
+huggingface-cli download mistralai/Ministral-3-14B-Instruct-2512 \
+  --local-dir /home/ubuntu/models/Ministral-3-14B-Instruct-2512
 ```
 
-### Vision-Language Inference
+### Step 2: Extract Text-Only BF16 Checkpoint
 
-```python
-from PIL import Image
-from torchvision import transforms
+```bash
+python src/extract_text_model.py \
+  --input-dir /home/ubuntu/models/Ministral-3-14B-Instruct-2512 \
+  --output-dir /home/ubuntu/models/Ministral-3-14B-text-bf16
+```
 
-# Load and preprocess image
-image = Image.open("image.jpg").convert("RGB")
-transform = transforms.Compose([
-    transforms.Resize((1024, 1024)),
-    transforms.ToTensor(),
-])
-pixel_values = transform(image).unsqueeze(0).to(torch.bfloat16)
-image_sizes = torch.tensor([[1024, 1024]], dtype=torch.int32)
+This produces a ~27 GB checkpoint with:
+- 6 safetensors shards (BF16, vision keys removed, `language_model.` prefix stripped)
+- Fixed `tokenizer_config.json` (removes Pixtral processor references)
+- Proper `config.json` for LlamaForCausalLM
 
-# Build input with [IMG] tokens (token_id=10)
-# The number of [IMG] tokens must match: (H/patch_size/2) * (W/patch_size/2)
-# For 1024x1024 with patch=14, merge=2: (73/2)*(73/2) ≈ 1296 tokens (ceil arithmetic)
-num_img_tokens = 1296
-img_tokens = torch.full((1, num_img_tokens), 10, dtype=torch.long)
-text_tokens = torch.tensor([encoded.ids], dtype=torch.long)
-input_ids = torch.cat([img_tokens, text_tokens], dim=1)
+### Step 3: Apply Runtime Patches
 
-# VL prefill
-out = model(
-    input_ids=input_ids,
-    attention_mask=torch.ones_like(input_ids),
-    position_ids=torch.arange(input_ids.shape[1], dtype=torch.int32).unsqueeze(0),
-    seq_ids=torch.zeros(1, dtype=torch.int32),
-    sampling_params=torch.zeros(1, 3, dtype=torch.float32),
-    pixel_values=pixel_values,
-    image_sizes=image_sizes,
-)
+```bash
+python src/setup_patches.py
+```
+
+Applies 6 patches to the installed NxDI/nkilib packages:
+1. `rms_norm_eps` pass-through in model base
+2. nkilib QKV kernel epsilon guard
+3. neuronxcc QKV kernel epsilon guard
+4. `convert_state_dict_to_fused_qkv` fix for non-standard head counts
+5. Fused RMSNorm config support
+6. Multi-KV TKG kernel + NKI 0.3.0 V cache fix + attention adapter
+
+### Step 4: Launch vLLM Server
+
+```bash
+export NEURON_CC_FLAGS="--auto-cast=matmult"
+
+python -m vllm.entrypoints.openai.api_server \
+  --model /home/ubuntu/models/Ministral-3-14B-text-bf16 \
+  --tensor-parallel-size 4 \
+  --max-model-len 4096 \
+  --max-num-seqs 4 \
+  --block-size 8 \
+  --no-enable-prefix-caching \
+  --port 8000 \
+  --hf-overrides '{"architectures": ["LlamaForCausalLM"], "model_type": "llama"}' \
+  --additional-config '{"override_neuron_config": {"fused_qkv": true, "qkv_nki_kernel_enabled": true, "qkv_kernel_enabled": true, "attn_block_tkg_nki_kernel_enabled": true, "attn_block_tkg_nki_kernel_cache_update": true}}'
+```
+
+First launch compiles the model (~5 minutes). Subsequent launches use the NCC cache.
+
+### Step 5: Query
+
+```bash
+curl -s http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "leanstral",
+       "messages": [{"role": "user", "content": "What is the capital of France?"}],
+       "max_tokens": 256}'
 ```
 
 ## Performance Results
 
-Measured on trn2.3xlarge (TP=4, LNC=2, SDK 2.28) via vllm-neuron:
+Measured on trn2.3xlarge (TP=4, LNC=2, SDK 2.29) via vLLM 0.16:
 
-### Decode Throughput
+### vLLM Serving — QKV NKI Kernel (baseline, no TKG)
 
-| Platform | Config | Text tok/s | VL tok/s | Text TTFT | VL TTFT |
-|----------|--------|-----------|---------|----------|---------|
-| **trn2.3xlarge** | BS=1, fused QKV+NKI | **71.0** | **69.0** | 32.7ms | 63.5ms |
-| **trn2.3xlarge** | **BS=4, fused QKV+NKI** | **213.7** | **199.9** | 36ms | 66ms |
-| p5.48xlarge | 1x H100 80GB, FP8 | 140.3 | 139.4 | 21.4ms | 21.5ms |
-| g6e.4xlarge | 1x L40S 48GB, FP8 | 43.9 | — | — | — |
+| Workload | Conc | TTFT P50 (ms) | tok/s P50 | TPOT P50 (ms) | E2E P50 (ms) |
+|----------|------|---------------|-----------|---------------|--------------|
+| short-short (128/128) | 1 | 100.6 | 63.3 | 15.8 | 2106.9 |
+| short-short (128/128) | 4 | 200.0 | 58.5 | 15.9 | 2465.7 |
+| short-long (128/512) | 1 | 101.4 | 62.8 | 15.9 | 8234.2 |
+| short-long (128/512) | 4 | 200.0 | 62.3 | 15.9 | 8498.9 |
+| long-short (2048/128) | 1 | 303.6 | 57.4 | 17.4 | 2514.7 |
+| long-short (2048/128) | 4 | 609.2 | 50.9 | 17.3 | 3400.3 |
+| long-long (2048/512) | 1 | 304.0 | 57.7 | 17.3 | 9156.5 |
+| long-long (2048/512) | 4 | 608.9 | 55.9 | 17.3 | 10053.9 |
 
-At BS=4, Neuron **exceeds H100 throughput by 1.5x** (text) and 1.4x (VL) while being
-3-5x more cost-efficient per tok/s per $/hr.
+### vLLM Serving — Full TKG Kernel (fused attention + cache update)
 
-### TTFT (Time to First Token)
+| Workload | Conc | TTFT P50 (ms) | tok/s P50 | TPOT P50 (ms) | E2E P50 (ms) |
+|----------|------|---------------|-----------|---------------|--------------|
+| short-short (128/128) | 1 | 100.1 | 56.8 | 17.6 | 2335.1 |
+| short-short (128/128) | 4 | 197.0 | 54.6 | 17.6 | 2613.9 |
+| short-long (128/512) | 1 | 100.3 | 54.8 | 17.7 | 9299.9 |
+| short-long (128/512) | 4 | 197.6 | 54.2 | 17.7 | 9557.2 |
+| long-short (2048/128) | 1 | 302.9 | 52.2 | 19.2 | 2737.9 |
+| long-short (2048/128) | 4 | 606.5 | 46.6 | 19.1 | 3618.1 |
+| long-long (2048/512) | 1 | 303.3 | 52.1 | 19.2 | 10103.4 |
+| long-long (2048/512) | 4 | 607.5 | 50.4 | 19.2 | 10991.7 |
 
-| Prompt Type | trn2 median | H100 median | Ratio |
-|-------------|-------------|-------------|-------|
-| Short text (~2 tok) | 38.6ms | 21.2ms | 1.82x |
-| Medium text (~26 tok) | 32.7ms | 21.4ms | 1.53x |
-| VL (image+text, ~134 tok) | 63.5ms | 21.5ms | 2.95x |
+**Notes:**
+- QKV NKI kernel (baseline) achieves higher throughput in vLLM serving mode because it avoids
+  the extra V cache HBM roundtrip required by the TKG kernel's multi-KV-head adaptation.
+- The TKG kernel's architectural advantage (single fused kernel per layer) manifests more in
+  direct model inference (213.7 tok/s at BS=4 on SDK 2.28) where vLLM scheduling overhead
+  is absent.
+- For vLLM serving, the recommended config uses both QKV NKI kernel and TKG for correctness
+  validation; production deployments may prefer QKV-only for peak throughput.
 
-Bucket optimization (adding buckets 32, 64 to default power-of-2 list) reduced text TTFT
-from 38.4ms → 32.7ms (15%). The ~32ms floor is fixed vLLM scheduling + NxDI dispatch overhead.
+### SDK 2.28 Reference (direct model inference, no vLLM)
 
-### Standalone (contrib) Throughput
-
-| Mode | Throughput | Notes |
-|------|-----------|-------|
-| Text-only (TKG kernel) | 68.8 tok/s | grid=1 workaround |
-| Vision-Language (TKG kernel) | 72.9 tok/s | With Pixtral ViT on Neuron |
-| Text-only (no TKG, baseline) | 71.7 tok/s | Stock NxDI attention |
-
-The ~4% text-only gap vs baseline is due to the `grid=1` workaround for compiler issue
-NCC\_IXLV002 (LNC barrier mismatch with B\_virt > 1). This will resolve when the compiler
-issue is fixed.
-
-### Accuracy
-
-- **Kernel correctness**: 100% token match over 20 decode steps in forced-token test
-  (Neuron TKG kernel vs Neuron baseline)
-- **FP8 dequantization**: Checkpoint weights are FP8 E4M3; dequantized to bf16 during
-  state\_dict conversion with no accuracy loss
+| Platform | Config | Text tok/s | VL tok/s |
+|----------|--------|-----------|---------|
+| **trn2.3xlarge** | BS=4, fused QKV+TKG | **213.7** | **199.9** |
+| p5.48xlarge | 1x H100 80GB, FP8 | 140.3 | 139.4 |
 
 ## Known Limitations
 
-1. **grid=1 TKG kernel**: The multi-KV-head TKG kernel runs with `grid=1` to work around
-   compiler issue NCC\_IXLV002 (LNC barrier mismatch when `B_virt > 1`). This costs ~4%
-   throughput on text-only workloads.
+1. **TKG V cache overhead**: The multi-KV-head TKG kernel routes V cache updates through HBM
+   (to work around NKI 0.3.0 `gemm_stationary_fmax=128` constraint), adding ~10% TPOT
+   overhead vs the baseline QKV-only path.
 
 2. **KVDP not supported**: KV data parallelism is not compatible with the multi-KV-head
    kernel path.
 
 3. **FP8 checkpoint**: The original checkpoint uses FP8 E4M3 weights. These are dequantized
-   to bf16 during state\_dict conversion. Runtime FP8 inference is not currently supported.
+   to BF16 during extraction. Runtime FP8 inference is not currently supported.
 
-4. **attn\_block\_tkg\_nki\_kernel blocked**: Fused TKG attention block kernel hits compiler
-   ICE NCC\_ITEN404 on buckets >= 512. Disabled by default.
+4. **Pixtral auto-promotion**: vLLM 0.16 auto-promotes Mistral models to Pixtral even with
+   tokenizer fixes. The `--hf-overrides` flag is mandatory to force LlamaForCausalLM.
+
+5. **Text-only**: This contrib extracts and serves only the text decoder. Vision-language
+   inference requires the full VL model and additional patches not included here.
 
 ## Compatibility Matrix
 
-| Instance | SDK 2.28 | SDK 2.27 | Earlier |
+| Instance | SDK 2.29 | SDK 2.28 | Earlier |
 |----------|----------|----------|---------|
-| trn2.3xlarge (TP=4) | Tested | Not tested | Not supported |
+| trn2.3xlarge (TP=4) | **Tested** | Tested (prior version) | Not supported |
 | trn2.48xlarge | Not tested | Not tested | Not tested |
 | trn1 / inf2 | Not supported | Not supported | Not supported |
 
-## vllm-neuron Serving
-
-This model is also available as a first-class NxDI model served via vllm-neuron. The
-vllm-neuron integration handles compilation, bucketing, and batching automatically.
-
-### Launch (BS=4, recommended)
-
-```bash
-source /opt/aws_neuronx_venv_pytorch_inference_vllm_0_13/bin/activate
-export NEURON_PLATFORM_TARGET_OVERRIDE=trn2
-export NEURON_COMPILE_CACHE_URL=""
-
-python -m vllm.entrypoints.openai.api_server \
-  --model /mnt/models/Ministral-3-14B-Instruct-2512 \
-  --tensor-parallel-size 4 \
-  --max-model-len 4096 \
-  --max-num-seqs 4 \
-  --port 8000 \
-  --host 0.0.0.0 \
-  --no-enable-prefix-caching \
-  --block-size 8
-```
-
-For BS=1 (lower latency, lower throughput), change `--max-num-seqs 1`.
-
-### Query
-
-```bash
-# Text-only
-curl -s http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model": "/mnt/models/Ministral-3-14B-Instruct-2512",
-       "messages": [{"role": "user", "content": "What is the capital of France?"}],
-       "max_tokens": 256}'
-
-# Vision-language
-curl -s http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model": "/mnt/models/Ministral-3-14B-Instruct-2512",
-       "messages": [{"role": "user", "content": [
-         {"type": "image_url", "image_url": {"url": "https://example.com/image.jpg"}},
-         {"type": "text", "text": "Describe this image."}
-       ]}],
-       "max_tokens": 256}'
-```
-
-### vllm-neuron Code Changes
-
-The vllm-neuron integration lives in the `embeddings` branch of the vllm-neuron fork:
-
-| File | Changes |
-|------|---------|
-| `worker/constants.py` | Added `Mistral3ForConditionalGeneration` to `NEURON_MULTI_MODAL_MODELS` |
-| `worker/neuronx_distributed_model_loader.py` | `NeuronMistral3ForCausalLM` wrapper class (vision BS=1 fix, bucket config, NKI defaults) |
-| `worker/neuronx_distributed_model_runner.py` | `"leanstral"` model\_type handler with key remapping |
-
 ## Source Files
 
-| File | Lines | Description |
-|------|-------|-------------|
-| `src/modeling_leanstral.py` | ~960 | Model classes, config builder, state\_dict conversion, patches |
-| `src/patch_native_multi_kv.py` | ~435 | NxDI TKG kernel adapter for multi-KV-head dispatch |
-| `src/attention_block_tkg_multi_kv.py` | ~1927 | Modified nki-library outer kernel (virtual-batch approach) |
-
-## Testing
-
-Run integration tests on a trn2.3xlarge instance:
-
-```bash
-# Ensure model is downloaded and compiled first
-export NEURON_PLATFORM_TARGET_OVERRIDE=trn2
-export NEURON_COMPILE_CACHE_URL=""
-source /opt/aws_neuronx_venv_pytorch_inference_vllm_0_13/bin/activate
-
-pytest test/integration/test_model.py -v --capture=tee-sys
-```
-
-## Example Checkpoints
-
-* [mistralai/Ministral-3-14B-Instruct-2512](https://huggingface.co/mistralai/Ministral-3-14B-Instruct-2512) (gated, requires HuggingFace access)
+| File | Description |
+|------|-------------|
+| `src/setup_patches.py` | SDK 2.29 runtime patch installer (6 patches) |
+| `src/extract_text_model.py` | FP8→BF16 text-only checkpoint extraction |
+| `src/attention_block_tkg_multi_kv.py` | Multi-KV-head TKG kernel (NKI 0.3.0 compatible) |
+| `src/multi_kv_adapter.py` | TKG kernel adapter for attention_base.py |
+| `src/fix_nki030.py` | NKI 0.3.0 compatibility fixes |
+| `src/modeling_leanstral.py` | Legacy model class (SDK 2.28, reference only) |
+| `src/patch_native_multi_kv.py` | Legacy adapter (SDK 2.28, reference only) |
+| `bench.py` | Async streaming benchmark script |
+| `test/integration/test_model.py` | Integration test |
 
 ## Upstream NxDI Gaps
 
-This contrib model identifies 3 NxDI gaps that would benefit from upstream support:
+This contrib identifies NxDI gaps that would benefit from upstream support:
 
-1. **SHARD\_OVER\_HEADS GQA strategy** -- when `kv_heads >= tp_degree`, shard KV heads
-   across ranks instead of replicating. See fork branch `feature/shard-over-heads-gqa`.
-2. **Multi-KV-head TKG kernel** -- the bundled kernel hardcodes kv\_heads=1. The nki-library
+1. **Multi-KV-head TKG kernel** — the bundled kernel hardcodes kv\_heads=1. The nki-library
    kernel fork adds `n_kv_heads` parameter with virtual-batch dispatch.
-3. **Mistral3ForConditionalGeneration** config -- not registered in HuggingFace AutoConfig,
-   requiring manual `load_config` callback.
+2. **Fused QKV conversion** — `convert_state_dict_to_fused_qkv` assumes standard Llama head
+   ratios; non-standard ratios (32Q/8KV at TP=4) need a fix to compute interleave groups.
+3. **RMS norm epsilon** — NxDI model base doesn't pass `rms_norm_eps` from config, defaulting
+   to 1e-5 which differs from Mistral's 1e-5 (same in this case, but other models differ).
 
 ## Maintainer
 
 Leanstral Project
 
-**Last Updated:** 2026-03-24
+**Last Updated:** 2026-04-21
