@@ -1,10 +1,10 @@
 # Contrib Model: MiniMax M2
 
-NeuronX Distributed Inference implementation of [MiniMax/MiniMax-M2](https://huggingface.co/MiniMax/MiniMax-M2).
+NeuronX Distributed Inference implementation of [MiniMaxAI/MiniMax-M2](https://huggingface.co/MiniMaxAI/MiniMax-M2).
 
 ## Model Information
 
-- **HuggingFace ID:** `MiniMax/MiniMax-M2`
+- **HuggingFace ID:** `MiniMaxAI/MiniMax-M2`
 - **Model Type:** Decoder-only MoE transformer
 - **Architecture:** Custom MoE with sigmoid routing and e_score_correction_bias
 - **License:** Check HuggingFace model card
@@ -184,8 +184,11 @@ pytest contrib/models/MiniMax-M2/test/integration/test_model.py -v
 
 ## Example Checkpoints
 
-* [MiniMax/MiniMax-M2](https://huggingface.co/MiniMax/MiniMax-M2)
-* [MiniMax/MiniMax-M2-unquantized](https://huggingface.co/MiniMax/MiniMax-M2-unquantized) (BF16)
+* [MiniMaxAI/MiniMax-M2](https://huggingface.co/MiniMaxAI/MiniMax-M2) (FP8)
+
+> **Note:** MiniMax renamed their HuggingFace org from `MiniMax` to `MiniMaxAI` in April 2026.
+> The previously available `-unquantized` (BF16) variant is no longer listed. Use the main
+> checkpoint and convert to BF16 during weight loading.
 
 ## Maintainer
 
