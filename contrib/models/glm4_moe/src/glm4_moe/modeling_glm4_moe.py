@@ -23,12 +23,15 @@ Architecture differences from Qwen3MoE:
 """
 
 import gc
+import logging
 import warnings
 import math
 from typing import List, Optional, Tuple, Union, Dict, Any
 
 import torch
 from torch import nn
+
+logger = logging.getLogger(__name__)
 
 from neuronx_distributed_inference.models.model_base import (
     NeuronBaseForCausalLM,
@@ -85,6 +88,62 @@ from neuronx_distributed_inference.models.layer_boundary_marker import (
 )
 
 _flash_fwd_call = nki_jit()(attention_isa_kernel)
+
+
+# ---------------------------------------------------------------------------
+# Sigmoid routing patch for fused MoE TKG kernel
+# ---------------------------------------------------------------------------
+# GLM-4.5 MoE uses sigmoid routing. The fused MoE TKG kernel's built-in
+# router only supports softmax activation. This patch forces the ISA router
+# fallback when the fused TKG kernel is active, ensuring correct routing
+# behaviour. Applied automatically at import time.
+
+
+def _patch_fused_tkg_for_sigmoid():
+    """Patch MoEFusedTKG kernel to use ISA router fallback for sigmoid routing."""
+    try:
+        import neuronx_distributed.modules.moe.moe_fused_tkg as fused_tkg_mod
+
+        original_kernel = fused_tkg_mod._moe_token_gen_selective_load_kernel_nki_call
+        if original_kernel is None:
+            logger.warning(
+                "Fused TKG selective load kernel not available, skipping patch"
+            )
+            return
+
+        class _PatchedKernelCall:
+            def __init__(self, original):
+                self._original = original
+
+            def __getitem__(self, grid):
+                original_grid_call = self._original[grid]
+
+                def patched_call(*args, **kwargs):
+                    kwargs["use_router_topk_nki_kernel"] = False
+                    return original_grid_call(*args, **kwargs)
+
+                return patched_call
+
+        fused_tkg_mod._moe_token_gen_selective_load_kernel_nki_call = (
+            _PatchedKernelCall(original_kernel)
+        )
+
+        original_all = fused_tkg_mod._moe_tkg_forward_all_experts_nki_call
+        if original_all is not None:
+            fused_tkg_mod._moe_tkg_forward_all_experts_nki_call = _PatchedKernelCall(
+                original_all
+            )
+
+        logger.warning("Patched MoEFusedTKG for sigmoid routing (ISA fallback)")
+    except ImportError:
+        logger.info("moe_fused_tkg module not available (SDK < 2.28), skipping patch")
+    except Exception as e:
+        logger.warning("Failed to patch MoEFusedTKG for sigmoid: %s", e)
+
+
+# Apply sigmoid patch at import time so it takes effect before model construction
+_patch_fused_tkg_for_sigmoid()
+
 
 SampleOutput = Union[SampleEncoderDecoderOutput, SampleDecoderOnlyOutput]
 

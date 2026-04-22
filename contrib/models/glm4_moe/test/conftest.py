@@ -4,10 +4,47 @@
 import random
 import sys
 import tempfile
+import types
 from pathlib import Path
 
 import pytest
 import torch
+
+# ---------------------------------------------------------------------------
+# Compatibility shims for transformers 5.0.0 + NxDI library quirks
+#
+# Two issues are resolved here before any test-module import occurs:
+#
+# 1. neuronx_distributed.pipeline.trace imports transformers.utils.fx.HFTracer
+#    which was removed in transformers 5.0.  Register a stub module BEFORE
+#    neuronx_distributed is first imported so the import succeeds.
+#
+# 2. neuronx_distributed_inference.utils.hf_adapter imports
+#    transformers.generation.SampleDecoderOnlyOutput which was renamed to
+#    GenerateDecoderOnlyOutput in transformers 5.0.  Patch the live
+#    transformers.generation module to re-export the old name as an alias.
+#
+# All shims are applied at conftest collection time and do not affect
+# GLM-4.5 MoE inference behaviour.
+# ---------------------------------------------------------------------------
+
+# Shim 1: transformers.utils.fx.HFTracer stub
+if "transformers.utils.fx" not in sys.modules:
+    _fx_stub = types.ModuleType("transformers.utils.fx")
+
+    class _HFTracerStub:
+        """Stub replacing transformers.utils.fx.HFTracer (removed in transformers 5.0)."""
+
+    _fx_stub.HFTracer = _HFTracerStub  # type: ignore[attr-defined]
+    sys.modules["transformers.utils.fx"] = _fx_stub
+
+# Shim 2: transformers.generation.SampleDecoderOnlyOutput backward-compat alias
+import transformers.generation as _tg
+
+if not hasattr(_tg, "SampleDecoderOnlyOutput"):
+    _tg.SampleDecoderOnlyOutput = _tg.GenerateDecoderOnlyOutput  # type: ignore[attr-defined]
+if not hasattr(_tg, "SampleEncoderDecoderOutput"):
+    _tg.SampleEncoderDecoderOutput = _tg.GenerateEncoderDecoderOutput  # type: ignore[attr-defined]
 
 # Add src to path so glm4_moe package is importable
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))

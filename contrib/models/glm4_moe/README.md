@@ -31,8 +31,8 @@ GLM-4.5 MoE has several differences from standard MoE models that required custo
 |---|---|
 | `num_hidden_layers` | 46 |
 | `hidden_size` | 4096 |
-| `num_attention_heads` | 32 |
-| `num_key_value_heads` | 2 |
+| `num_attention_heads` | 96 |
+| `num_key_value_heads` | 8 |
 | `head_dim` | 128 |
 | `partial_rotary_factor` | 0.5 (rotary_dim = 64) |
 | `attention_bias` | True |
@@ -40,10 +40,10 @@ GLM-4.5 MoE has several differences from standard MoE models that required custo
 | `num_experts_per_tok` | 8 |
 | `n_shared_experts` | 1 |
 | `first_k_dense_replace` | 1 |
-| `moe_intermediate_size` | 2048 |
-| `intermediate_size` | 16384 (dense layers) |
-| `n_group` | 8 |
-| `topk_group` | 4 |
+| `moe_intermediate_size` | 1408 |
+| `intermediate_size` | 10944 (dense layers) |
+| `n_group` | 1 |
+| `topk_group` | 1 |
 | `vocab_size` | 151552 |
 | `max_position_embeddings` | 131072 |
 
@@ -206,8 +206,12 @@ The integration test:
 - Flash decoding requires Trn2 for optimal performance; Trn1 falls back to standard decoding
 - `e_score_correction_bias` is loaded from checkpoint as a frozen buffer (not trained during fine-tuning)
 
+### Sigmoid Routing and Fused MoE TKG Kernel
+
+The fused MoE TKG kernel's built-in router only supports softmax activation. GLM-4.5 MoE uses sigmoid routing. This model includes a runtime patch (`_patch_fused_tkg_for_sigmoid()`) that forces the ISA router fallback when the fused TKG kernel is active, ensuring correct routing behavior. No user action needed — the patch is applied automatically at import time.
+
 ## Maintainer
 
 Community contribution — PRs welcome.
 
-**Last Updated:** 2026-03-06
+**Last Updated:** 2026-04-21
