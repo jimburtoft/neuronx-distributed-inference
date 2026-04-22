@@ -629,30 +629,61 @@ def attention_block_tkg(
             #
             # NKI 0.3.0 / neuronx-cc 2.24 fix:
             # V_tkg_sb has shape (B*S_tkg, kv_heads*d_head) = (4, 256).
-            # nc_transpose fails: stationary free dim 256 > gemm_stationary_fmax=128.
+            # nc_transpose on the full tensor fails: stationary free dim 256 > gemm_stationary_fmax=128.
             # tensor_copy from partition b also fails (cross-partition BIR error).
             #
-            # Solution: Use v_active_hbm which already has V data on HBM in
-            # (B_virt, 1, S_tkg, d_head) layout. DMA directly from HBM to cache.
-            # No SBUF transpose needed — avoids both the 256-dim and partition issues.
+            # Solution: Split V per KV head FIRST, then transpose each (B*S_tkg, d_head) = (4, 128)
+            # chunk separately. nc_transpose on (4, 128) has stationary free = 4 (well under 128).
+            # This keeps everything in SBUF — no HBM roundtrip overhead.
             if n_prgs == 1 or prg_id == 0:
                 V_cache_3d = V_cache.reshape((B_virt_cache, S_max_ctx, d_head))
-                # Reshape v_active_hbm to 2D: (B_virt*S_tkg, d_head) for flat DMA access
-                V_active_2d = v_active_hbm.reshape((B_virt_cache * S_tkg, d_head))
 
-                for b in range(B_attn):
-                    nisa.dma_copy(start_position, kv_cache_update_idx[b])
-                    for g in range(kv_heads):
+                for g in range(kv_heads):
+                    # Slice V for this KV head: (B*S_tkg, d_head) from V_tkg_sb
+                    V_head_sb = V_tkg_sb[
+                        :, nl.ds(g * d_head, d_head)
+                    ]  # (B*S_tkg, d_head)
+                    # Transpose (B*S_tkg, d_head) → (d_head, B*S_tkg)
+                    # stationary free = B*S_tkg (e.g. 4) << 128 ✓
+                    V_head_T_psum = nl.ndarray(
+                        (d_head, B_attn * S_tkg),
+                        dtype=V_head_sb.dtype,
+                        buffer=nl.psum,
+                    )
+                    nisa.nc_transpose(dst=V_head_T_psum, data=V_head_sb)
+                    V_head_T_sb = nl.ndarray(
+                        (d_head, B_attn * S_tkg),
+                        dtype=V_head_sb.dtype,
+                        buffer=nl.sbuf,
+                    )
+                    nisa.tensor_copy(V_head_T_sb, V_head_T_psum)
+
+                    for b in range(B_attn):
                         vb = b * kv_heads + g
-                        # Load V token from HBM → SBUF
-                        V_token_sb = nl.ndarray(
-                            (S_tkg, d_head), dtype=V_active_2d.dtype, buffer=nl.sbuf
+                        nisa.dma_copy(start_position, kv_cache_update_idx[b])
+                        # Extract (d_head, S_tkg) column for this batch
+                        V_col_sb = nl.ndarray(
+                            (d_head, S_tkg),
+                            dtype=V_head_T_sb.dtype,
+                            buffer=nl.sbuf,
                         )
-                        nisa.dma_copy(
-                            dst=V_token_sb,
-                            src=V_active_2d[nl.ds(vb * S_tkg, S_tkg), :],
+                        nisa.tensor_copy(
+                            V_col_sb,
+                            V_head_T_sb[:, nl.ds(b * S_tkg, S_tkg)],
                         )
-                        # DMA from SBUF → V cache (HBM)
+                        # Transpose (d_head, S_tkg) → (S_tkg, d_head) for cache DMA
+                        V_col_T_psum = nl.ndarray(
+                            (S_tkg, d_head),
+                            dtype=V_col_sb.dtype,
+                            buffer=nl.psum,
+                        )
+                        nisa.nc_transpose(dst=V_col_T_psum, data=V_col_sb)
+                        V_col_T_sb = nl.ndarray(
+                            (S_tkg, d_head),
+                            dtype=V_col_sb.dtype,
+                            buffer=nl.sbuf,
+                        )
+                        nisa.tensor_copy(V_col_T_sb, V_col_T_psum)
                         nisa.dma_copy(
                             dst=V_cache_3d.ap(
                                 pattern=[[d_head, S_tkg], [1, d_head]],
@@ -660,7 +691,7 @@ def attention_block_tkg(
                                 scalar_offset=start_position,
                                 indirect_dim=1,
                             ),
-                            src=V_token_sb,
+                            src=V_col_T_sb,
                         )
 
             # K update on lnc=1
