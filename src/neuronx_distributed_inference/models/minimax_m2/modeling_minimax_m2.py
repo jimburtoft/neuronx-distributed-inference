@@ -138,7 +138,7 @@ def convert_state_dict_to_fused_qkv(state_dict: Dict[str, Any], cfg: InferenceCo
         if (
             cfg.neuron_config.quantized_mlp_kernel_enabled
             or cfg.neuron_config.quantized
-        ) and f"layers.{layer_idx}.self_attn" not in mods_to_not_conv:
+        ) and "self_attn" not in mods_to_not_conv:
             _helper_concat_and_delete_qkv(state_dict, layer_idx, "scale")
     gc.collect()
     return state_dict
