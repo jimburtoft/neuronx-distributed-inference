@@ -189,11 +189,20 @@ def create_config(args) -> MiniMaxM2InferenceConfig:
         quantized_checkpoints_path=args.quantized_checkpoints_path,
         quantization_type="blockwise_symmetric" if use_fp8 else "per_tensor_symmetric",
         quantization_dtype="f8e4m3" if use_fp8 else "int8",
-        quantization_block_size=128 if use_fp8 else None,
-        quantization_block_axis=0 if use_fp8 else None,
-        # Exclude all modules from NxD convert() -- attention is BF16 (dequantized
-        # in preprocessing), MoE experts use MoEFusedTKG's internal FP8 path.
-        modules_to_not_convert=["self_attn", "lm_head", "embed_tokens", "norm"]
+        quantization_block_size=[128, 128] if use_fp8 else None,
+        quantization_block_axis=[0, 1] if use_fp8 else None,
+        # Exclude ALL modules from NxD convert(). Attention is BF16 (dequantized
+        # in preprocessing). MoE expert weights use MoEFusedTKG's internal FP8
+        # path (scale tensors passed to NKI kernel), not NxD quantization.
+        modules_to_not_convert=[
+            "self_attn",
+            "lm_head",
+            "embed_tokens",
+            "norm",
+            "block_sparse_moe",
+            "expert_mlps",
+            "router",
+        ]
         if use_fp8
         else None,
     )
