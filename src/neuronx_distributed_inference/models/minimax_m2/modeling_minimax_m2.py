@@ -393,6 +393,42 @@ def initialize_minimax_m2_moe_module(
         tkg_expert_model_parallel_group=moe_tkg_expert_model_parallel_group,
     )
 
+    # When quantized=True, the MoE expert weights are FP8 with separate .scale
+    # tensors. The ExpertFusedColumnParallelLinear is initialized with BF16 dtype
+    # by default, which causes:
+    #   1. cast_weights() to cast FP8 checkpoint values to BF16
+    #   2. load_state_dict() to silently drop .scale keys (no matching parameter)
+    # Fix: Re-create weight params as FP8 and register .scale buffers.
+    is_quantized = getattr(config.neuron_config, "quantized", False)
+    if is_quantized:
+        import torch.nn as nn
+
+        for proj in [expert_mlps.mlp_op.gate_up_proj, expert_mlps.mlp_op.down_proj]:
+            # Replace weight parameter with FP8 dtype so cast_weights doesn't cast
+            old_weight = proj.weight
+            proj.weight = nn.Parameter(
+                torch.empty(
+                    old_weight.shape,
+                    dtype=torch.float8_e4m3fn,
+                    device=old_weight.device,
+                ),
+                requires_grad=False,
+            )
+            # Copy expert-parallel metadata from old weight
+            for attr in [
+                "expert_model_parallel",
+                "is_prefill",
+                "expert_distribution",
+                "tensor_model_parallel",
+            ]:
+                if hasattr(old_weight, attr):
+                    setattr(proj.weight, attr, getattr(old_weight, attr))
+            del old_weight
+
+            # Register .scale buffer for load_state_dict to populate.
+            # Placeholder shape [1]; actual shape comes from checkpoint.
+            proj.register_buffer("scale", torch.empty(1, dtype=torch.float32))
+
     if init_tkg_module:
         from neuronx_distributed.modules.moe.model import MoEFusedTKGConfig
 
