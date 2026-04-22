@@ -429,6 +429,14 @@ def initialize_minimax_m2_moe_module(
             # Placeholder shape [1]; actual shape comes from checkpoint.
             proj.register_buffer("scale", torch.empty(1, dtype=torch.float32))
 
+            # Set quantization_type attribute expected by ExpertMLPsV2.forward_blockwise.
+            # Use BLOCKWISE_SYMMETRIC to match our blockwise [128,128] FP8 quantization.
+            from neuronx_distributed.quantization.quantization_config import (
+                QuantizationType,
+            )
+
+            proj.quantization_type = QuantizationType.BLOCKWISE_SYMMETRIC
+
     if init_tkg_module:
         from neuronx_distributed.modules.moe.model import MoEFusedTKGConfig
 
