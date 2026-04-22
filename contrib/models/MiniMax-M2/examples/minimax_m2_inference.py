@@ -28,6 +28,21 @@ Usage:
         --max-context-length 128 \
         --max-new-tokens 128 \
         --enable-nki-attention
+
+    # With FP8 MoE weights (halves MoE HBM, allows longer context):
+    # Step 1: Preprocess the FP8 checkpoint
+    python conversion_script/preprocess_minimax_m2_fp8.py \
+        --hf_model_path /mnt/models/MiniMax-M2 \
+        --save_path /mnt/models/MiniMax-M2-fp8-neuron
+    # Step 2: Run with --quantized-checkpoints-path
+    python minimax_m2_inference.py \
+        --model-path /mnt/models/MiniMax-M2-fp8-neuron \
+        --compiled-model-path /mnt/models/MiniMax-M2-compiled-fp8 \
+        --quantized-checkpoints-path /mnt/models/MiniMax-M2-fp8-neuron \
+        --tp-degree 32 \
+        --batch-size 1 \
+        --max-context-length 512 \
+        --max-new-tokens 128
 """
 
 import argparse
@@ -97,6 +112,14 @@ def parse_args():
         help="Enable NKI attention block kernel (fused QKV + RoPE + attention "
         "+ in-kernel KV cache update — ~54 tok/s, fastest configuration)",
     )
+    parser.add_argument(
+        "--quantized-checkpoints-path",
+        type=str,
+        default=None,
+        help="Path to preprocessed FP8 checkpoint (from preprocess_minimax_m2_fp8.py). "
+        "Enables FP8 MoE inference, halving expert weight HBM and allowing "
+        "longer context lengths.",
+    )
     return parser.parse_args()
 
 
@@ -119,10 +142,17 @@ def create_config(args) -> MiniMaxM2InferenceConfig:
     # configuration, ~23% faster than baseline.
 
     use_nki_attn = args.enable_nki_attention
+    use_fp8 = args.quantized_checkpoints_path is not None
     if use_nki_attn:
         print(
             "INFO: NKI attention kernel enabled with in-kernel KV cache update "
             "(cache_update=True). Expected ~54 tok/s vs ~44 tok/s baseline."
+        )
+    if use_fp8:
+        print(
+            f"INFO: FP8 MoE inference enabled. Loading preprocessed checkpoint from "
+            f"{args.quantized_checkpoints_path}. Expert weights stay in FP8 (1 byte/param "
+            f"vs 2 for BF16), halving MoE HBM usage."
         )
 
     neuron_config = MoENeuronConfig(
@@ -153,6 +183,12 @@ def create_config(args) -> MiniMaxM2InferenceConfig:
         qkv_kernel_enabled=use_nki_attn,
         # fused_qkv=True always — uses fused QKV weight for cleaner loading
         fused_qkv=True,
+        # FP8 MoE quantization: keep expert weights in FP8 with .scale tensors.
+        # The preprocessing script rescales from OCP range (448) to Neuron (240).
+        quantized=use_fp8,
+        quantized_checkpoints_path=args.quantized_checkpoints_path,
+        quantization_type="blockwise_symmetric",
+        quantization_dtype="f8e4m3" if use_fp8 else "int8",
     )
 
     # MiniMax-M2 HF repo has auto_map, requiring trust_remote_code for AutoConfig.

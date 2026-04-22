@@ -455,8 +455,14 @@ def convert_minimax_m2_hf_to_neuron_state_dict(
         "MiniMax-M2 requires glu_mlp=True (SwiGLU)"
     )
 
-    # Dequantize FP8 weights if present
-    maybe_dequantize_layer(neuron_state_dict, config)
+    # Dequantize FP8 weights if present.
+    # When quantized=True, the preprocessing script has already rescaled FP8
+    # expert weights to Neuron range and converted scale_inv to .scale format.
+    # Attention weights have been dequantized to BF16 by the preprocessing script.
+    # We only need to dequantize when NOT using a preprocessed checkpoint.
+    is_quantized = getattr(config.neuron_config, "quantized", False)
+    if not is_quantized:
+        maybe_dequantize_layer(neuron_state_dict, config)
 
     with torch.no_grad():
         tp_degree = config.neuron_config.tp_degree
@@ -540,6 +546,10 @@ def convert_minimax_m2_hf_to_neuron_state_dict(
             device = neuron_state_dict[w1_key].device
             dtype = neuron_state_dict[w1_key].dtype
 
+            # Check if FP8 scale tensors are present (preprocessed checkpoint)
+            s1_key_0 = f"layers.{layer_idx}.block_sparse_moe.experts.0.w1.scale"
+            has_scales = s1_key_0 in neuron_state_dict
+
             # Stack gate (w1) + up (w3) into gate_up_proj: [E, H, 2*I]
             gate_up_proj = torch.empty(
                 config.num_local_experts,
@@ -548,6 +558,9 @@ def convert_minimax_m2_hf_to_neuron_state_dict(
                 dtype=dtype,
                 device=device,
             )
+            gate_scales = [] if has_scales else None
+            up_scales = [] if has_scales else None
+
             for expert_idx in range(config.num_local_experts):
                 ew1 = f"layers.{layer_idx}.block_sparse_moe.experts.{expert_idx}.w1.weight"
                 ew3 = f"layers.{layer_idx}.block_sparse_moe.experts.{expert_idx}.w3.weight"
@@ -560,6 +573,17 @@ def convert_minimax_m2_hf_to_neuron_state_dict(
                     gate_up_slice, 2, intermediate_size, intermediate_size
                 ).copy_(neuron_state_dict[ew3].T)
                 del neuron_state_dict[ew1], neuron_state_dict[ew3]
+
+                # Collect and remove scale tensors if present
+                if has_scales:
+                    es1 = f"layers.{layer_idx}.block_sparse_moe.experts.{expert_idx}.w1.scale"
+                    es3 = f"layers.{layer_idx}.block_sparse_moe.experts.{expert_idx}.w3.scale"
+                    # Scales are in original weight layout [I, H].
+                    # Weight is transposed to [H, I] during stacking, so we
+                    # transpose scales to match: [sh_I, sw_H] -> [sw_H, sh_I]
+                    gate_scales.append(neuron_state_dict.pop(es1).T)
+                    up_scales.append(neuron_state_dict.pop(es3).T)
+
                 if (expert_idx + 1) % gc_interval == 0:
                     gc.collect()
 
@@ -578,6 +602,16 @@ def convert_minimax_m2_hf_to_neuron_state_dict(
                 f"layers.{layer_idx}.block_sparse_moe.expert_mlps.mlp_op.gate_up_proj.weight"
             ] = gate_up_proj
 
+            # Fuse and store gate_up scales: [E, sw_H, sh_I] + [E, sw_H, sh_I] -> [E, sw_H, 2*sh_I]
+            if has_scales:
+                gate_s = torch.stack(gate_scales, dim=0)
+                up_s = torch.stack(up_scales, dim=0)
+                gate_up_scale = torch.cat([gate_s, up_s], dim=-1)
+                neuron_state_dict[
+                    f"layers.{layer_idx}.block_sparse_moe.expert_mlps.mlp_op.gate_up_proj.scale"
+                ] = gate_up_scale
+                del gate_scales, up_scales, gate_s, up_s
+
             # Stack down (w2) into down_proj: [E, I, H]
             down_proj = torch.empty(
                 config.num_local_experts,
@@ -586,12 +620,20 @@ def convert_minimax_m2_hf_to_neuron_state_dict(
                 dtype=dtype,
                 device=device,
             )
+            down_scales = [] if has_scales else None
+
             for expert_idx in range(config.num_local_experts):
                 ew2 = f"layers.{layer_idx}.block_sparse_moe.experts.{expert_idx}.w2.weight"
                 torch.narrow(down_proj, 0, expert_idx, 1).copy_(
                     neuron_state_dict[ew2].T
                 )
                 del neuron_state_dict[ew2]
+
+                if has_scales:
+                    es2 = f"layers.{layer_idx}.block_sparse_moe.experts.{expert_idx}.w2.scale"
+                    # w2 shape [H, I] -> transpose to [I, H], so scale transposes too
+                    down_scales.append(neuron_state_dict.pop(es2).T)
+
                 if (expert_idx + 1) % gc_interval == 0:
                     gc.collect()
 
@@ -601,6 +643,13 @@ def convert_minimax_m2_hf_to_neuron_state_dict(
             neuron_state_dict[
                 f"layers.{layer_idx}.block_sparse_moe.expert_mlps.mlp_op.down_proj.weight"
             ] = down_proj
+
+            if has_scales:
+                down_s = torch.stack(down_scales, dim=0)
+                neuron_state_dict[
+                    f"layers.{layer_idx}.block_sparse_moe.expert_mlps.mlp_op.down_proj.scale"
+                ] = down_s
+                del down_scales, down_s
 
             gc.collect()
 
@@ -1321,6 +1370,11 @@ class NeuronMiniMaxM2ForCausalLM(NeuronBaseForCausalLM):
             )
             self.neuron_config.pre_rope_rmsnorm = True
             args += " --internal-max-instruction-limit=15000000"
+
+        # FP8 expert weights require the OCP->IEEE-754 FP8 format translation flag.
+        # PyTorch uses float8_e4m3fn (OCP format) but Neuron uses float8_e4m3 (IEEE).
+        if getattr(self.neuron_config, "quantized", False):
+            args += " --experimental-unsafe-fp8e4m3fn-as-fp8e4m3"
 
         return args
 
