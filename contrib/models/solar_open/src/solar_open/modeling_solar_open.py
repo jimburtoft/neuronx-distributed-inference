@@ -26,8 +26,8 @@ Architecture notes vs GLM-4.5 MoE (which is the primary template):
   - rope_scaling: None → plain RotaryEmbedding; {"type":"yarn"} → YaRN RoPE
   - Router: same sigmoid + group routing + e_score_correction_bias + routed_scaling_factor
     as GLM-4.5 (NeuronGlm4MoeRouter is reused directly)
-  - solar_open is not in transformers stable releases (≤4.56.2) but has been merged
-    into transformers main; load_hf_model loads safetensors directly for now
+  - solar_open is a built-in transformers model (SolarOpenForCausalLM, available
+    since transformers 4.57+); no trust_remote_code needed
 """
 
 import gc
@@ -110,7 +110,7 @@ SampleOutput = Union[SampleEncoderDecoderOutput, SampleDecoderOnlyOutput]
 
 GQA_SHARDING_STRATEGY = GQA.REPLICATE_TO_TP_DEGREE
 
-logger = logging.getLogger("Neuron")
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
