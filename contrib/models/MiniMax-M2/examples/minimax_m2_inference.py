@@ -46,6 +46,7 @@ Usage:
 """
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -219,6 +220,11 @@ def create_config(args) -> MiniMaxM2InferenceConfig:
 
 def main():
     args = parse_args()
+
+    # FP8 MoE requires UNSAFE_FP8FNCAST=1 for torch_neuronx XLA tracing to
+    # accept float8_e4m3fn tensors. Must be set before model trace/compile.
+    if args.quantized_checkpoints_path is not None:
+        os.environ["UNSAFE_FP8FNCAST"] = "1"
 
     print(f"Loading tokenizer from {args.model_path}...")
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
