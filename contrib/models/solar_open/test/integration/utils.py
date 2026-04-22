@@ -1,30 +1,31 @@
 """Integration test utilities for Solar Open MoE.
 
-Uses transformers.SolarOpenForCausalLM (available since transformers 5.0.0) as the
+Uses transformers.SolarOpenForCausalLM (available since transformers 4.57+) as the
 CPU reference model for logit accuracy checks against NeuronSolarOpenForCausalLM.
 
 Public API:
-- create_tiny_solar_open_model(): write a minimal HF checkpoint via SolarOpenForCausalLM
-- get_neuron_config(): return MoENeuronConfig for integration tests
-- check_text_accuracy(): compare last-token logits (MAE) between CPU and Neuron model
+- create_neuron_config(): return MoENeuronConfig for integration tests
+- create_tiny_solar_open_model(): write a minimal HF checkpoint
+- generate_golden_logits(): generate CPU reference logits before Neuron load
+- prepare_inputs(): create random input tensors
 """
 
+import gc
 import os
 import sys
 from pathlib import Path
+from typing import Tuple
 
 import torch
+from transformers import GenerationConfig
 
 # Add contrib src to Python path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 
-from solar_open.modeling_solar_open import (
-    NeuronSolarOpenForCausalLM,
-    SolarOpenInferenceConfig,
-    load_solar_open_config,
+from neuronx_distributed_inference.models.config import (
+    MoENeuronConfig,
+    OnDeviceSamplingConfig,
 )
-
-from neuronx_distributed_inference.models.config import MoENeuronConfig
 
 
 # ---------------------------------------------------------------------------
@@ -32,26 +33,38 @@ from neuronx_distributed_inference.models.config import MoENeuronConfig
 # ---------------------------------------------------------------------------
 
 
-def get_neuron_config() -> MoENeuronConfig:
-    """Return MoENeuronConfig for Solar Open integration tests.
+def create_neuron_config(
+    tp_degree: int = 2,
+    seq_len: int = 128,
+    batch_size: int = 1,
+    torch_dtype: torch.dtype = torch.bfloat16,
+) -> MoENeuronConfig:
+    """Create MoENeuronConfig for Solar Open integration tests.
 
-    Uses tp_degree=2, moe_tp_degree=2, moe_ep_degree=1 — compatible with
-    trn2.3xlarge (2 NeuronCores) and smaller test instances.
+    Args:
+        tp_degree: Tensor parallelism degree.
+        seq_len: Maximum sequence length.
+        batch_size: Batch size for inference.
+        torch_dtype: Dtype for model weights.
+
+    Returns:
+        Configured MoENeuronConfig.
     """
     return MoENeuronConfig(
-        tp_degree=2,
-        moe_tp_degree=2,
+        tp_degree=tp_degree,
+        moe_tp_degree=tp_degree,
         moe_ep_degree=1,
-        batch_size=1,
-        ctx_batch_size=1,
-        tkg_batch_size=1,
-        seq_len=128,
-        max_context_length=112,
-        torch_dtype=torch.bfloat16,
-        fused_qkv=True,
-        flash_decoding_enabled=False,
-        output_logits=True,
+        batch_size=batch_size,
+        ctx_batch_size=batch_size,
+        tkg_batch_size=batch_size,
+        seq_len=seq_len,
+        max_context_length=seq_len - 8,
+        torch_dtype=torch_dtype,
+        on_device_sampling_config=OnDeviceSamplingConfig(do_sample=False, top_k=1),
+        output_logits=True,  # Required for check_accuracy_logits_v2
         enable_bucketing=False,
+        flash_decoding_enabled=False,
+        fused_qkv=True,
         sequence_parallel_enabled=False,
         qkv_kernel_enabled=False,
         attn_kernel_enabled=False,
@@ -64,16 +77,12 @@ def get_neuron_config() -> MoENeuronConfig:
 
 
 def create_tiny_solar_open_model(model_dir: str) -> None:
-    """Create a tiny random-weight Solar Open checkpoint using transformers 5.0.0.
+    """Create a tiny random-weight Solar Open checkpoint using transformers.
 
     Calls SolarOpenForCausalLM(config).save_pretrained(model_dir) which writes:
       - config.json  (model_type="solar_open", all HF fields)
-      - model.safetensors  (random weights in Format B: pre-fused 3D expert tensors)
-      - generation_config.json  (with transformers_version="5.0.0")
-
-    The weight format is automatically detected by
-    convert_solar_open_hf_to_neuron_state_dict via the presence of
-    "layers.0.mlp.experts.gate_up_proj" keys (Format B path).
+      - model.safetensors  (random weights)
+      - generation_config.json
 
     Args:
         model_dir: Directory to write the checkpoint to.
@@ -106,79 +115,94 @@ def create_tiny_solar_open_model(model_dir: str) -> None:
 
     torch.manual_seed(42)
     model = SolarOpenForCausalLM(config)
+    # Save in bfloat16 to match Neuron inference precision and avoid
+    # fp32-vs-bf16 logit divergences in accuracy tests with random weights.
+    model = model.to(torch.bfloat16)
     model.save_pretrained(model_dir)
 
 
 # ---------------------------------------------------------------------------
-# Logit accuracy check (CPU transformers reference vs Neuron)
+# Input preparation
 # ---------------------------------------------------------------------------
 
 
-def check_text_accuracy(
-    model_dir: str,
-    traced_dir: str,
-    neuron_config: MoENeuronConfig,
-    tol: float = 0.1,
-) -> bool:
-    """Compare last-token logits from CPU reference and compiled Neuron model.
-
-    Uses transformers.SolarOpenForCausalLM as the CPU reference (available since
-    transformers 5.0.0).  Compares last-token logit vectors via mean absolute error.
-
-    Exact token-ID matching is not used because Neuron's bfloat16 hardware
-    arithmetic can produce a different argmax on borderline logits, even when the
-    overall logit distribution is very close to the CPU reference.
+def prepare_inputs(
+    batch_size: int,
+    seq_len: int,
+    vocab_size: int = 1000,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Prepare random input tensors for inference.
 
     Args:
-        model_dir: Path to the tiny random model checkpoint.
-        traced_dir: Path to the compiled Neuron model.
-        neuron_config: MoENeuronConfig used for compilation.
-        tol: Maximum allowed mean absolute error on last-token logits.
+        batch_size: Number of sequences in the batch.
+        seq_len: Sequence length.
+        vocab_size: Vocabulary size for token sampling.
 
     Returns:
-        True if logit MAE is within tolerance, False otherwise.
+        Tuple of (input_ids, attention_mask).
     """
-    import shutil
+    torch.manual_seed(0)
+    input_ids = torch.randint(0, vocab_size, (batch_size, seq_len), dtype=torch.long)
+    attention_mask = torch.ones(batch_size, seq_len, dtype=torch.long)
+    return input_ids, attention_mask
+
+
+# ---------------------------------------------------------------------------
+# Golden logit generation (CPU-only, before Neuron model load)
+# ---------------------------------------------------------------------------
+
+
+def generate_golden_logits(
+    model_path: str,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    generation_config: GenerationConfig,
+    max_new_tokens: int,
+) -> torch.Tensor:
+    """Generate reference logits from the HuggingFace CPU model.
+
+    This function loads SolarOpenForCausalLM on CPU, generates logits using
+    greedy decoding, and immediately frees the model from memory. It should
+    be called BEFORE the Neuron model is compiled/loaded to avoid OOM on
+    memory-constrained instances (e.g., trn2.3xlarge where the Neuron runtime
+    maps 96 GB HBM into the process address space).
+
+    Args:
+        model_path: Path to the HF checkpoint directory.
+        input_ids: Input token IDs [batch_size, seq_len].
+        attention_mask: Attention mask [batch_size, seq_len].
+        generation_config: HuggingFace GenerationConfig.
+        max_new_tokens: Number of tokens to generate.
+
+    Returns:
+        Expected logits tensor [num_tokens, batch_size, vocab_size].
+    """
     from transformers import SolarOpenForCausalLM
 
-    torch.manual_seed(0)
-    input_ids = torch.randint(0, 500, (1, 16), dtype=torch.long)
-    attention_mask = torch.ones_like(input_ids)
-
-    # --- CPU Reference (transformers SolarOpenForCausalLM) ---
     hf_model = SolarOpenForCausalLM.from_pretrained(
-        model_dir, torch_dtype=torch.bfloat16
+        model_path, torch_dtype=torch.bfloat16
     )
     hf_model.eval()
 
     with torch.no_grad():
-        cpu_output = hf_model(input_ids, attention_mask=attention_mask)
-    ref_logits = cpu_output.logits.float()  # [1, seq, vocab]
-    ref_last = ref_logits[:, -1, :]  # [1, vocab]
+        outputs = hf_model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens,
+            min_new_tokens=max_new_tokens,
+            do_sample=False,
+            return_dict_in_generate=True,
+            output_scores=True,
+            generation_config=generation_config,
+        )
 
-    # --- Neuron model ---
-    # Copy model.safetensors to traced_dir so load() can find checkpoint weights
-    src = os.path.join(model_dir, "model.safetensors")
-    dst = os.path.join(traced_dir, "model.safetensors")
-    if os.path.exists(src) and not os.path.exists(dst):
-        shutil.copy2(src, dst)
+    expected_logits = torch.stack(outputs.scores)[:max_new_tokens, :, :]
+    expected_token_ids = expected_logits.argmax(dim=2).T
+    print(f"  Golden token IDs: {expected_token_ids}")
+    print(f"  Golden logits shape: {expected_logits.shape}")
 
-    neuron_model = NeuronSolarOpenForCausalLM(traced_dir)
-    neuron_model.load(traced_dir)
+    # Free CPU model before Neuron runtime claims device memory
+    del hf_model
+    gc.collect()
 
-    with torch.no_grad():
-        position_ids = torch.arange(input_ids.shape[1], dtype=torch.long).unsqueeze(0)
-        output = neuron_model(input_ids, position_ids=position_ids)
-        raw_logits = output.logits if hasattr(output, "logits") else output[0]
-        if isinstance(raw_logits, (list, tuple)):
-            raw_logits = raw_logits[0]
-        neuron_logits = raw_logits.float()  # [1, seq, vocab]
-    neuron_last = neuron_logits[:, -1, :]  # [1, vocab]
-
-    mae = (ref_last - neuron_last).abs().mean().item()
-    cpu_tok = ref_last.argmax(dim=-1).item()
-    nrn_tok = neuron_last.argmax(dim=-1).item()
-    print(f"  Logit MAE (last token): {mae:.6f} (tol={tol})")
-    print(f"  CPU argmax token:    {cpu_tok}")
-    print(f"  Neuron argmax token: {nrn_tok}")
-    return mae < tol
+    return expected_logits

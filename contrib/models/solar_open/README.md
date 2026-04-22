@@ -125,8 +125,23 @@ python -m pytest test/integration/ -v --capture=tee-sys
 
 Integration tests compile a 2-layer tiny random model and verify:
 1. **Smoke test** — model compiles and loads without error
-2. **Output shape** — generated token IDs have correct shape
-3. **Determinism** — same input produces same output across runs
+2. **Logit accuracy** — Neuron logits match HuggingFace CPU reference via `check_accuracy_logits_v2` (divergence_difference_tol=0.001)
+3. **Context encoding** — forward pass completes without error
+
+## Validation Results
+
+**Tested with:** Reduced 2-layer config (`hidden_size=512`, `n_routed_experts=8`, random weights), TP=2, `bfloat16`
+**Full model:** `upstage/Solar-Open-100B` on `trn2.48xlarge`, TP=64, SDK 2.29
+
+| Test | Status | Notes |
+|------|--------|-------|
+| Model compilation (2-layer) | PASS | Reduced config, TP=2 |
+| Model load | PASS | |
+| Logit accuracy (`check_accuracy_logits_v2`) | PASS | `divergence_difference_tol=0.001` |
+| Full model logit accuracy (100B, trn2.48xlarge) | PASS | 0 divergence, SDK 2.29 |
+| Unit: router top-k (10 tests) | PASS | CPU-only |
+| Unit: partial RoPE (9 tests) | PASS | CPU-only |
+| Unit: decoder layer dispatch (11 tests) | PASS | CPU-only |
 
 ## Performance (SDK 2.29, trn2.48xlarge)
 
@@ -148,6 +163,10 @@ The 6.54x TKG improvement comes from `neuronx-cc` 2.24 compiler optimizations fo
 |--------|---------|--------|
 | Attention NKI (`qkv_kernel_enabled`, `qkv_nki_kernel_enabled`) | **ON** | 82.4 tok/s — sole optimization path |
 | MoE fused NKI (`moe_fused_nki_kernel_enabled`) | **OFF** | 71.9 tok/s — 13% slower than ISA path |
+
+## Example Checkpoints
+
+- [`upstage/Solar-Open-100B`](https://huggingface.co/upstage/Solar-Open-100B) — Full 100B model (128 routed experts + 1 shared, 64 layers)
 
 ## Known Issues
 
@@ -176,4 +195,4 @@ Contributed by: gmkim (lifelongeeek)
 
 SDK 2.29 validation, NKI kernel optimization, and hf_adapter fix contributed by: jimburtoft
 
-**Last Updated:** 2026-04-19
+**Last Updated:** 2026-04-22
