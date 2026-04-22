@@ -50,30 +50,58 @@ FP8_SCALING_FACTOR = 448.0 / 240.0
 
 
 def rescale_fp8_weight_blockwise(
-    weight: torch.Tensor, scale_inv: torch.Tensor
+    weight: torch.Tensor, scale_inv: torch.Tensor, block_size: list = [128, 128]
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Rescale FP8 weight from OCP range to Neuron range, keeping block-wise scaling.
+    Rescale FP8 weight from OCP range to Neuron range, converting blockwise
+    scales to per-channel (per-row) scales.
+
+    The NxDI MoE kernels (MoEFusedTKG and CTE blockwise matmul) expect
+    per-channel scales, not blockwise grids. This function:
+    1. Dequantizes the FP8 weight using blockwise scales
+    2. Computes per-row max abs for a per-channel scale
+    3. Requantizes to FP8 in Neuron range with per-channel scale
 
     Args:
         weight: FP8 weight (float8_e4m3fn), shape [out_features, in_features]
         scale_inv: Block-wise inverse scale (weight_scale_inv), shape [sh, sw]
+        block_size: Blockwise quantization block size [block_h, block_w]
 
     Returns:
-        (rescaled_weight_fp8, neuron_scale):
-        - rescaled_weight_fp8: FP8 weight in Neuron range
-        - neuron_scale: Direct scale (NOT reciprocal), FP32
+        (rescaled_weight_fp8, per_channel_scale):
+        - rescaled_weight_fp8: FP8 weight in Neuron range, per-channel quantized
+        - per_channel_scale: Per-row scale [out_features], FP32
     """
-    weight_bf16 = weight.bfloat16()
-    rescaled_bf16 = weight_bf16 / FP8_SCALING_FACTOR
-    rescaled_fp8 = rescaled_bf16.to(torch.float8_e4m3fn)
+    # Neuron FP8 E4M3 max value (IEEE-754 range)
+    NEURON_FP8_MAX = 240.0
 
-    # Convert: neuron_scale = scale_inv * FACTOR
-    # (Because: original = fp8 * scale_inv, and rescaled = fp8/FACTOR,
-    #  so original = rescaled * (scale_inv * FACTOR))
-    neuron_scale = scale_inv.float() * FP8_SCALING_FACTOR
+    # Step 1: Dequantize blockwise: original_bf16 = fp8_weight * scale_inv (per block)
+    h, w = weight.shape
+    block_h, block_w = block_size
+    weight_float = weight.float()
+    dequantized = torch.zeros(h, w, dtype=torch.float32)
 
-    return rescaled_fp8, neuron_scale.to(torch.float32)
+    sh, sw = scale_inv.shape
+    for i in range(sh):
+        for j in range(sw):
+            h_start = i * block_h
+            h_end = min((i + 1) * block_h, h)
+            w_start = j * block_w
+            w_end = min((j + 1) * block_w, w)
+            dequantized[h_start:h_end, w_start:w_end] = (
+                weight_float[h_start:h_end, w_start:w_end] * scale_inv[i, j].item()
+            )
+
+    # Step 2: Compute per-row (per-channel) scale
+    row_max_abs = dequantized.abs().amax(dim=1)  # [out_features]
+    per_channel_scale = row_max_abs / NEURON_FP8_MAX
+    per_channel_scale = torch.clamp(per_channel_scale, min=1e-10)
+
+    # Step 3: Requantize to FP8 in Neuron range
+    scale_expanded = per_channel_scale.unsqueeze(1)  # [out_features, 1]
+    requantized = (dequantized / scale_expanded).to(torch.float8_e4m3fn)
+
+    return requantized, per_channel_scale.to(torch.float32)
 
 
 def dequantize_blockwise(
@@ -231,7 +259,9 @@ def process_minimax_m2_checkpoint(
                 scale_inv = state_dict.get(s_key)
 
                 if weight.dtype == torch.float8_e4m3fn and scale_inv is not None:
-                    weight, scale = rescale_fp8_weight_blockwise(weight, scale_inv)
+                    weight, scale = rescale_fp8_weight_blockwise(
+                        weight, scale_inv, block_size
+                    )
                     new_state_dict[w_key] = weight
                     # Save as .scale (NOT .weight_scale, since MiniMax-M2's
                     # get_state_dict doesn't do the .weight_scale -> .scale rename

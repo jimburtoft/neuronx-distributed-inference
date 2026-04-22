@@ -439,12 +439,12 @@ def initialize_minimax_m2_moe_module(
             proj.register_buffer("scale", torch.empty(1, dtype=torch.float32))
 
             # Set quantization_type attribute expected by ExpertMLPsV2.forward_blockwise.
-            # Use BLOCKWISE_SYMMETRIC to match our blockwise [128,128] FP8 quantization.
+            # Use PER_CHANNEL_SYMMETRIC: preprocessing converts blockwise scales to per-channel.
             from neuronx_distributed.quantization.quantization_config import (
                 QuantizationType,
             )
 
-            proj.quantization_type = QuantizationType.BLOCKWISE_SYMMETRIC
+            proj.quantization_type = QuantizationType.PER_CHANNEL_SYMMETRIC
 
     if init_tkg_module:
         from neuronx_distributed.modules.moe.model import MoEFusedTKGConfig
@@ -631,11 +631,11 @@ def convert_minimax_m2_hf_to_neuron_state_dict(
                 if has_scales:
                     es1 = f"layers.{layer_idx}.block_sparse_moe.experts.{expert_idx}.w1.scale"
                     es3 = f"layers.{layer_idx}.block_sparse_moe.experts.{expert_idx}.w3.scale"
-                    # Scales are in original weight layout [I, H].
-                    # Weight is transposed to [H, I] during stacking, so we
-                    # transpose scales to match: [sh_I, sw_H] -> [sw_H, sh_I]
-                    gate_scales.append(neuron_state_dict.pop(es1).T)
-                    up_scales.append(neuron_state_dict.pop(es3).T)
+                    # Per-channel scales are 1D [I] (per output feature of original weight).
+                    # No transposition needed — the scale aligns with the output dim
+                    # which becomes the last dim after weight transposition to [H, I].
+                    gate_scales.append(neuron_state_dict.pop(es1))
+                    up_scales.append(neuron_state_dict.pop(es3))
 
                 if (expert_idx + 1) % gc_interval == 0:
                     gc.collect()
@@ -655,11 +655,12 @@ def convert_minimax_m2_hf_to_neuron_state_dict(
                 f"layers.{layer_idx}.block_sparse_moe.expert_mlps.mlp_op.gate_up_proj.weight"
             ] = gate_up_proj
 
-            # Fuse and store gate_up scales: [E, sw_H, sh_I] + [E, sw_H, sh_I] -> [E, sw_H, 2*sh_I]
+            # Fuse and store gate_up scales: [E, I] + [E, I] -> [E, 2*I]
+            # TKG kernel reads as .view(E, 2, -1) -> [E, 2, I]
             if has_scales:
-                gate_s = torch.stack(gate_scales, dim=0)
-                up_s = torch.stack(up_scales, dim=0)
-                gate_up_scale = torch.cat([gate_s, up_s], dim=-1)
+                gate_s = torch.stack(gate_scales, dim=0)  # [E, I]
+                up_s = torch.stack(up_scales, dim=0)  # [E, I]
+                gate_up_scale = torch.cat([gate_s, up_s], dim=-1)  # [E, 2*I]
                 neuron_state_dict[
                     f"layers.{layer_idx}.block_sparse_moe.expert_mlps.mlp_op.gate_up_proj.scale"
                 ] = gate_up_scale
@@ -684,8 +685,9 @@ def convert_minimax_m2_hf_to_neuron_state_dict(
 
                 if has_scales:
                     es2 = f"layers.{layer_idx}.block_sparse_moe.experts.{expert_idx}.w2.scale"
-                    # w2 shape [H, I] -> transpose to [I, H], so scale transposes too
-                    down_scales.append(neuron_state_dict.pop(es2).T)
+                    # Per-channel scale is 1D [H] (per output feature of w2).
+                    # No transposition needed.
+                    down_scales.append(neuron_state_dict.pop(es2))
 
                 if (expert_idx + 1) % gc_interval == 0:
                     gc.collect()

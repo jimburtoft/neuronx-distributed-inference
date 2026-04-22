@@ -174,9 +174,10 @@ def create_config(args) -> MiniMaxM2InferenceConfig:
         enable_bucketing=False,
         # NKI MoE kernels: For BF16, disabled at TP=32 because intermediate_size/TP=48
         # causes overhead from internal padding to 128 in the NKI kernel.
-        # For FP8, MUST be enabled because the CTE blockwise and selective-loading
-        # forward paths don't apply FP8 dequantization scales — only the NKI
-        # blockwise matmul kernel handles FP8 scale tensors correctly.
+        # For FP8, MUST be enabled — the standard CTE forward paths
+        # (torch_blockwise_matmul_inference, forward_selective_loading) don't apply
+        # FP8 dequantization scales. Only the NKI kernels (BlockwiseMatmulNKIFunc
+        # for CTE, MoEFusedTKG for TKG) handle FP8 scale tensors correctly.
         router_topk_nki_kernel_enabled=use_fp8,
         expert_mlp_nki_kernel_enabled=use_fp8,
         # NKI attention block kernel (fused QKV + RoPE + attention + KV cache)
@@ -191,10 +192,13 @@ def create_config(args) -> MiniMaxM2InferenceConfig:
         # The preprocessing script rescales from OCP range (448) to Neuron (240).
         quantized=use_fp8,
         quantized_checkpoints_path=args.quantized_checkpoints_path,
-        quantization_type="blockwise_symmetric" if use_fp8 else "per_tensor_symmetric",
+        quantization_type="per_channel_symmetric"
+        if use_fp8
+        else "per_tensor_symmetric",
         quantization_dtype="f8e4m3" if use_fp8 else "int8",
-        quantization_block_size=[128, 128] if use_fp8 else None,
-        quantization_block_axis=[0, 1] if use_fp8 else None,
+        # Per-channel scales (preprocessing converts blockwise->per-channel)
+        quantization_block_size=None,
+        quantization_block_axis=None,
         # Exclude ALL modules from NxD convert(). Attention is BF16 (dequantized
         # in preprocessing). MoE expert weights use MoEFusedTKG's internal FP8
         # path (scale tensors passed to NKI kernel), not NxD quantization.
