@@ -414,15 +414,16 @@ def initialize_minimax_m2_moe_module(
                 ),
                 requires_grad=False,
             )
-            # Copy expert-parallel metadata from old weight
-            for attr in [
-                "expert_model_parallel",
-                "is_prefill",
-                "expert_distribution",
-                "tensor_model_parallel",
-            ]:
-                if hasattr(old_weight, attr):
-                    setattr(proj.weight, attr, getattr(old_weight, attr))
+            # Copy ALL custom attributes from old weight (expert-parallel,
+            # tensor-model-parallel, partition_dim, partition_stride, etc.)
+            for attr in dir(old_weight):
+                if attr.startswith("_"):
+                    continue
+                if not hasattr(proj.weight, attr):
+                    try:
+                        setattr(proj.weight, attr, getattr(old_weight, attr))
+                    except (AttributeError, TypeError):
+                        pass
             del old_weight
 
             # Register .scale buffer for load_state_dict to populate.
