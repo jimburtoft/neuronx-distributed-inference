@@ -6,7 +6,7 @@ NeuronX Distributed Inference implementation of [GLM-4.5 MoE](https://huggingfac
 
 - **HuggingFace ID:** `zai-org/GLM-4.5-Air`
 - **Model Type:** Decoder-only MoE transformer (`Glm4MoeForCausalLM`)
-- **Architecture:** 46 layers, hidden size 4096, 128 routed experts, 2 shared experts
+- **Architecture:** 46 layers, hidden size 4096, 128 routed experts, 1 shared expert
 - **Parameters:** ~70B total, ~9B active per token
 - **License:** [GLM-4 License](https://huggingface.co/zai-org/GLM-4.5-Air)
 
