@@ -232,10 +232,21 @@ class TestSolarOpenAccuracy:
         input_ids, attention_mask = input_ids_and_mask
 
         print("\n[test] Running check_accuracy_logits_v2...")
-        # Note: loose tolerances because this test uses random weights (tiny
-        # 2-layer model) where near-flat logit distributions amplify TP-sharding
-        # numerical noise.  With trained weights the full Solar Open 100B model
-        # passes at the default tolerances (divergence_difference_tol=0.001).
+        # Loose tolerances required for random-weight testing.  Random weights
+        # produce near-flat logit distributions where TP-sharding numerical
+        # noise easily flips the argmax, causing cascading divergences.
+        #
+        # What these tolerances still catch:
+        #   - Weight loading failures (all-zero or garbage logits)
+        #   - Compute graph mismatches (wrong layer wiring, missing ops)
+        #   - Shape errors in expert routing or MoE assembly
+        #
+        # What they intentionally allow:
+        #   - Argmax differences from bf16 rounding across TP shards
+        #   - Cascading divergences after an argmax flip
+        #
+        # With trained weights the full Solar Open 100B model passes at
+        # divergence_difference_tol=0.001 and default tol_map (rtol=0.05).
         random_weight_tol_map = {
             None: (1e-5, 2.0),  # (atol, rtol) — default is 0.05
             1000: (1e-5, 2.0),  # default is 0.03
