@@ -302,7 +302,7 @@ def test_capital_of_france(compiled_model, tokenizer, generation_config):
         tokenizer,
         generation_config,
         "What is the capital of France? Answer in one word.",
-        max_new_tokens=30,
+        max_new_tokens=60,
     )
     # Strip <think></think> tags if present
     clean = response
