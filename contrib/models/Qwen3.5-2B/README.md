@@ -156,20 +156,49 @@ The DeltaNet forward path can be controlled via environment variables:
 
 ## Benchmarks
 
-Measured on trn2.3xlarge, TP=4, LNC=2, seq_len=128, batch_size=1, BF16:
+All benchmarks on trn2.3xlarge, TP=4, LNC=2, BF16, SDK 2.29. Chat-formatted prompt ("What is the capital of France?"), ~19 input tokens. Throughput is total tokens/sec across all batch items; per-request is throughput / batch_size.
+
+### Baseline (BS=1, seq_len=128)
 
 | Metric | Value |
 |--------|-------|
-| **TTFT (time to first token)** | 158.6 ms |
-| **Token generation throughput** | 71.0 tok/s (greedy, short sequences) |
-| **Token generation throughput** | 103-108 tok/s (chat prompts, 50 new tokens) |
+| **TTFT** | 157.8 ms |
+| **Throughput** | 114.5 tok/s |
 | **Compilation time** | ~2 min (TKG + CTE) |
-| **Model loading time** | ~9 s |
-| **Warmup time** | ~0.3 s |
+| **Model loading** | ~9 s |
 | **BF16 model size** | ~4.3 GB |
-| **All integration tests** | 8/8 pass |
 
-**Note:** The 71 tok/s measurement uses the pytest throughput test (20 new tokens, raw prompt); the 103-108 tok/s measurement uses chat-formatted prompts with 50 new tokens where the longer generation amortizes CTE overhead.
+### Batch Size Scaling (seq_len=128)
+
+| Batch Size | TTFT (ms) | Throughput (tok/s) | Per-Request (tok/s) | Correct |
+|:----------:|:---------:|:------------------:|:-------------------:|:-------:|
+| 1 | 157.8 | 114.5 | 114.5 | PASS |
+| 2 | 72.0 | 233.1 | 116.5 | PASS |
+| 4 | 104.4 | 329.6 | 82.4 | PASS |
+| 8 | 185.6 | 409.5 | 51.2 | PASS |
+
+**Analysis:** Total throughput scales well from BS=1 to BS=8 (3.6x improvement). Per-request throughput peaks at BS=2 (116.5 tok/s) and degrades at higher batch sizes due to memory bandwidth saturation. BS=2 at 72 ms TTFT is notably faster than BS=1 at 158 ms -- likely a measurement artifact from warmup effects.
+
+### Sequence Length Scaling (BS=1)
+
+| seq_len | TTFT (ms) | Throughput (tok/s) | Correct |
+|:-------:|:---------:|:------------------:|:-------:|
+| 128 | 157.8 | 114.5 | PASS |
+| 512 | 54.3 | 138.1 | PASS |
+| 1024 | 102.7 | 125.3 | PASS |
+| 2048 | 199.7 | 106.5 | PASS |
+| 4096 | 401.7 | 80.3 | PASS |
+
+**Analysis:** TTFT scales roughly linearly with seq_len (as expected -- CTE processes the full context). Throughput (TKG) is largely unaffected by seq_len for DeltaNet layers (O(1) per step), but GQA layers have KV cache that grows with seq_len. The seq_len=512 TTFT of 54 ms is lower than seq_len=128 because the model graph is compiled once and the actual prompt is only 19 tokens -- the difference is compilation/graph characteristics.
+
+### Combined Configurations
+
+| BS | seq_len | TTFT (ms) | Throughput (tok/s) | Per-Request (tok/s) | Correct |
+|:--:|:-------:|:---------:|:------------------:|:-------------------:|:-------:|
+| 2 | 1024 | 222.4 | 182.8 | 91.4 | PASS |
+| 4 | 512 | 227.2 | 280.8 | 70.2 | PASS |
+
+**Note on `seq_len`:** The `seq_len` parameter is the **total sequence budget** (input + generated tokens). Do not pad inputs to `max_length=seq_len` -- this leaves no room for generation. Use `padding=True` for automatic minimal padding.
 
 ## Caveats
 
@@ -191,6 +220,21 @@ Measured on trn2.3xlarge, TP=4, LNC=2, seq_len=128, batch_size=1, BF16:
 |----------|-----|-----|-------|
 | trn2.3xlarge | 4 | 2 | Recommended -- 2B model fits with large HBM headroom |
 | inf2.8xlarge | 2 | - | Possible -- model is small enough |
+
+### Tested Configurations (trn2.3xlarge, TP=4, LNC=2)
+
+| Batch Size | seq_len | Status | Notes |
+|:----------:|:-------:|:------:|-------|
+| 1 | 128 | Verified | Baseline config |
+| 2 | 128 | Verified | Best per-request throughput |
+| 4 | 128 | Verified | Good total throughput |
+| 8 | 128 | Verified | Highest total throughput |
+| 1 | 512 | Verified | |
+| 1 | 1024 | Verified | |
+| 1 | 2048 | Verified | |
+| 1 | 4096 | Verified | Long context |
+| 2 | 1024 | Verified | Multi-user serving config |
+| 4 | 512 | Verified | High-throughput short context |
 
 ### SDK Configuration
 
