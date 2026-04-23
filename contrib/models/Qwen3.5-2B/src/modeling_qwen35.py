@@ -2200,6 +2200,11 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
         return Qwen35InferenceConfig
 
     @staticmethod
+    def update_state_dict_for_tied_weights(state_dict):
+        """Copy embed_tokens weight to lm_head for tied embeddings."""
+        state_dict["lm_head.weight"] = state_dict["embed_tokens.weight"].clone()
+
+    @staticmethod
     def convert_hf_to_neuron_state_dict(state_dict, config):
         """Strip VL wrapper prefix and convert to NxDI format."""
         new_sd = {}
