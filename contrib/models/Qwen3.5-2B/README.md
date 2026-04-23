@@ -106,6 +106,22 @@ outputs = gen_model.generate(
 print(tokenizer.decode(outputs[0], skip_special_tokens=True))
 ```
 
+**Chat template formatting recommended:** Qwen3.5-2B is a chat model trained with `<|im_start|>`/`<|im_end|>` formatting. Raw text prompts may produce echoey output. Use `tokenizer.apply_chat_template()` for best results:
+
+```python
+messages = [{"role": "user", "content": "What is the capital of France?"}]
+text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+inputs = tokenizer(text, padding=True, return_tensors="pt")
+outputs = gen_model.generate(
+    inputs.input_ids,
+    generation_config=gen_config,
+    attention_mask=inputs.attention_mask,
+    max_new_tokens=80,
+)
+print(tokenizer.decode(outputs[0], skip_special_tokens=True))
+# Output: "The capital of France is **Paris**."
+```
+
 ### Vision-Language (trn2.3xlarge, TP=4)
 
 The VL pipeline uses the text decoder on Neuron and the vision encoder on CPU:
@@ -144,22 +160,30 @@ Measured on trn2.3xlarge, TP=4, LNC=2, seq_len=128, batch_size=1, BF16:
 
 | Metric | Value |
 |--------|-------|
-| **TTFT (time to first token)** | 158.9 ms |
-| **Token generation throughput** | 70.6 tok/s |
+| **TTFT (time to first token)** | 158.6 ms |
+| **Token generation throughput** | 71.0 tok/s (greedy, short sequences) |
+| **Token generation throughput** | 103-108 tok/s (chat prompts, 50 new tokens) |
 | **Compilation time** | ~2 min (TKG + CTE) |
 | **Model loading time** | ~9 s |
-| **Warmup time** | ~0.5 s |
+| **Warmup time** | ~0.3 s |
 | **BF16 model size** | ~4.3 GB |
+| **All integration tests** | 8/8 pass |
+
+**Note:** The 71 tok/s measurement uses the pytest throughput test (20 new tokens, raw prompt); the 103-108 tok/s measurement uses chat-formatted prompts with 50 new tokens where the longer generation amortizes CTE overhead.
 
 ## Caveats
 
 1. **SDK 2.29+ required:** The NKI DeltaNet kernels require NKI 0.3.0 (SDK 2.29). No library modifications needed -- runs on stock SDK 2.29 DLAMI (`/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/`).
 
-2. **No mini model test:** DeltaNet layers require NKI kernels that only execute on Neuron devices. Integration tests require a trn2 instance with model weights.
+2. **Chat template required for quality output:** Qwen3.5-2B is a chat model. Raw text prompts (e.g., `"The capital of France is"`) produce echoey/repetitive output. Always use `tokenizer.apply_chat_template()` for correct responses.
 
-3. **+1 RMSNorm convention:** Qwen3.5 uses `output = norm(x) * (1 + weight)` for most RMSNorm layers, but DeltaNet internal norms use standard `output = norm(x) * weight`. The weight conversion handles this automatically, but custom weight loading must be aware of both conventions.
+3. **No mini model test:** DeltaNet layers require NKI kernels that only execute on Neuron devices. Integration tests require a trn2 instance with model weights.
 
-4. **Neumann series convergence:** The fused DeltaNet kernel uses a 6-round Neumann series for intra-chunk correction. This requires L2-normalized Q and K inputs. Unnormalized inputs will cause NaN divergence.
+4. **+1 RMSNorm convention:** Qwen3.5 uses `output = norm(x) * (1 + weight)` for most RMSNorm layers, but DeltaNet internal norms use standard `output = norm(x) * weight`. The weight conversion handles this automatically, but custom weight loading must be aware of both conventions.
+
+5. **Neumann series convergence:** The fused DeltaNet kernel uses a 6-round Neumann series for intra-chunk correction. This requires L2-normalized Q and K inputs. Unnormalized inputs will cause NaN divergence.
+
+6. **DeltaNet state persistence:** DeltaNet recurrent and conv1d state buffers persist in HBM via `input_output_aliases`, the same mechanism used for KV cache. Both CTE and TKG share the same JIT ScriptModule, so state is automatically shared. The `_copy_past_key_values` override is only used for CPU execution paths (not on Neuron hardware).
 
 ## Compatibility Matrix
 
