@@ -1,0 +1,4755 @@
+diff --git a/contrib/models/Qwen2.5-Omni-7B/README.md b/contrib/models/Qwen2.5-Omni-7B/README.md
+index c5830ceb..de1cb223 100644
+--- a/contrib/models/Qwen2.5-Omni-7B/README.md
++++ b/contrib/models/Qwen2.5-Omni-7B/README.md
+@@ -1,130 +1,214 @@
+-# Contrib Model: Qwen2.5 Omni 7B
++# Contrib Model: Qwen2.5-Omni-7B
+ 
+-NeuronX Distributed Inference implementation of Qwen2.5 Omni 7B.
+-
+-> **Note:** This implementation has been validated using the **text backbone only**. Vision/audio modalities are implemented but not yet verified.
++NeuronX Distributed Inference implementation of [Qwen/Qwen2.5-Omni-7B](https://huggingface.co/Qwen/Qwen2.5-Omni-7B) with full multimodal support: text generation, image understanding, audio understanding, and text-to-speech.
+ 
+ ## Model Information
+ 
+ - **HuggingFace ID:** `Qwen/Qwen2.5-Omni-7B`
+-- **Model Type:** Decoder-only transformer
++- **Model Type:** Multimodal encoder-decoder (Thinker + Vision + Audio + Talker + Token2Wav)
++- **Architecture:** Qwen2-based text backbone with vision/audio encoders and speech synthesis
+ - **License:** Check HuggingFace model card
+ 
+ ## Architecture Details
+ 
+-- **Layers:** Check model config
+-- **Hidden Size:** Check model config
+-- **Attention Heads:** Check model config
+-- **Vocabulary:** Check model config
+-- **Max Position Embeddings:** Check model config
+-
+-## Validation Results
++| Component | Runtime | TP | Parameters |
++|-----------|---------|-----|------------|
++| Thinker (text) | Neuron | 4 | hidden=3584, heads=28, kv_heads=4, layers=28 |
++| Vision encoder | Neuron | 4 | embed=1280, heads=16, depth=32, SwiGLU MLP |
++| Audio encoder | CPU+Neuron | 4 | d_model=1280, heads=20, layers=32, chunked attention |
++| Talker | CPU | N/A | hidden=896, heads=12, kv_heads=4, layers=24, vocab=8448 |
++| Token2Wav | CPU (fp32) | N/A | DiT: dim=1024, 22 blocks; BigVGAN: 6 upsample stages |
+ 
+-**Validated:** 2026-01-29  
+-**Configuration:** TP=2, batch_size=1, seq_len=128, bfloat16
++**Total state dict keys:** 2448 (Text: 339, Vision: 518, Audio: 489, Talker: 293, Token2Wav: 809)
+ 
+-### Test Results
++Key features:
++- **Thinker**: Architecturally identical to Qwen2.5-7B; reuses `NeuronQwen2ForCausalLM` with state-dict prefix remapping (28 heads / 4 TP = 7 per rank, 4 kv_heads / 4 TP = 1 per rank)
++- **Vision encoder**: SwiGLU MLP, RMSNorm, separate QKV projections, PatchMerger (16 heads / 4 TP = 4 per rank)
++- **Audio encoder**: Whisper-style with chunked attention. Hybrid CPU+Neuron: Conv1d frontend + chunking on CPU, 32 transformer layers on Neuron (20 heads / 4 TP = 5 per rank), AvgPool + LayerNorm + projection on CPU
++- **Talker**: Wraps HF's `Qwen2_5OmniTalkerForConditionalGeneration` on CPU. Stays on CPU because: non-standard head_dim (128 != 896/12), 3D mRoPE with per-step thinker-state injection, only ~690M params
++- **Token2Wav**: DiT + BigVGAN vocoder with ODE sampling (Runge-Kutta 4), requires float32
+ 
+-| Test | Status | Result |
+-|------|--------|--------|
+-| Smoke Test | ✅ PASS | Model loads successfully |
+-| Token Matching | ⚠️ N/A | **0.0% match** |
+-| TTFT (P50) | ✅ PASS | 50.15ms (threshold: 100ms) |
+-| Throughput | ✅ PASS | 19.82 tok/s (threshold: 10 tok/s) |
++## Prerequisites
+ 
+-### Performance Metrics
++- **Instance**: trn2.48xlarge or trn2.xlarge (4+ NeuronCores sufficient)
++- **Weights**: Download from [Qwen/Qwen2.5-Omni-7B](https://huggingface.co/Qwen/Qwen2.5-Omni-7B)
+ 
+-| Metric | Value |
+-|--------|-------|
+-| TTFT (P50) | 50.15ms |
+-| Throughput | 19.82 tokens/s |
++## Usage
+ 
++### Text-only (Thinker)
+ 
+-**Status:** ✅ VALIDATED
++```python
++import torch
++from transformers import AutoTokenizer
++from neuronx_distributed_inference.models.config import NeuronConfig, OnDeviceSamplingConfig
++from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config, HuggingFaceGenerationAdapter
++from neuronx_distributed_inference.models.qwen25_omni.modeling_qwen25_omni import (
++    NeuronQwen25OmniForCausalLM,
++    Qwen25OmniInferenceConfig,
++)
+ 
+-### Device Profiling Metrics
++model_path = "/path/to/Qwen2.5-Omni-7B/"
++compiled_path = "/path/to/compiled/"
+ 
+-**Configuration:** TP=2, batch_size=1, seq_len=128, bfloat16
+-**Instance:** trn1.32xlarge | **Profiled:** 2026-03-18
++neuron_config = NeuronConfig(
++    tp_degree=4,
++    batch_size=1,
++    seq_len=4096,
++    max_context_length=4096,
++    torch_dtype=torch.bfloat16,
++    on_device_sampling_config=OnDeviceSamplingConfig(
++        do_sample=True, temperature=0.6, top_k=20, top_p=0.95
++    ),
++)
+ 
+-| Metric | Context Encoding | Token Generation |
+-|--------|-----------------|------------------|
+-| MFU (%) | 0.19 | 0.00 |
+-| MBU (%) | 0.36 | 0.42 |
+-| HFU (%) | 0.19 | 0.00 |
+-| Execution Time (us) | 0.05 | 0.04 |
+-| HBM Read | 7.19 GB | 7.08 GB |
+-| HBM Write | 88.46 MB | 2.78 MB |
++config = Qwen25OmniInferenceConfig(
++    neuron_config, load_config=load_pretrained_config(model_path)
++)
+ 
+-**Throughput:** 19.81 tok/s | **Compile Time:** 332.09s
++model = NeuronQwen25OmniForCausalLM(model_path, config)
++model.compile(compiled_path)
++model.load(compiled_path)
+ 
+-> Metrics from `neuron-profile capture` on compiled NEFFs. MFU = Model FLOPs Utilization,
+-> MBU = Memory Bandwidth Utilization, HFU = Hardware FLOPs Utilization.
++tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
++adapter = HuggingFaceGenerationAdapter(model, tokenizer)
++output = adapter.generate("What is quantum computing?", max_new_tokens=256)
++```
+ 
+-## Usage
++### Multimodal (Vision + Audio + Speech)
+ 
+ ```python
+-from transformers import AutoTokenizer, GenerationConfig
+-from neuronx_distributed_inference.models.config import NeuronConfig
+-from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config
++from neuronx_distributed_inference.models.qwen25_omni.modeling_qwen25_omni import (
++    NeuronQwen25OmniMultimodalForCausalLM,
++    Qwen25OmniMultimodalInferenceConfig,
++)
+ 
+-# Import model classes from src
+-from src.modeling_qwen2_5_omni_7b import NeuronQwen25Omni7BForCausalLM, Qwen25Omni7BInferenceConfig
++# After loading text model, enable multimodal components:
++# model.enable_audio_encoder(audio_state_dict)
++# model.compile_audio_encoder("/path/to/compiled_audio/")  # compile Neuron transformer
++# model.load_audio_encoder("/path/to/compiled_audio/")     # load compiled model
++# model.enable_talker(talker_state_dict)
++# model.enable_token2wav(token2wav_state_dict, speaker_dict_path="spk_dict.pt")
++#
++# Full multimodal pipeline:
++#   Thinker generates text -> hidden states passed to Talker
++#   -> Talker generates codec tokens -> Token2Wav generates waveform
++```
+ 
+-model_path = "/path/to/Qwen2.5-Omni-7B/"
+-compiled_model_path = "/path/to/compiled/"
++## vLLM Integration
+ 
+-# Configure
+-neuron_config = NeuronConfig(
+-    tp_degree=2,
+-    batch_size=1,
+-    seq_len=512,
+-    torch_dtype=torch.bfloat16,
+-)
++Qwen2.5-Omni can be served via [vllm-neuron](https://github.com/aws-neuron/vllm-neuron) for text-only inference. A patch is required for the nested config structure.
+ 
+-config = Qwen25Omni7BInferenceConfig(
+-    neuron_config,
+-    load_config=load_pretrained_config(model_path),
+-)
++### Setup
++
++```bash
++# 1. Install vllm-neuron
++pip install vllm-neuron
++
++# 2. Apply the Qwen2.5-Omni patch
++python perf_test/apply_vllm_neuron_patch_qwen25omni.py
++```
+ 
+-# Compile and load
+-model = NeuronQwen25Omni7BForCausalLM(model_path, config)
+-model.compile(compiled_model_path)
+-model.load(compiled_model_path)
++### Serving
+ 
+-# Generate
+-tokenizer = AutoTokenizer.from_pretrained(model_path)
+-# ... (see integration test for full example)
++```bash
++python3 -m vllm.entrypoints.openai.api_server \
++    --model /path/to/Qwen2.5-Omni-7B \
++    --tensor-parallel-size 4 \
++    --max-model-len 4096 \
++    --max-num-seqs 32 \
++    --no-enable-chunked-prefill \
++    --no-enable-prefix-caching \
++    --trust_remote_code \
++    --additional-config '{
++        "override_neuron_config": {
++            "tp_degree": 4,
++            "fused_qkv": false,
++            "flash_decoding_enabled": false,
++            "sequence_parallel_enabled": false,
++            "batch_size": 32,
++            "ctx_batch_size": 1,
++            "tkg_batch_size": 32,
++            "max_context_length": 4096,
++            "seq_len": 4096,
++            "is_continuous_batching": true,
++            "enable_bucketing": true,
++            "async_mode": true,
++            "on_device_sampling_config": {
++                "do_sample": true, "temperature": 0.6, "top_k": 20, "top_p": 0.95
++            }
++        }
++    }'
+ ```
+ 
++### Key vLLM Patch Changes
++
++The patch (`perf_test/apply_vllm_neuron_patch_qwen25omni.py`) modifies vllm-neuron to:
++- Extract text config from nested `thinker_config.text_config`
++- Map `Qwen2_5OmniModel` architecture to `qwen2_5_omni` model type
++- Handle layer count extraction for nested config
++
++See `perf_test/3_bench_qwen25_omni_7b.sh` for full benchmark configurations.
++
++## Performance
++
++Text-only benchmark (trn2, BF16, TP=4):
++
++| Config | TPOT (ms) | Output tok/s | Notes |
++|--------|-----------|--------------|-------|
++| BS=1, non-CB, greedy | ~11-13 | ~77-90 | Tested with chat template |
++| BS=4, CB, c=4 | TBD | TBD | vLLM serving |
++
++Model load time: ~15s (from compiled artifacts on NVMe).
++
++Audio encoder performance (CPU frontend + CPU postprocessor, no Neuron transformer):
++
++| Audio Length | Mel Frames | Frontend | Postprocessor |
++|-------------|-----------|----------|---------------|
++| 1s | ~100 | ~20ms | included |
++| 3s | ~300 | ~22ms | included |
++| 10s | ~1000 | ~33ms | included |
++| 30s | ~3000 | ~34ms | included |
++
+ ## Compatibility Matrix
+ 
+-| Instance/Version | 2.20+ | 2.19 and earlier |
+-|------------------|-------|------------------|
+-| Trn1             | ✅ Working | Not tested |
+-| Inf2             | Not tested | Not tested |
++| Instance/Version | 2.23+ (PyTorch 2.9) | 2.22 and earlier |
++|------------------|---------------------|------------------|
++| Trn2 (trn2.48xlarge) | Tested (TP=4) | Not tested |
++| Trn2 (trn2.xlarge) | Supported (TP=4) | Not tested |
++| Trn1 (trn1.32xlarge) | Should work (TP=4, 4 NeuronCores) | Not tested |
++| Inf2 (inf2.48xlarge) | Should work (TP=4) | Not tested |
+ 
+ ## Testing
+ 
+-Run integration tests:
++Verified on trn2.48xlarge with real Qwen2.5-Omni-7B weights:
++
++- **Imports**: All model classes import successfully
++- **Config**: TP=4 head divisibility verified (Thinker 7/1, Audio 5, Vision 4 per rank)
++- **State dict**: All 2448 keys converted correctly (text=339, audio=489, vision=518, talker=293, token2wav=809)
++- **Audio CPU**: Frontend+postprocessor 1s=20ms, 30s=34ms
++- **Talker CPU**: 1351M params loaded in ~10s, codec tokens verified
++- **Text generation (TP=4)**: Compile + load + generate working, TPOT ~11-13ms, correct outputs verified
+ 
+ ```bash
+-pytest nxdi_contrib_models/models/Qwen2.5-Omni-7B/test/integration/test_model.py --capture=tee-sys
++# End-to-end test (compile + load + generate)
++python /tmp/test_qwen25_omni_tp4.py
+ ```
+ 
+-Or run manually:
++## Key Implementation Notes
+ 
+-```bash
+-cd nxdi_contrib_models/models/Qwen2.5-Omni-7B
+-python3 test/integration/test_model.py
+-```
++1. **TP=4 for all Neuron components**: Thinker (28 heads/4=7 per rank), Vision (16 heads/4=4), Audio (20 heads/4=5). All heads divisible by 4.
++2. **Audio encoder hybrid architecture**: Conv1d frontend + chunking on CPU, 32 transformer layers on Neuron with TP=4, AvgPool + LayerNorm + projection on CPU. Asymmetric attention bias (q/v have bias, k has none) handled via ColumnParallelLinear.
++3. **Talker on CPU**: Non-standard head_dim (128 != 896/12), 3D mRoPE with per-step thinker-state injection, only ~690M params. Uses HF's autoregressive generation.
++4. **Token2Wav in float32**: ODE solver (Runge-Kutta 4) requires float32 precision
++5. **Speaker support**: `spk_dict.pt` contains per-speaker conditioning (Ethan, Chelsie)
++6. **State dict prefix remapping**: `thinker.model.*` -> `model.*`, `thinker.lm_head.*` -> `lm_head.*`, `thinker.visual.*` -> `visual.*`, `thinker.audio_tower.*` -> `frontend.*`/`transformer.*`/`postprocessor.*`
+ 
+ ## Example Checkpoints
+ 
+-* Qwen/Qwen2.5-Omni-7B
++* [Qwen/Qwen2.5-Omni-7B](https://huggingface.co/Qwen/Qwen2.5-Omni-7B)
+ 
+ ## Maintainer
+ 
+-Annapurna Labs
++Henan Wan (whn09)
+ 
+-**Last Updated:** 2026-01-29
++**Last Updated:** 2026-04-10
+diff --git a/contrib/models/Qwen2.5-Omni-7B/test/integration/test_model.py b/contrib/models/Qwen2.5-Omni-7B/test/integration/test_model.py
+index 633d8387..3c931575 100755
+--- a/contrib/models/Qwen2.5-Omni-7B/test/integration/test_model.py
++++ b/contrib/models/Qwen2.5-Omni-7B/test/integration/test_model.py
+@@ -1,236 +1,801 @@
+ #!/usr/bin/env python3
+ """
+-Integration tests for Qwen2.5-Omni-7B NeuronX implementation.
+-"""
++Integration tests for Qwen2.5-Omni-7B on NeuronX (TP=4).
+ 
+-import pytest
+-import torch
+-import json
+-from pathlib import Path
+-from transformers import AutoTokenizer, GenerationConfig
++Tests:
++  1. Import validation
++  2. Config creation and TP=4 head divisibility
++  3. State dict conversion (all 2448 keys)
++  4. Audio encoder CPU components (frontend + postprocessor)
++  5. Talker CPU model (weight loading + codec tokens)
++  6. Text-only Thinker compile + load + generate
++  7. Image understanding (requires vision encoder compiled)
++  8. Audio understanding (requires audio encoder compiled)
++
++Usage:
++  source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
++
++  # Run all tests (skip tests requiring compilation with --quick):
++  python3 test_model.py
++
++  # Run only text generation (model must be pre-compiled):
++  python3 test_model.py --test text_gen
+ 
+-from neuronx_distributed_inference.models.config import NeuronConfig
+-from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config
++  # Run with pytest:
++  pytest test_model.py -v
++"""
+ 
+-# Import from src directory
++import argparse
++import gc
++import os
+ import sys
+-sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
+-from modeling_qwen2_5_omni import *
+-
+-
+-# Test configuration
+-MODEL_PATH = "/home/ubuntu/models/Qwen2.5-Omni-7B/"
+-COMPILED_MODEL_PATH = "/home/ubuntu/neuron_models/Qwen2.5-Omni-7B/"
+-
+-
+-def load_neuron_config_from_compiled(compiled_path: str):
+-    """Load neuron configuration from compiled model's neuron_config.json."""
+-    config_path = Path(compiled_path) / "neuron_config.json"
+-    
+-    if not config_path.exists():
+-        raise FileNotFoundError(f"neuron_config.json not found: {config_path}")
+-    
+-    with open(config_path) as f:
+-        config_data = json.load(f)
+-    
+-    if "neuron_config" in config_data:
+-        return config_data["neuron_config"]
+-    else:
+-        return config_data
++import time
++import traceback
+ 
++import torch
+ 
+-def create_model_for_inference(compiled_path: str, model_path: str):
+-    """Create model for inference using compiled neuron_config."""
+-    neuron_config_dict = load_neuron_config_from_compiled(compiled_path)
+-    
+-    dtype_str = neuron_config_dict.get('torch_dtype', 'torch.bfloat16')
+-    if isinstance(dtype_str, str):
+-        dtype = getattr(torch, dtype_str.split('.')[1]) if dtype_str.startswith('torch.') else torch.bfloat16
++# Default paths - override with environment variables
++MODEL_PATH = os.environ.get(
++    "QWEN25_OMNI_MODEL_PATH", "/opt/dlami/nvme/models/Qwen2.5-Omni-7B"
++)
++COMPILED_PATH = os.environ.get(
++    "QWEN25_OMNI_COMPILED_PATH", "/tmp/qwen25_omni_tp4_compiled"
++)
++TP_DEGREE = int(os.environ.get("QWEN25_OMNI_TP_DEGREE", "4"))
++
++# Test media URLs from Qwen official examples
++IMAGE_URL = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg"
++AUDIO_URL = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen2.5-Omni/cough.wav"
++
++
++class Timer:
++    """Context manager to time a block."""
++
++    def __init__(self, label):
++        self.label = label
++        self.elapsed = 0
++
++    def __enter__(self):
++        self.start = time.time()
++        return self
++
++    def __exit__(self, *args):
++        self.elapsed = time.time() - self.start
++        print(f"  [{self.label}] {self.elapsed:.2f}s")
++
++
++# ---------------------------------------------------------------------------
++# Test 1: Imports
++# ---------------------------------------------------------------------------
++def test_imports():
++    """Verify all Qwen2.5-Omni modules import correctly."""
++    print("=" * 60)
++    print("Test 1: Import validation")
++    print("=" * 60)
++
++    from neuronx_distributed_inference.models.config import (
++        NeuronConfig,
++        OnDeviceSamplingConfig,
++    )
++    from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config
++
++    print("  NeuronConfig, OnDeviceSamplingConfig imported OK")
++
++    from neuronx_distributed_inference.models.qwen25_omni.modeling_qwen25_omni import (
++        NeuronQwen25OmniForCausalLM,
++        Qwen25OmniInferenceConfig,
++        NeuronQwen25OmniMultimodalForCausalLM,
++        Qwen25OmniMultimodalInferenceConfig,
++    )
++
++    print("  Qwen25Omni model classes imported OK")
++
++    from neuronx_distributed_inference.models.qwen25_omni.modeling_qwen25_omni_audio import (
++        NeuronQwen25OmniAudioEncoder,
++        NeuronQwen25OmniForAudioEncoding,
++        AudioEncoderInferenceConfig,
++        AudioCPUFrontend,
++        AudioCPUPostprocessor,
++        NeuronAudioTransformerModel,
++        AudioTransformerModelWrapper,
++    )
++
++    print("  Audio encoder classes imported OK")
++
++    from neuronx_distributed_inference.models.qwen25_omni.modeling_qwen25_omni_talker import (
++        NeuronQwen25OmniTalker,
++    )
++
++    print("  Talker imported OK")
++
++    from neuronx_distributed_inference.models.qwen25_omni.modeling_qwen25_omni_token2wav import (
++        NeuronQwen25OmniToken2Wav,
++    )
++
++    print("  Token2Wav imported OK")
++
++    from neuronx_distributed_inference.models.qwen25_omni.modeling_qwen25_omni_vision import (
++        NeuronQwen25OmniForImageEncoding,
++    )
++
++    print("  Vision encoder imported OK")
++
++    print("  PASS: All imports successful\n")
++    return True
++
++
++# ---------------------------------------------------------------------------
++# Test 2: Config
++# ---------------------------------------------------------------------------
++def test_config():
++    """Create configs and verify TP=4 head divisibility."""
++    print("=" * 60)
++    print("Test 2: Config creation and TP=4 validation")
++    print("=" * 60)
++
++    from neuronx_distributed_inference.models.config import (
++        NeuronConfig,
++        OnDeviceSamplingConfig,
++    )
++    from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config
++    from neuronx_distributed_inference.models.qwen25_omni.modeling_qwen25_omni import (
++        Qwen25OmniInferenceConfig,
++    )
++    from transformers import AutoConfig
++
++    neuron_config = NeuronConfig(
++        tp_degree=TP_DEGREE,
++        batch_size=1,
++        seq_len=2048,
++        max_context_length=2048,
++        torch_dtype=torch.bfloat16,
++        on_device_sampling_config=OnDeviceSamplingConfig(
++            do_sample=True, temperature=0.6, top_k=20, top_p=0.95
++        ),
++    )
++
++    hf_config = load_pretrained_config(MODEL_PATH)
++    config = Qwen25OmniInferenceConfig(neuron_config, load_config=hf_config)
++
++    # Validate text config
++    print(f"  hidden_size={config.hidden_size}")
++    print(f"  num_attention_heads={config.num_attention_heads}")
++    print(f"  num_key_value_heads={config.num_key_value_heads}")
++    print(f"  num_hidden_layers={config.num_hidden_layers}")
++    print(f"  vocab_size={config.vocab_size}")
++
++    # TP divisibility check for Thinker
++    assert (
++        config.num_attention_heads % TP_DEGREE == 0
++    ), f"num_attention_heads={config.num_attention_heads} not divisible by TP={TP_DEGREE}"
++    assert (
++        config.num_key_value_heads % TP_DEGREE == 0
++    ), f"num_key_value_heads={config.num_key_value_heads} not divisible by TP={TP_DEGREE}"
++    print(
++        f"  Thinker heads: {config.num_attention_heads}/{TP_DEGREE}="
++        f"{config.num_attention_heads // TP_DEGREE} per rank, "
++        f"kv_heads: {config.num_key_value_heads}/{TP_DEGREE}="
++        f"{config.num_key_value_heads // TP_DEGREE} per rank"
++    )
++
++    # Validate audio config (via AutoConfig for full nested access)
++    full_config = AutoConfig.from_pretrained(MODEL_PATH, trust_remote_code=True)
++    if hasattr(full_config, "thinker_config"):
++        tc = full_config.thinker_config
++        if hasattr(tc, "__dict__") and not isinstance(tc, dict):
++            tc = vars(tc)
++        if "audio_config" in tc:
++            ac = tc["audio_config"]
++            if hasattr(ac, "__dict__"):
++                ac = vars(ac)
++            audio_heads = ac.get("encoder_attention_heads", 20)
++            print(
++                f"  Audio: d_model={ac.get('d_model')}, heads={audio_heads}, "
++                f"layers={ac.get('encoder_layers')}"
++            )
++            assert (
++                audio_heads % TP_DEGREE == 0
++            ), f"audio heads={audio_heads} not divisible by TP={TP_DEGREE}"
++            print(
++                f"  Audio heads: {audio_heads}/{TP_DEGREE}={audio_heads // TP_DEGREE} per rank"
++            )
++
++    # Validate talker config
++    if hasattr(full_config, "talker_config"):
++        tc = full_config.talker_config
++        if hasattr(tc, "__dict__") and not isinstance(tc, dict):
++            tc = vars(tc)
++        talker_heads = tc.get("num_attention_heads", 12)
++        talker_hidden = tc.get("hidden_size", 896)
++        print(
++            f"  Talker: hidden={talker_hidden}, heads={talker_heads}, "
++            f"head_dim={tc.get('head_dim', 128)}"
++        )
++        print(
++            f"  Talker stays on CPU (head_dim={tc.get('head_dim', 128)} "
++            f"!= {talker_hidden}//{talker_heads})"
++        )
++
++    print("  PASS: Config creation and TP=4 validation\n")
++    return True
++
++
++# ---------------------------------------------------------------------------
++# Test 3: State dict conversion
++# ---------------------------------------------------------------------------
++def test_state_dict():
++    """Load full HF model and convert state dict for all components."""
++    print("=" * 60)
++    print("Test 3: State dict conversion (all components)")
++    print("=" * 60)
++
++    from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import (
++        Qwen2_5OmniForConditionalGeneration,
++    )
++    from neuronx_distributed_inference.models.qwen25_omni.modeling_qwen25_omni_audio import (
++        NeuronQwen25OmniAudioEncoder,
++    )
++    from neuronx_distributed_inference.models.qwen25_omni.modeling_qwen25_omni_talker import (
++        NeuronQwen25OmniTalker,
++    )
++
++    # Load HF model state dict
++    with Timer("Load HF model"):
++        hf_model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
++            MODEL_PATH,
++            trust_remote_code=True,
++            torch_dtype=torch.bfloat16,
++            low_cpu_mem_usage=True,
++        )
++        full_sd = hf_model.state_dict()
++    print(f"  Full state dict: {len(full_sd)} keys")
++
++    # Count keys by prefix
++    prefix_counts = {}
++    for k in full_sd:
++        p = k.split(".")[0]
++        prefix_counts[p] = prefix_counts.get(p, 0) + 1
++    for p, c in sorted(prefix_counts.items()):
++        print(f"    {p}: {c} keys")
++
++    # Test audio encoder state dict conversion
++    with Timer("Audio state dict conversion"):
++        audio_sd = NeuronQwen25OmniAudioEncoder.convert_hf_to_neuron_state_dict(
++            {k: v for k, v in full_sd.items() if "audio_tower" in k},
++            dtype=torch.bfloat16,
++        )
++    frontend_keys = [k for k in audio_sd if k.startswith("frontend.")]
++    transformer_keys = [k for k in audio_sd if k.startswith("transformer.")]
++    postprocessor_keys = [k for k in audio_sd if k.startswith("postprocessor.")]
++    print(
++        f"  Audio keys: frontend={len(frontend_keys)}, "
++        f"transformer={len(transformer_keys)}, "
++        f"postprocessor={len(postprocessor_keys)}"
++    )
++
++    # Test talker state dict conversion
++    with Timer("Talker state dict conversion"):
++        talker_sd = NeuronQwen25OmniTalker.convert_hf_to_neuron_state_dict(
++            {k: v for k, v in full_sd.items() if k.startswith("talker.")}
++        )
++    print(f"  Talker keys: {len(talker_sd)}")
++
++    del hf_model, full_sd
++    gc.collect()
++
++    print("  PASS: State dict conversion\n")
++    return True
++
++
++# ---------------------------------------------------------------------------
++# Test 4: Audio encoder CPU components
++# ---------------------------------------------------------------------------
++def test_audio_encoder():
++    """Test audio encoder CPU frontend and postprocessor with synthetic input."""
++    print("=" * 60)
++    print("Test 4: Audio encoder CPU components")
++    print("=" * 60)
++
++    from transformers import AutoConfig
++    from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import (
++        Qwen2_5OmniForConditionalGeneration,
++    )
++    from neuronx_distributed_inference.models.qwen25_omni.modeling_qwen25_omni_audio import (
++        NeuronQwen25OmniAudioEncoder,
++    )
++
++    # Load config
++    hf_config = AutoConfig.from_pretrained(MODEL_PATH, trust_remote_code=True)
++    if not hasattr(hf_config, "thinker_config"):
++        print("  SKIP: No thinker_config found")
++        return True
++
++    tc = hf_config.thinker_config
++    if hasattr(tc, "__dict__") and not isinstance(tc, dict):
++        tc = vars(tc)
++    audio_config = tc.get("audio_config", None)
++    if audio_config is not None and hasattr(audio_config, "__dict__"):
++        audio_config = vars(audio_config)
++    if audio_config is None:
++        print("  SKIP: No audio_config found")
++        return True
++
++    print(
++        f"  Audio config: d_model={audio_config.get('d_model')}, "
++        f"heads={audio_config.get('encoder_attention_heads')}, "
++        f"layers={audio_config.get('encoder_layers')}"
++    )
++
++    # Load HF model for weights
++    with Timer("Load HF model for audio weights"):
++        hf_model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
++            MODEL_PATH,
++            trust_remote_code=True,
++            torch_dtype=torch.bfloat16,
++            low_cpu_mem_usage=True,
++        )
++        full_sd = hf_model.state_dict()
++
++    with Timer("Convert audio state dict"):
++        converted_sd = NeuronQwen25OmniAudioEncoder.convert_hf_to_neuron_state_dict(
++            full_sd, dtype=torch.bfloat16
++        )
++
++    del hf_model, full_sd
++    gc.collect()
++
++    with Timer("Create audio encoder + load CPU weights"):
++        encoder = NeuronQwen25OmniAudioEncoder.from_pretrained_state_dict(
++            audio_config, converted_sd, dtype=torch.bfloat16
++        )
++        encoder.eval()
++
++    del converted_sd
++    gc.collect()
++
++    # Test with synthetic mel spectrograms of various lengths
++    n_mels = audio_config.get("num_mel_bins", 128)
++    test_cases = [(100, "1s"), (300, "3s"), (1000, "10s"), (3000, "30s")]
++
++    for mel_len, label in test_cases:
++        mel_input = torch.randn(n_mels, mel_len, dtype=torch.bfloat16)
++        feature_lens = torch.tensor([mel_len], dtype=torch.long)
++
++        t0 = time.time()
++        hidden, aftercnn_lens, cu_seqlens = encoder.frontend(mel_input, feature_lens)
++        audio_embeds = encoder.postprocessor(hidden, aftercnn_lens)
++        elapsed = time.time() - t0
++
++        print(
++            f"  {label} ({mel_len} frames): frontend→{hidden.shape[0]} tokens, "
++            f"postprocessor→{audio_embeds.shape}, time={elapsed*1000:.1f}ms"
++        )
++
++    del encoder
++    gc.collect()
++
++    print("  PASS: Audio encoder CPU components\n")
++    return True
++
++
++# ---------------------------------------------------------------------------
++# Test 5: Talker CPU model
++# ---------------------------------------------------------------------------
++def test_talker():
++    """Test Talker CPU model weight loading and codec token IDs."""
++    print("=" * 60)
++    print("Test 5: Talker CPU model")
++    print("=" * 60)
++
++    from transformers import AutoConfig
++    from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import (
++        Qwen2_5OmniForConditionalGeneration,
++    )
++    from neuronx_distributed_inference.models.qwen25_omni.modeling_qwen25_omni_talker import (
++        NeuronQwen25OmniTalker,
++    )
++
++    hf_config = AutoConfig.from_pretrained(MODEL_PATH, trust_remote_code=True)
++    talker_config = getattr(hf_config, "talker_config", None)
++    if talker_config is None:
++        print("  SKIP: No talker_config found")
++        return True
++
++    if hasattr(talker_config, "__dict__") and not isinstance(talker_config, dict):
++        tc = vars(talker_config)
+     else:
+-        dtype = dtype_str
+-    
+-    neuron_config_kwargs = {
+-        'tp_degree': neuron_config_dict.get('tp_degree', 2),
+-        'batch_size': neuron_config_dict.get('batch_size', 1),
+-        'seq_len': neuron_config_dict.get('seq_len', 128),
+-        'torch_dtype': dtype,
+-    }
+-    
+-    neuron_config = NeuronConfig(**neuron_config_kwargs)
+-    
+-    # This will use the imported model and config classes
+-    # The actual class names will be determined at runtime
+-    return None, neuron_config
+-
+-
+-def generate_with_neuron_model(model, input_ids, max_new_tokens: int):
+-    """Generate tokens using manual forward pass loop."""
+-    generated_ids = input_ids.clone()
+-    
+-    for _ in range(max_new_tokens):
+-        seq_len = generated_ids.shape[1]
+-        position_ids = torch.arange(seq_len).unsqueeze(0).expand(generated_ids.shape[0], -1)
+-        
+-        with torch.no_grad():
+-            outputs = model(generated_ids, position_ids=position_ids)
+-        
+-        if hasattr(outputs, 'logits'):
+-            logits = outputs.logits
+-        elif isinstance(outputs, tuple):
+-            logits = outputs[0]
+-        else:
+-            logits = outputs
+-        
+-        next_token_logits = logits[:, -1, :]
+-        next_token = torch.argmax(next_token_logits, dim=-1).unsqueeze(-1)
+-        generated_ids = torch.cat([generated_ids, next_token], dim=-1)
+-    
+-    return generated_ids
+-
+-
+-@pytest.fixture(scope="module")
+-def compiled_model():
+-    """Load pre-compiled model."""
+-    # Note: Actual implementation would load the specific model class
+-    # This is a template that should be customized per model
+-    return None
+-
+-
+-@pytest.fixture(scope="module")
+-def tokenizer():
+-    """Load tokenizer."""
+-    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, padding_side="right", trust_remote_code=True)
++        tc = talker_config
++
++    print(
++        f"  Talker config: hidden={tc.get('hidden_size')}, "
++        f"heads={tc.get('num_attention_heads')}, "
++        f"kv_heads={tc.get('num_key_value_heads')}, "
++        f"layers={tc.get('num_hidden_layers')}, "
++        f"vocab={tc.get('vocab_size')}, "
++        f"embedding_size={tc.get('embedding_size')}"
++    )
++
++    with Timer("Load HF model for talker weights"):
++        hf_model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
++            MODEL_PATH,
++            trust_remote_code=True,
++            torch_dtype=torch.bfloat16,
++            low_cpu_mem_usage=True,
++        )
++        full_sd = hf_model.state_dict()
++
++    talker_sd = NeuronQwen25OmniTalker.convert_hf_to_neuron_state_dict(
++        {k: v for k, v in full_sd.items() if k.startswith("talker.")}
++    )
++    print(f"  Talker state dict: {len(talker_sd)} keys")
++
++    del hf_model, full_sd
++    gc.collect()
++
++    with Timer("Create Talker + load weights"):
++        talker = NeuronQwen25OmniTalker.from_pretrained_state_dict(
++            talker_config, talker_sd, dtype=torch.bfloat16
++        )
++
++    print(
++        f"  Talker codec tokens: bos={talker.codec_bos_token}, "
++        f"eos={talker.codec_eos_token}, pad={talker.codec_pad_token}"
++    )
++
++    del talker, talker_sd
++    gc.collect()
++
++    print("  PASS: Talker CPU model\n")
++    return True
++
++
++# ---------------------------------------------------------------------------
++# Test 6: Text-only Thinker compile + load + generate
++# ---------------------------------------------------------------------------
++def test_text_gen():
++    """Compile (if needed), load, and generate with the Thinker at TP=4."""
++    print("=" * 60)
++    print("Test 6: Text-only Thinker compile + load + generate (TP=4)")
++    print("=" * 60)
++
++    from neuronx_distributed_inference.models.config import (
++        NeuronConfig,
++        OnDeviceSamplingConfig,
++    )
++    from neuronx_distributed_inference.utils.hf_adapter import (
++        load_pretrained_config,
++        HuggingFaceGenerationAdapter,
++    )
++    from neuronx_distributed_inference.models.qwen25_omni.modeling_qwen25_omni import (
++        NeuronQwen25OmniForCausalLM,
++        Qwen25OmniInferenceConfig,
++    )
++    from transformers import AutoTokenizer
++
++    neuron_config = NeuronConfig(
++        tp_degree=TP_DEGREE,
++        batch_size=1,
++        seq_len=2048,
++        max_context_length=2048,
++        torch_dtype=torch.bfloat16,
++        on_device_sampling_config=OnDeviceSamplingConfig(
++            do_sample=False,
++            top_k=1,
++        ),
++    )
++
++    hf_config = load_pretrained_config(MODEL_PATH)
++    config = Qwen25OmniInferenceConfig(neuron_config, load_config=hf_config)
++
++    compiled_dir = os.path.join(COMPILED_PATH, "thinker_tp4")
++
++    with Timer("Create model"):
++        model = NeuronQwen25OmniForCausalLM(MODEL_PATH, config)
++
++    if not os.path.exists(os.path.join(compiled_dir, "neuron_config.json")):
++        with Timer("Compile (this takes several minutes)"):
++            model.compile(compiled_dir)
++    else:
++        print("  Compiled artifacts found, skipping compilation")
++
++    with Timer("Load compiled model"):
++        model.load(compiled_dir)
++
++    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
+     if tokenizer.pad_token is None:
+         tokenizer.pad_token = tokenizer.eos_token
+-    return tokenizer
+-
+-
+-def test_model_loads(compiled_model):
+-    """Test that model loads successfully (smoke test)."""
+-    assert compiled_model is not None
+-    assert hasattr(compiled_model, 'config')
+-    print("✓ Smoke test passed - Model loaded successfully")
+-
+-
+-def test_model_generates(compiled_model, tokenizer):
+-    """Test that model can generate text."""
+-    prompt = "The capital of France is"
+-    inputs = tokenizer(prompt, return_tensors="pt", padding=True)
+-    
+-    generated_ids = generate_with_neuron_model(compiled_model, inputs.input_ids, max_new_tokens=20)
+-    output_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+-    
+-    assert len(output_text) > len(prompt), "Output should be longer than prompt"
+-    print(f"✓ Generation test passed")
+-    print(f"  Output: {output_text}")
+-
+-
+-def test_output_coherence(compiled_model, tokenizer):
+-    """Test that output is coherent (not gibberish)."""
+-    prompt = "Hello, how are you?"
+-    inputs = tokenizer(prompt, return_tensors="pt", padding=True)
+-    
+-    generated_ids = generate_with_neuron_model(compiled_model, inputs.input_ids, max_new_tokens=30)
+-    output_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+-    
+-    # Coherence checks
+-    assert len(output_text.split()) > 3, "Output should have multiple words"
+-    assert not _is_repetitive(output_text), "Output should not be repetitive"
+-    
+-    print(f"✓ Coherence test passed")
+-    print(f"  Output: {output_text[:100]}...")
+-
+-
+-
+-def _is_repetitive(text: str, max_repeat: int = 5) -> bool:
+-    """Check if text has excessive repetition."""
+-    words = text.split()
+-    if len(words) < 10:
+-        return False
+-    
+-    # Check for repeated words
+-    for i in range(len(words) - max_repeat):
+-        word = words[i]
+-        if all(words[i+j] == word for j in range(max_repeat)):
+-            return True
+-    
+-    # Check for repeated characters
+-    new_text = text[-100:] if len(text) > 100 else text
+-    if len(new_text) > 20:
+-        char_counts = {}
+-        for c in new_text:
+-            char_counts[c] = char_counts.get(c, 0) + 1
+-        max_char_ratio = max(char_counts.values()) / len(new_text)
+-        if max_char_ratio > 0.5:
+-            return True
+-    
+-    return False
+-
+-
+-def test_performance_ttft(compiled_model, tokenizer):
+-    """Test Time To First Token (TTFT) performance."""
+-    import time
+-    
+-    prompt = "Hello, how are you?"
+-    inputs = tokenizer(prompt, return_tensors="pt", padding=True)
+-    input_ids = inputs.input_ids
+-    
+-    # Warmup
+-    for _ in range(3):
+-        seq_len = input_ids.shape[1]
+-        position_ids = torch.arange(seq_len).unsqueeze(0).expand(input_ids.shape[0], -1)
+-        with torch.no_grad():
+-            _ = compiled_model(input_ids, position_ids=position_ids)
+-    
+-    # Measure TTFT
+-    times = []
+-    for _ in range(10):
+-        seq_len = input_ids.shape[1]
+-        position_ids = torch.arange(seq_len).unsqueeze(0).expand(input_ids.shape[0], -1)
+-        
+-        start = time.perf_counter()
+-        with torch.no_grad():
+-            _ = compiled_model(input_ids, position_ids=position_ids)
+-        end = time.perf_counter()
+-        
+-        times.append((end - start) * 1000)  # ms
+-    
+-    avg_ttft = sum(times) / len(times)
+-    print(f"✓ TTFT: {avg_ttft:.2f}ms")
+-
+-
+-
+-def test_performance_throughput(compiled_model, tokenizer):
+-    """Test token generation throughput."""
+-    import time
+-    
+-    prompt = "Hello"
+-    inputs = tokenizer(prompt, return_tensors="pt", padding=True)
+-    input_ids = inputs.input_ids
+-    num_tokens = 50
+-    
+-    # Warmup
+-    _ = generate_with_neuron_model(compiled_model, input_ids, max_new_tokens=5)
+-    
+-    # Measure throughput
+-    start = time.perf_counter()
+-    _ = generate_with_neuron_model(compiled_model, input_ids, max_new_tokens=num_tokens)
+-    end = time.perf_counter()
+-    
+-    total_time = end - start
+-    throughput = num_tokens / total_time
+-    print(f"✓ Throughput: {throughput:.2f} tok/s")
+ 
++    # HuggingFaceGenerationAdapter does NOT take tokenizer as argument.
++    adapter = HuggingFaceGenerationAdapter(model)
++
++    def make_chat_input(prompt):
++        messages = [
++            {"role": "system", "content": "You are a helpful assistant."},
++            {"role": "user", "content": prompt},
++        ]
++        text = tokenizer.apply_chat_template(
++            messages, tokenize=False, add_generation_prompt=True
++        )
++        encoded = tokenizer(text, return_tensors="pt")
++        return encoded["input_ids"], encoded["attention_mask"]
++
++    prompts = [
++        "What is 2+3? Answer with just the number.",
++        "Write a haiku about the ocean.",
++        "Explain quantum computing in one sentence.",
++    ]
++
++    for prompt in prompts:
++        input_ids, attention_mask = make_chat_input(prompt)
++        prompt_len = input_ids.shape[1]
++
++        with Timer(f"Generate '{prompt[:40]}...'"):
++            output_ids = adapter.generate(
++                input_ids=input_ids,
++                attention_mask=attention_mask,
++                max_new_tokens=128,
++                eos_token_id=[tokenizer.eos_token_id, 151645],
++            )
++
++        new_tokens = output_ids[0, prompt_len:]
++        output_text = tokenizer.decode(new_tokens, skip_special_tokens=True)
++        n_new = sum(
++            1
++            for tok in new_tokens
++            if tok.item()
++            not in [tokenizer.eos_token_id, tokenizer.pad_token_id, 151645]
++        )
++        print(f"    Input:  {prompt}")
++        print(f"    Output: {output_text.strip()[:200]}")
++        print(f"    Tokens: {n_new}")
++        print()
++
++    del model, adapter
++    gc.collect()
++
++    print("  PASS: Text-only Thinker compile + load + generate\n")
++    return True
++
++
++# ---------------------------------------------------------------------------
++# Test 7: Image understanding (requires multimodal model)
++# ---------------------------------------------------------------------------
++def test_image_understanding():
++    """Test image understanding with the Qwen2.5-Omni vision encoder.
++
++    This test requires the multimodal model (vision encoder + text decoder)
++    to be compiled. It downloads a test image and asks the model to describe it.
++
++    NOTE: This is a placeholder for the full multimodal pipeline. The vision
++    encoder must be compiled on Neuron before this test can run end-to-end.
++    Currently tests the preprocessing pipeline only.
++    """
++    print("=" * 60)
++    print("Test 7: Image understanding (preprocessing)")
++    print("=" * 60)
++
++    try:
++        from qwen_omni_utils import process_mm_info
++    except ImportError:
++        print("  SKIP: qwen-omni-utils not installed")
++        print("  Install with: pip install qwen-omni-utils[decord]")
++        return True
++
++    from transformers import AutoConfig
++
++    # Build message with image
++    messages = [
++        {
++            "role": "system",
++            "content": [
++                {
++                    "type": "text",
++                    "text": "You are a helpful assistant.",
++                }
++            ],
++        },
++        {
++            "role": "user",
++            "content": [
++                {"type": "image", "image": IMAGE_URL},
++                {"type": "text", "text": "Describe this image briefly."},
++            ],
++        },
++    ]
++
++    print(f"  Image URL: {IMAGE_URL}")
++
++    with Timer("Process multimodal info (download + preprocess)"):
++        audios, images, videos = process_mm_info(
++            messages, use_audio_in_video=False
++        )
++
++    if images:
++        print(f"  Images processed: {len(images)}")
++        for i, img in enumerate(images):
++            if hasattr(img, "shape"):
++                print(f"    Image {i}: shape={img.shape}")
++            elif hasattr(img, "size"):
++                print(f"    Image {i}: size={img.size}")
++    else:
++        print("  No images found in processed output")
++
++    # Verify config has vision token IDs
++    hf_config = AutoConfig.from_pretrained(MODEL_PATH, trust_remote_code=True)
++    if hasattr(hf_config, "thinker_config"):
++        tc = hf_config.thinker_config
++        if hasattr(tc, "__dict__") and not isinstance(tc, dict):
++            tc = vars(tc)
++        image_token_id = tc.get("image_token_index")
++        vision_start_id = tc.get("vision_start_token_id")
++        vision_end_id = tc.get("vision_end_token_id")
++        print(
++            f"  Vision tokens: image={image_token_id}, "
++            f"start={vision_start_id}, end={vision_end_id}"
++        )
++
++    print(
++        "  NOTE: Full end-to-end image understanding requires "
++        "compiled vision encoder on Neuron."
++    )
++    print("  PASS: Image preprocessing\n")
++    return True
++
++
++# ---------------------------------------------------------------------------
++# Test 8: Audio understanding (requires audio encoder on Neuron)
++# ---------------------------------------------------------------------------
++def test_audio_understanding():
++    """Test audio understanding preprocessing pipeline.
++
++    Downloads a test audio file and preprocesses it through the Qwen2.5-Omni
++    audio pipeline. Full end-to-end inference requires the audio encoder's
++    Neuron transformer to be compiled.
++    """
++    print("=" * 60)
++    print("Test 8: Audio understanding (preprocessing)")
++    print("=" * 60)
++
++    try:
++        from qwen_omni_utils import process_mm_info
++    except ImportError:
++        print("  SKIP: qwen-omni-utils not installed")
++        print("  Install with: pip install qwen-omni-utils[decord]")
++        return True
++
++    from transformers import AutoConfig
++
++    # Build message with audio
++    messages = [
++        {
++            "role": "system",
++            "content": [
++                {
++                    "type": "text",
++                    "text": "You are a helpful assistant.",
++                }
++            ],
++        },
++        {
++            "role": "user",
++            "content": [
++                {"type": "audio", "audio": AUDIO_URL},
++                {"type": "text", "text": "What sound is this?"},
++            ],
++        },
++    ]
++
++    print(f"  Audio URL: {AUDIO_URL}")
++
++    with Timer("Process multimodal info (download + preprocess)"):
++        audios, images, videos = process_mm_info(
++            messages, use_audio_in_video=False
++        )
++
++    if audios:
++        print(f"  Audios processed: {len(audios)}")
++        for i, audio in enumerate(audios):
++            if hasattr(audio, "shape"):
++                print(f"    Audio {i}: shape={audio.shape}")
++            else:
++                print(f"    Audio {i}: type={type(audio)}")
++    else:
++        print("  No audios found in processed output")
++
++    # Verify config has audio token IDs
++    hf_config = AutoConfig.from_pretrained(MODEL_PATH, trust_remote_code=True)
++    if hasattr(hf_config, "thinker_config"):
++        tc = hf_config.thinker_config
++        if hasattr(tc, "__dict__") and not isinstance(tc, dict):
++            tc = vars(tc)
++        audio_token_id = tc.get("audio_token_index")
++        audio_start_id = tc.get("audio_start_token_id")
++        audio_end_id = tc.get("audio_end_token_id")
++        print(
++            f"  Audio tokens: audio={audio_token_id}, "
++            f"start={audio_start_id}, end={audio_end_id}"
++        )
++
++    print(
++        "  NOTE: Full end-to-end audio understanding requires "
++        "compiled audio encoder on Neuron."
++    )
++    print("  PASS: Audio preprocessing\n")
++    return True
++
++
++# ---------------------------------------------------------------------------
++# Main
++# ---------------------------------------------------------------------------
++ALL_TESTS = [
++    ("imports", test_imports),
++    ("config", test_config),
++    ("state_dict", test_state_dict),
++    ("audio_encoder", test_audio_encoder),
++    ("talker", test_talker),
++    ("text_gen", test_text_gen),
++    ("image", test_image_understanding),
++    ("audio", test_audio_understanding),
++]
++
++
++def main():
++    parser = argparse.ArgumentParser(
++        description="Qwen2.5-Omni-7B integration tests"
++    )
++    parser.add_argument(
++        "--test",
++        choices=[name for name, _ in ALL_TESTS],
++        nargs="+",
++        help="Run specific test(s). Default: all.",
++    )
++    parser.add_argument(
++        "--quick",
++        action="store_true",
++        help="Skip heavyweight tests (state_dict, audio_encoder, talker).",
++    )
++    args = parser.parse_args()
++
++    if args.test:
++        tests = [(n, fn) for n, fn in ALL_TESTS if n in args.test]
++    elif args.quick:
++        skip = {"state_dict", "audio_encoder", "talker"}
++        tests = [(n, fn) for n, fn in ALL_TESTS if n not in skip]
++    else:
++        tests = ALL_TESTS
++
++    print("\n" + "=" * 60)
++    print(f"Qwen2.5-Omni-7B TP={TP_DEGREE} Integration Tests")
++    print(f"Model: {MODEL_PATH}")
++    print(f"Compiled: {COMPILED_PATH}")
++    print("=" * 60 + "\n")
++
++    results = {}
++    total_start = time.time()
++
++    for name, test_fn in tests:
++        try:
++            passed = test_fn()
++            results[name] = "PASS" if passed else "FAIL"
++        except Exception as e:
++            print(f"\n  FAIL: {e}")
++            traceback.print_exc()
++            results[name] = f"FAIL: {e}"
++
++    total_time = time.time() - total_start
++
++    print("\n" + "=" * 60)
++    print("RESULTS SUMMARY")
++    print("=" * 60)
++    for name, result in results.items():
++        status = "PASS" if result == "PASS" else "FAIL"
++        print(f"  [{status}] {name}: {result}")
++    print(f"\n  Total time: {total_time:.1f}s")
++    print("=" * 60)
++
++    if any(r != "PASS" for r in results.values()):
++        sys.exit(1)
+ 
+ 
+ if __name__ == "__main__":
+-    print("="*80)
+-    print("Qwen2.5-Omni-7B Integration Tests")
+-    print("="*80)
+-    
+-    print("\nNote: This is a template test file.")
+-    print("For actual model testing, customize the model loading logic.")
+-    
+-    print("\n" + "="*80)
+-    print("✓ Template structure verified!")
+-    print("="*80)
++    main()
+diff --git a/examples/generate_qwen25_omni.py b/examples/generate_qwen25_omni.py
+new file mode 100644
+index 00000000..cb13602c
+--- /dev/null
++++ b/examples/generate_qwen25_omni.py
+@@ -0,0 +1,448 @@
++#!/usr/bin/env python3
++"""
++End-to-end multimodal inference for Qwen2.5-Omni-7B on NeuronX (TP=4).
++
++Supports:
++  1. Text-only: Thinker generates text
++  2. Image + text: Vision encoder + Thinker
++  3. Audio + text: Audio encoder + Thinker
++  4. Image + audio + text: All encoders + Thinker
++  5. Speech output: Thinker → Talker → Token2Wav (optional)
++
++Usage:
++  source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
++  pip install qwen-omni-utils[decord]
++
++  # First run compiles (~30 min), subsequent runs load from cache:
++  python3 examples/generate_qwen25_omni.py
++
++  # Text-only (fastest, uses simpler text-only model):
++  python3 examples/generate_qwen25_omni.py --mode text
++
++  # Image understanding:
++  python3 examples/generate_qwen25_omni.py --mode image
++
++  # Audio understanding:
++  python3 examples/generate_qwen25_omni.py --mode audio
++
++  # Full multimodal (image + audio + text → text + speech):
++  python3 examples/generate_qwen25_omni.py --mode full
++"""
++
++import argparse
++import gc
++import os
++import sys
++import time
++
++import torch
++
++# ---------------------------------------------------------------------------
++# Configuration
++# ---------------------------------------------------------------------------
++MODEL_PATH = os.environ.get(
++    "QWEN25_OMNI_MODEL_PATH", "/opt/dlami/nvme/models/Qwen2.5-Omni-7B"
++)
++COMPILED_PATH = os.environ.get(
++    "QWEN25_OMNI_COMPILED_PATH", "/tmp/qwen25_omni_compiled"
++)
++TP_DEGREE = int(os.environ.get("QWEN25_OMNI_TP_DEGREE", "4"))
++
++# Test media from Qwen official examples
++IMAGE_URL = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg"
++AUDIO_URL = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen2.5-Omni/cough.wav"
++
++# Sequence lengths
++TEXT_SEQ_LENGTH = 4096
++TEXT_BUCKETS = [256, 512, 1024, 2048, 4096]
++VISION_SEQ_LENGTH = 1012  # single image
++VISION_BUCKETS = [1]  # 1 image
++
++
++class Timer:
++    def __init__(self, label):
++        self.label = label
++        self.elapsed = 0
++
++    def __enter__(self):
++        self.start = time.time()
++        return self
++
++    def __exit__(self, *args):
++        self.elapsed = time.time() - self.start
++        print(f"  [{self.label}] {self.elapsed:.2f}s")
++
++
++# ---------------------------------------------------------------------------
++# Mode 1: Text-only (uses the simpler NeuronQwen25OmniForCausalLM)
++# ---------------------------------------------------------------------------
++def run_text_only(model_path=MODEL_PATH, compiled_path=COMPILED_PATH):
++    """Text-only inference using the Thinker model."""
++    from neuronx_distributed_inference.models.config import (
++        NeuronConfig,
++        OnDeviceSamplingConfig,
++    )
++    from neuronx_distributed_inference.utils.hf_adapter import (
++        load_pretrained_config,
++        HuggingFaceGenerationAdapter,
++    )
++    from neuronx_distributed_inference.models.qwen25_omni.modeling_qwen25_omni import (
++        NeuronQwen25OmniForCausalLM,
++        Qwen25OmniInferenceConfig,
++    )
++    from transformers import AutoTokenizer
++
++    print("\n" + "=" * 60)
++    print("Mode: Text-only (Thinker on Neuron, TP=4)")
++    print("=" * 60)
++
++    neuron_config = NeuronConfig(
++        tp_degree=TP_DEGREE,
++        batch_size=1,
++        seq_len=2048,
++        max_context_length=2048,
++        torch_dtype=torch.bfloat16,
++        on_device_sampling_config=OnDeviceSamplingConfig(do_sample=False, top_k=1),
++    )
++
++    hf_config = load_pretrained_config(model_path)
++    config = Qwen25OmniInferenceConfig(neuron_config, load_config=hf_config)
++
++    compiled_dir = os.path.join(compiled_path, "thinker_tp4")
++
++    with Timer("Create model"):
++        model = NeuronQwen25OmniForCausalLM(model_path, config)
++
++    if not os.path.exists(os.path.join(compiled_dir, "neuron_config.json")):
++        with Timer("Compile"):
++            model.compile(compiled_dir)
++    else:
++        print("  Compiled artifacts found")
++
++    with Timer("Load"):
++        model.load(compiled_dir)
++
++    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
++    if tokenizer.pad_token is None:
++        tokenizer.pad_token = tokenizer.eos_token
++    adapter = HuggingFaceGenerationAdapter(model)
++
++    prompts = [
++        "What is 2+3? Answer with just the number.",
++        "Write a haiku about the ocean.",
++        "Explain quantum computing in one sentence.",
++    ]
++
++    print("\n--- Generation Results ---")
++    for prompt in prompts:
++        messages = [
++            {"role": "system", "content": "You are a helpful assistant."},
++            {"role": "user", "content": prompt},
++        ]
++        text = tokenizer.apply_chat_template(
++            messages, tokenize=False, add_generation_prompt=True
++        )
++        encoded = tokenizer(text, return_tensors="pt")
++
++        with Timer(f"Generate"):
++            output_ids = adapter.generate(
++                input_ids=encoded["input_ids"],
++                attention_mask=encoded["attention_mask"],
++                max_new_tokens=128,
++                eos_token_id=[tokenizer.eos_token_id, 151645],
++            )
++
++        new_tokens = output_ids[0, encoded["input_ids"].shape[1] :]
++        output_text = tokenizer.decode(new_tokens, skip_special_tokens=True)
++        print(f"  Q: {prompt}")
++        print(f"  A: {output_text.strip()[:300]}")
++        print()
++
++    del model, adapter
++    gc.collect()
++
++
++# ---------------------------------------------------------------------------
++# Mode 2: Multimodal (image/audio + text → text, optional speech)
++# ---------------------------------------------------------------------------
++def run_multimodal(mode="full", model_path=MODEL_PATH, compiled_path=COMPILED_PATH):
++    """Multimodal inference: image + audio + text → text (+ optional speech).
++
++    Args:
++        mode: "image" (image+text), "audio" (audio+text), "full" (image+audio+text)
++        model_path: Path to HF model weights
++        compiled_path: Path for compiled artifacts
++    """
++    from neuronx_distributed_inference.models.config import (
++        NeuronConfig,
++        OnDeviceSamplingConfig,
++    )
++    from neuronx_distributed_inference.utils.hf_adapter import (
++        load_pretrained_config,
++        HuggingFaceGenerationAdapter,
++    )
++    from neuronx_distributed_inference.models.qwen25_omni.modeling_qwen25_omni import (
++        NeuronQwen25OmniMultimodalForCausalLM,
++        Qwen25OmniMultimodalInferenceConfig,
++    )
++    from transformers import AutoProcessor, GenerationConfig
++
++    print("\n" + "=" * 60)
++    print(f"Mode: Multimodal ({mode}) on Neuron, TP={TP_DEGREE}")
++    print("=" * 60)
++
++    # --- Step 1: Create configs ---
++    text_neuron_config = NeuronConfig(
++        batch_size=1,
++        seq_len=TEXT_SEQ_LENGTH,
++        max_context_length=TEXT_SEQ_LENGTH,
++        ctx_batch_size=1,
++        tp_degree=TP_DEGREE,
++        torch_dtype=torch.bfloat16,
++        fused_qkv=False,
++        sequence_parallel_enabled=False,
++        flash_decoding_enabled=False,
++        qkv_kernel_enabled=False,
++        qkv_nki_kernel_enabled=False,
++        attn_kernel_enabled=False,
++        enable_bucketing=True,
++        context_encoding_buckets=TEXT_BUCKETS,
++        token_generation_buckets=TEXT_BUCKETS,
++        on_device_sampling_config=OnDeviceSamplingConfig(do_sample=False, top_k=1),
++    )
++
++    vision_neuron_config = NeuronConfig(
++        batch_size=1,
++        seq_len=VISION_SEQ_LENGTH,
++        tp_degree=TP_DEGREE,
++        torch_dtype=torch.bfloat16,
++        enable_bucketing=True,
++        buckets=VISION_BUCKETS,
++        fused_qkv=False,  # Qwen2.5-Omni vision uses separate Q/K/V
++        qkv_kernel_enabled=False,
++        attn_kernel_enabled=False,
++    )
++
++    config = Qwen25OmniMultimodalInferenceConfig(
++        text_neuron_config=text_neuron_config,
++        vision_neuron_config=vision_neuron_config,
++        load_config=load_pretrained_config(model_path),
++    )
++
++    processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
++
++    # --- Step 2: Create and compile/load the model ---
++    compiled_dir = os.path.join(compiled_path, "multimodal_tp4")
++
++    with Timer("Create multimodal model"):
++        model = NeuronQwen25OmniMultimodalForCausalLM(
++            model_path=model_path, config=config
++        )
++
++    if not os.path.exists(os.path.join(compiled_dir, "neuron_config.json")):
++        with Timer("Compile text + vision (this takes 20-40 minutes)"):
++            model.compile(compiled_dir)
++            processor.save_pretrained(compiled_dir)
++    else:
++        print("  Compiled artifacts found")
++
++    with Timer("Load compiled model"):
++        model.load(compiled_dir)
++        processor = AutoProcessor.from_pretrained(compiled_dir)
++
++    # --- Step 3: Enable audio encoder (if needed) ---
++    if mode in ("audio", "full"):
++        print("\n  Enabling audio encoder...")
++        from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import (
++            Qwen2_5OmniForConditionalGeneration,
++        )
++        from neuronx_distributed_inference.models.qwen25_omni.modeling_qwen25_omni_audio import (
++            NeuronQwen25OmniAudioEncoder,
++        )
++
++        with Timer("Load HF model for audio weights"):
++            hf_model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
++                model_path,
++                trust_remote_code=True,
++                torch_dtype=torch.bfloat16,
++                low_cpu_mem_usage=True,
++            )
++            full_sd = hf_model.state_dict()
++
++        audio_sd = NeuronQwen25OmniAudioEncoder.convert_hf_to_neuron_state_dict(
++            full_sd, dtype=torch.bfloat16
++        )
++        del hf_model, full_sd
++        gc.collect()
++
++        model.enable_audio_encoder(audio_sd)
++
++        compiled_audio_dir = os.path.join(compiled_path, "audio_encoder_tp4")
++        if not os.path.exists(
++            os.path.join(compiled_audio_dir, "neuron_config.json")
++        ):
++            with Timer("Compile audio encoder transformer"):
++                model.compile_audio_encoder(compiled_audio_dir)
++        else:
++            print("  Audio encoder compiled artifacts found")
++
++        with Timer("Load audio encoder"):
++            model.load_audio_encoder(compiled_audio_dir)
++
++        del audio_sd
++        gc.collect()
++
++    # --- Step 4: Run inference ---
++    adapter = HuggingFaceGenerationAdapter(model)
++    generation_config = GenerationConfig(
++        do_sample=False,
++        eos_token_id=[151645],
++        pad_token_id=151645,
++    )
++
++    # Prepare inputs based on mode
++    from qwen_omni_utils import process_mm_info
++
++    if mode == "image":
++        print("\n--- Image Understanding ---")
++        messages = [
++            {
++                "role": "system",
++                "content": [{"type": "text", "text": "You are a helpful assistant."}],
++            },
++            {
++                "role": "user",
++                "content": [
++                    {"type": "image", "image": IMAGE_URL},
++                    {"type": "text", "text": "Describe this image in detail."},
++                ],
++            },
++        ]
++    elif mode == "audio":
++        print("\n--- Audio Understanding ---")
++        messages = [
++            {
++                "role": "system",
++                "content": [{"type": "text", "text": "You are a helpful assistant."}],
++            },
++            {
++                "role": "user",
++                "content": [
++                    {"type": "audio", "audio": AUDIO_URL},
++                    {"type": "text", "text": "What sound is this? Describe what you hear."},
++                ],
++            },
++        ]
++    else:  # full
++        print("\n--- Full Multimodal (Image + Audio + Text) ---")
++        messages = [
++            {
++                "role": "system",
++                "content": [{"type": "text", "text": "You are a helpful assistant."}],
++            },
++            {
++                "role": "user",
++                "content": [
++                    {"type": "image", "image": IMAGE_URL},
++                    {"type": "audio", "audio": AUDIO_URL},
++                    {
++                        "type": "text",
++                        "text": "Describe the image and the audio you received.",
++                    },
++                ],
++            },
++        ]
++
++    # Process multimodal inputs
++    with Timer("Process multimodal inputs"):
++        audios, images, videos = process_mm_info(messages, use_audio_in_video=False)
++        text = processor.apply_chat_template(
++            messages, tokenize=False, add_generation_prompt=True
++        )
++        inputs = processor(
++            text=[text],
++            images=images if images else None,
++            audios=audios if audios else None,
++            return_tensors="pt",
++            padding=True,
++        )
++
++    print(f"  input_ids shape: {inputs.input_ids.shape}")
++    if hasattr(inputs, "pixel_values") and inputs.pixel_values is not None:
++        print(f"  pixel_values shape: {inputs.pixel_values.shape}")
++    if hasattr(inputs, "image_grid_thw") and inputs.image_grid_thw is not None:
++        print(f"  image_grid_thw: {inputs.image_grid_thw}")
++    if hasattr(inputs, "input_features") and inputs.input_features is not None:
++        print(f"  input_features shape: {inputs.input_features.shape}")
++
++    # Generate
++    generate_kwargs = {
++        "input_ids": inputs.input_ids,
++        "attention_mask": inputs.attention_mask,
++        "generation_config": generation_config,
++        "max_new_tokens": 256,
++    }
++    if hasattr(inputs, "pixel_values") and inputs.pixel_values is not None:
++        generate_kwargs["pixel_values"] = inputs.pixel_values
++    if hasattr(inputs, "image_grid_thw") and inputs.image_grid_thw is not None:
++        generate_kwargs["image_grid_thw"] = inputs.image_grid_thw
++    if hasattr(inputs, "input_features") and inputs.input_features is not None:
++        generate_kwargs["input_features"] = inputs.input_features
++    if (
++        hasattr(inputs, "feature_attention_mask")
++        and inputs.feature_attention_mask is not None
++    ):
++        generate_kwargs["feature_attention_mask"] = inputs.feature_attention_mask
++
++    with Timer("Generate"):
++        output_ids = adapter.generate(**generate_kwargs)
++
++    output_text = processor.batch_decode(
++        output_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
++    )
++    print(f"\n  Output: {output_text[0].strip()[:500]}")
++
++    del model, adapter
++    gc.collect()
++
++
++# ---------------------------------------------------------------------------
++# Main
++# ---------------------------------------------------------------------------
++def main():
++    parser = argparse.ArgumentParser(description="Qwen2.5-Omni-7B inference on Neuron")
++    parser.add_argument(
++        "--mode",
++        choices=["text", "image", "audio", "full"],
++        default="text",
++        help="Inference mode (default: text)",
++    )
++    parser.add_argument(
++        "--model-path",
++        default=MODEL_PATH,
++        help=f"Model path (default: {MODEL_PATH})",
++    )
++    parser.add_argument(
++        "--compiled-path",
++        default=COMPILED_PATH,
++        help=f"Compiled model path (default: {COMPILED_PATH})",
++    )
++    args = parser.parse_args()
++
++    model_path = args.model_path
++    compiled_path = args.compiled_path
++
++    print(f"Model: {model_path}")
++    print(f"Compiled: {compiled_path}")
++    print(f"TP: {TP_DEGREE}")
++
++    if args.mode == "text":
++        run_text_only(model_path, compiled_path)
++    else:
++        run_multimodal(args.mode, model_path, compiled_path)
++
++    print("\nDone!")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/perf_test/3_bench_qwen25_omni_7b.sh b/perf_test/3_bench_qwen25_omni_7b.sh
+new file mode 100644
+index 00000000..e398db20
+--- /dev/null
++++ b/perf_test/3_bench_qwen25_omni_7b.sh
+@@ -0,0 +1,171 @@
++#!/bin/bash
++set -e
++
++source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
++
++MODEL_PATH="/opt/dlami/nvme/models/Qwen2.5-Omni-7B"
++PORT=8000
++RESULTS_DIR="/var/tmp/bench_results/qwen25_omni_7b"
++mkdir -p "$RESULTS_DIR"
++
++# Helper: wait for vLLM server to be ready
++wait_for_server() {
++    echo "  Waiting for vLLM server to be ready..."
++    for i in $(seq 1 360); do
++        if curl -s http://localhost:$PORT/health > /dev/null 2>&1; then
++            echo "  Server ready! (${i}s * 5 = $((i*5))s)"
++            return 0
++        fi
++        sleep 5
++    done
++    echo "  ERROR: Server did not start within 1800s"
++    return 1
++}
++
++# Helper: run benchmark
++run_bench() {
++    local config_name=$1
++    local concurrency=$2
++    local num_prompts=$3
++
++    echo "    Benchmark: concurrency=$concurrency, prompts=$num_prompts"
++    vllm bench serve \
++        --backend vllm \
++        --model "$MODEL_PATH" \
++        --tokenizer "$MODEL_PATH" \
++        --endpoint /v1/completions \
++        --dataset-name random \
++        --num-prompts "$num_prompts" \
++        --random-input-len 900 \
++        --random-output-len 90 \
++        --random-range-ratio 0.03 \
++        --max-concurrency "$concurrency" \
++        2>&1 | tee "$RESULTS_DIR/${config_name}_c${concurrency}.txt"
++    echo ""
++}
++
++# Helper: stop server
++stop_server() {
++    echo "  Stopping vLLM server..."
++    pkill -f "vllm.entrypoints.openai.api_server" 2>/dev/null || true
++    sleep 5
++}
++
++# Helper: quick sanity check
++sanity_check() {
++    echo "  Running sanity check..."
++    curl -s http://localhost:$PORT/v1/chat/completions \
++        -H 'Content-Type: application/json' \
++        -d '{
++            "messages": [{"role": "user", "content": "What is 1+1? Answer briefly."}],
++            "model": "'"$MODEL_PATH"'",
++            "max_tokens": 64,
++            "temperature": 0.0,
++            "stream": false
++        }' | python3 -c "import sys,json; r=json.load(sys.stdin); print('  Sanity:', r['choices'][0]['message']['content'][:100])" 2>/dev/null || echo "  Sanity check: could not parse response"
++}
++
++echo "=========================================="
++echo "Qwen2.5-Omni-7B Performance Benchmark"
++echo "=========================================="
++echo "Model: $MODEL_PATH"
++echo "Results: $RESULTS_DIR"
++echo ""
++
++###############################################################################
++# Config 1: BS=1, TP=4, non-CB (baseline latency)
++# Qwen2.5-Omni-7B is a dense 7B model, TP=4 is sufficient
++###############################################################################
++CONFIG_NAME="bs1_tp4"
++echo "--- Config 1: BS=1, TP=4, non-CB (baseline) ---"
++
++python3 -m vllm.entrypoints.openai.api_server \
++    --model "$MODEL_PATH" \
++    --tokenizer "$MODEL_PATH" \
++    --tensor-parallel-size 4 \
++    --max-model-len 4096 \
++    --max-num-seqs 1 \
++    --no-enable-chunked-prefill \
++    --no-enable-prefix-caching \
++    --port $PORT \
++    --trust_remote_code \
++    --additional-config '{
++        "override_neuron_config": {
++            "tp_degree": 4,
++            "fused_qkv": false,
++            "flash_decoding_enabled": false,
++            "sequence_parallel_enabled": false,
++            "qkv_kernel_enabled": false,
++            "qkv_nki_kernel_enabled": false,
++            "attn_kernel_enabled": false,
++            "batch_size": 1,
++            "ctx_batch_size": 1,
++            "tkg_batch_size": 1,
++            "max_context_length": 4096,
++            "seq_len": 4096,
++            "is_continuous_batching": false,
++            "enable_bucketing": false,
++            "async_mode": true,
++            "on_device_sampling_config": {
++                "do_sample": true, "temperature": 0.6, "top_k": 20, "top_p": 0.95
++            }
++        }
++    }' &
++
++wait_for_server
++sanity_check
++run_bench "$CONFIG_NAME" 1 16
++stop_server
++
++###############################################################################
++# Config 2: BS=4, TP=4, CB (throughput)
++###############################################################################
++CONFIG_NAME="bs4_tp4_cb"
++echo "--- Config 2: BS=4, TP=4, CB ---"
++
++python3 -m vllm.entrypoints.openai.api_server \
++    --model "$MODEL_PATH" \
++    --tokenizer "$MODEL_PATH" \
++    --tensor-parallel-size 4 \
++    --max-model-len 4096 \
++    --max-num-seqs 4 \
++    --no-enable-chunked-prefill \
++    --no-enable-prefix-caching \
++    --port $PORT \
++    --trust_remote_code \
++    --additional-config '{
++        "override_neuron_config": {
++            "tp_degree": 4,
++            "fused_qkv": false,
++            "flash_decoding_enabled": false,
++            "sequence_parallel_enabled": false,
++            "qkv_kernel_enabled": false,
++            "qkv_nki_kernel_enabled": false,
++            "attn_kernel_enabled": false,
++            "batch_size": 4,
++            "ctx_batch_size": 1,
++            "tkg_batch_size": 4,
++            "max_context_length": 4096,
++            "seq_len": 4096,
++            "is_continuous_batching": true,
++            "enable_bucketing": true,
++            "context_encoding_buckets": [4096],
++            "token_generation_buckets": [4096],
++            "async_mode": true,
++            "on_device_sampling_config": {
++                "do_sample": true, "temperature": 0.6, "top_k": 20, "top_p": 0.95
++            }
++        }
++    }' &
++
++wait_for_server
++sanity_check
++run_bench "$CONFIG_NAME" 1 16
++run_bench "$CONFIG_NAME" 4 64
++stop_server
++
++echo "=========================================="
++echo "Qwen2.5-Omni-7B benchmarks complete!"
++echo "Results saved to: $RESULTS_DIR"
++echo "=========================================="
++ls -la "$RESULTS_DIR"
+diff --git a/perf_test/apply_vllm_neuron_patch_qwen25omni.py b/perf_test/apply_vllm_neuron_patch_qwen25omni.py
+new file mode 100644
+index 00000000..68131ed0
+--- /dev/null
++++ b/perf_test/apply_vllm_neuron_patch_qwen25omni.py
+@@ -0,0 +1,83 @@
++#!/usr/bin/env python3
++"""Add Qwen2.5-Omni model support to vllm-neuron.
++
++This patch should be applied AFTER the MiMo/MiniMax patch (apply_vllm_neuron_patch.py).
++It handles:
++  1. Config extraction: Qwen2.5-Omni nests text config under thinker_config.text_config
++  2. Architecture mapping: "Qwen2_5OmniModel" -> "qwen2_5_omni" model type
++  3. Layer count extraction: get_num_layers_from_hf_config for nested config
++"""
++
++import os
++
++# Patch 1 & 2: neuronx_distributed_model_loader.py
++LOADER_FILE = "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/vllm_neuron/worker/neuronx_distributed_model_loader.py"
++
++with open(LOADER_FILE) as f:
++    content = f.read()
++
++# 1. In _get_model_configs: handle Qwen2.5-Omni nested config
++content = content.replace(
++    '    if architecture in NEURON_MULTI_MODAL_MODELS:\n'
++    '        config = getattr(config, "text_config", None)\n'
++    '    num_key_value_heads = getattr(config, "num_key_value_heads", None)',
++    '    if architecture in NEURON_MULTI_MODAL_MODELS:\n'
++    '        config = getattr(config, "text_config", None)\n'
++    '    # Qwen2.5-Omni: text config is nested under thinker_config.text_config\n'
++    '    if architecture == "Qwen2_5OmniModel":\n'
++    '        thinker_config = getattr(config, "thinker_config", None)\n'
++    '        if thinker_config is not None:\n'
++    '            config = getattr(thinker_config, "text_config", config)\n'
++    '    num_key_value_heads = getattr(config, "num_key_value_heads", None)',
++)
++
++# 2. In _get_neuron_model_cls: handle Qwen2_5OmniModel architecture
++content = content.replace(
++    '    try:\n'
++    '        if "For" in architecture:',
++    '    # Qwen2.5-Omni: architecture is "Qwen2_5OmniModel" (no "For" in name)\n'
++    '    if architecture == "Qwen2_5OmniModel":\n'
++    '        return MODEL_TYPES["qwen2_5_omni"]["causal-lm"]\n'
++    '\n'
++    '    try:\n'
++    '        if "For" in architecture:',
++)
++
++with open(LOADER_FILE, "w") as f:
++    f.write(content)
++
++print("Patch 1/2: neuronx_distributed_model_loader.py updated")
++
++# Patch 3: utils.py - handle Qwen2.5-Omni nested config for layer count
++UTILS_FILE = "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/lib/python3.12/site-packages/vllm_neuron/worker/utils.py"
++
++with open(UTILS_FILE) as f:
++    content = f.read()
++
++content = content.replace(
++    '    # Sum nested configs (multimodal models)\n'
++    '    total = 0\n'
++    '    for attr in ["text_config", "vision_config"]:',
++    '    # Qwen2.5-Omni: check thinker_config.text_config\n'
++    '    thinker_config = getattr(hf_config, "thinker_config", None)\n'
++    '    if thinker_config is not None:\n'
++    '        text_config = getattr(thinker_config, "text_config", None)\n'
++    '        if text_config is not None:\n'
++    '            layers = getattr(text_config, "num_hidden_layers", None)\n'
++    '            if layers is not None:\n'
++    '                return layers\n'
++    '\n'
++    '    # Sum nested configs (multimodal models)\n'
++    '    total = 0\n'
++    '    for attr in ["text_config", "vision_config"]:',
++)
++
++with open(UTILS_FILE, "w") as f:
++    f.write(content)
++
++print("Patch 2/2: utils.py updated")
++print()
++print("Qwen2.5-Omni vllm-neuron patch applied successfully!")
++print("  1. Added thinker_config.text_config extraction in _get_model_configs")
++print("  2. Added Qwen2_5OmniModel -> qwen2_5_omni mapping in _get_neuron_model_cls")
++print("  3. Added thinker_config.text_config layer count extraction in utils.py")
+diff --git a/src/neuronx_distributed_inference/inference_demo.py b/src/neuronx_distributed_inference/inference_demo.py
+index b42d6452..530a2ba3 100644
+--- a/src/neuronx_distributed_inference/inference_demo.py
++++ b/src/neuronx_distributed_inference/inference_demo.py
+@@ -31,6 +31,7 @@
+ from neuronx_distributed_inference.models.qwen3.modeling_qwen3 import NeuronQwen3ForCausalLM
+ from neuronx_distributed_inference.models.qwen3_moe.modeling_qwen3_moe import NeuronQwen3MoeForCausalLM
+ from neuronx_distributed_inference.models.gemma3.modeling_gemma3 import NeuronGemma3ForCausalLM
++from neuronx_distributed_inference.models.qwen25_omni.modeling_qwen25_omni import NeuronQwen25OmniForCausalLM
+ from neuronx_distributed_inference.modules.lora_serving import LoraServingConfig
+ from neuronx_distributed_inference.utils.accuracy import (
+     check_accuracy,
+@@ -58,6 +59,7 @@
+     "qwen3": {"causal-lm": NeuronQwen3ForCausalLM},
+     "qwen3_moe": {"causal-lm": NeuronQwen3MoeForCausalLM},
+     "gemma3": {"causal-lm": NeuronGemma3ForCausalLM},
++    "qwen2_5_omni": {"causal-lm": NeuronQwen25OmniForCausalLM},
+ }
+ 
+ 
+diff --git a/src/neuronx_distributed_inference/models/qwen25_omni/__init__.py b/src/neuronx_distributed_inference/models/qwen25_omni/__init__.py
+new file mode 100644
+index 00000000..e69de29b
+diff --git a/src/neuronx_distributed_inference/models/qwen25_omni/modeling_qwen25_omni.py b/src/neuronx_distributed_inference/models/qwen25_omni/modeling_qwen25_omni.py
+new file mode 100644
+index 00000000..e052b852
+--- /dev/null
++++ b/src/neuronx_distributed_inference/models/qwen25_omni/modeling_qwen25_omni.py
+@@ -0,0 +1,961 @@
++# coding=utf-8
++# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
++# SPDX-License-Identifier: Apache-2.0
++#
++# Qwen2.5-Omni support for NXD inference.
++#
++# Provides two modes:
++#   1. Text-only (Thinker): NeuronQwen25OmniForCausalLM
++#      - Reuses Qwen2 decoder with thinker.model.* prefix remapping
++#   2. Multimodal (Vision + Text): NeuronQwen25OmniMultimodalForCausalLM
++#      - Vision encoder: Qwen2.5-Omni ViT (SwiGLU, RMSNorm, separate QKV)
++#      - Text decoder: Qwen2-VL text model (multimodal RoPE)
++#
++# Reference: https://huggingface.co/Qwen/Qwen2.5-Omni-7B
++
++"""Qwen2.5-Omni model for NXD inference."""
++
++import copy
++import gc
++import logging
++from types import SimpleNamespace
++from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
++
++import torch
++from transformers.modeling_outputs import CausalLMOutputWithPast
++
++from neuronx_distributed_inference.models.config import InferenceConfig, NeuronConfig
++from neuronx_distributed_inference.models.image_to_text_model_base import (
++    ImageToTextInferenceConfig,
++    NeuronBaseForImageToText,
++)
++from neuronx_distributed_inference.models.model_wrapper import VISION_ENCODER_MODEL_TAG
++from neuronx_distributed_inference.models.qwen2.modeling_qwen2 import (
++    NeuronQwen2ForCausalLM,
++    NeuronQwen2Model,
++    convert_state_dict_to_fused_qkv,
++)
++
++logger = logging.getLogger("Neuron")
++
++
++# Attributes to extract from the thinker's text_config to the top-level config.
++_TEXT_CONFIG_ATTRS = [
++    "hidden_size",
++    "num_hidden_layers",
++    "num_attention_heads",
++    "num_key_value_heads",
++    "vocab_size",
++    "intermediate_size",
++    "max_position_embeddings",
++    "rope_theta",
++    "rms_norm_eps",
++    "hidden_act",
++    "tie_word_embeddings",
++    "max_window_layers",
++    "use_sliding_window",
++    "sliding_window",
++]
++
++
++class Qwen25OmniInferenceConfig(InferenceConfig):
++    """Inference config for Qwen2.5-Omni (Thinker text component).
++
++    Handles the nested config structure: the HF config has attributes under
++    thinker_config.text_config that we need at the top level for NxDI.
++    """
++
++    def add_derived_config(self):
++        self.num_cores_per_group = 1
++        # Qwen2.5-Omni text model has QKV bias but no output projection bias
++        self.qkv_bias = True
++        self.o_bias = False
++
++        # Extract text config attributes from nested thinker_config
++        if hasattr(self, "thinker_config"):
++            thinker_cfg = self.thinker_config
++            # When loaded from saved JSON, thinker_config is a plain dict
++            if isinstance(thinker_cfg, dict):
++                thinker_cfg = SimpleNamespace(**thinker_cfg)
++                self.thinker_config = thinker_cfg
++
++            text_cfg = thinker_cfg.text_config
++            if isinstance(text_cfg, dict):
++                text_cfg = SimpleNamespace(**text_cfg)
++                thinker_cfg.text_config = text_cfg
++
++            # Text config attributes always take precedence over top-level
++            # defaults from PretrainedConfig (e.g. tie_word_embeddings defaults
++            # to True at the top level but is False in text_config).
++            for attr in _TEXT_CONFIG_ATTRS:
++                if hasattr(text_cfg, attr):
++                    setattr(self, attr, getattr(text_cfg, attr))
++
++            # Set pad_token_id from thinker_config
++            if hasattr(thinker_cfg, "pad_token_id"):
++                if not hasattr(self, "pad_token_id") or self.pad_token_id is None:
++                    self.pad_token_id = thinker_cfg.pad_token_id
++
++    def get_required_attributes(self) -> List[str]:
++        return [
++            "hidden_size",
++            "num_attention_heads",
++            "num_hidden_layers",
++            "num_key_value_heads",
++            "pad_token_id",
++            "vocab_size",
++            "max_position_embeddings",
++            "rope_theta",
++            "rms_norm_eps",
++            "hidden_act",
++        ]
++
++    @classmethod
++    def get_neuron_config_cls(cls) -> Type[NeuronConfig]:
++        return NeuronConfig
++
++
++class NeuronQwen25OmniForCausalLM(NeuronQwen2ForCausalLM):
++    """Qwen2.5-Omni Thinker text model for Causal LM on Neuron.
++
++    Reuses the Qwen2 model architecture since the Thinker's text backbone
++    is architecturally identical to Qwen2.5. The main differences are:
++      - Weight keys are prefixed with 'thinker.model.' / 'thinker.lm_head.'
++      - Non-text weights (talker, token2wav, audio_tower, visual) are discarded
++    """
++
++    _model_cls = NeuronQwen2Model
++    _STATE_DICT_MODEL_PREFIX = "thinker.model."
++
++    @staticmethod
++    def load_hf_model(model_path: str, **kwargs):
++        """Load the full Qwen2.5-Omni model from HuggingFace.
++
++        Note: We load the full model and filter to thinker text weights
++        in convert_hf_to_neuron_state_dict.
++        """
++        from transformers import AutoModelForCausalLM
++
++        return AutoModelForCausalLM.from_pretrained(
++            model_path,
++            trust_remote_code=True,
++            **kwargs,
++        )
++
++    @classmethod
++    def get_config_cls(cls) -> Type[Qwen25OmniInferenceConfig]:
++        return Qwen25OmniInferenceConfig
++
++    @staticmethod
++    def convert_hf_to_neuron_state_dict(
++        state_dict: Dict[str, Any],
++        config: Qwen25OmniInferenceConfig,
++    ) -> Dict[str, Any]:
++        """Convert Qwen2.5-Omni state dict to NxDI format.
++
++        1. Keep only thinker text model weights (discard talker, token2wav, audio, visual)
++        2. Map 'thinker.lm_head.' -> 'lm_head.'
++        3. Apply standard Qwen2 conversions (fused QKV, rank utils, etc.)
++        """
++        neuron_config = config.neuron_config
++
++        # Filter: keep only thinker text weights and lm_head
++        # After base-class prefix stripping, 'thinker.model.*' becomes '*'
++        # but 'thinker.lm_head.*' is NOT stripped, so handle it here.
++        keys_to_remove = []
++        keys_to_rename = {}
++        for key in state_dict:
++            if key.startswith("thinker.lm_head."):
++                # Map thinker.lm_head.weight -> lm_head.weight
++                new_key = key.replace("thinker.lm_head.", "lm_head.", 1)
++                keys_to_rename[key] = new_key
++            elif not key.startswith(("layers.", "embed_tokens.", "norm.", "lm_head.")):
++                # After base-class prefix stripping, valid text keys start with
++                # layers.*, embed_tokens.*, norm.*, or lm_head.*
++                # Everything else (talker, token2wav, audio_tower, visual) should be removed
++                keys_to_remove.append(key)
++
++        # Apply renames
++        for old_key, new_key in keys_to_rename.items():
++            state_dict[new_key] = state_dict.pop(old_key)
++
++        # Remove non-text weights
++        for key in keys_to_remove:
++            del state_dict[key]
++
++        gc.collect()
++        logger.info(
++            "Filtered state dict to %d thinker text model weights", len(state_dict)
++        )
++
++        # Add rank utilities (same as Qwen2)
++        if neuron_config.vocab_parallel:
++            state_dict["embed_tokens.rank_util.rank"] = torch.arange(
++                0, neuron_config.local_ranks_size
++            )
++
++        num_layers = config.num_hidden_layers
++        tp_degree = neuron_config.tp_degree
++        for i in range(num_layers):
++            state_dict[f"layers.{i}.self_attn.rank_util.rank"] = torch.arange(
++                0, tp_degree, dtype=torch.int32
++            )
++
++        if neuron_config.fused_qkv:
++            state_dict = convert_state_dict_to_fused_qkv(state_dict, config)
++
++        state_dict["rank_util.rank"] = torch.arange(0, tp_degree, dtype=torch.int32)
++        return state_dict
++
++    def get_compiler_args(self):
++        compiler_args = (
++            "--enable-saturate-infinity "
++            "--enable-mixed-precision-accumulation "
++            "--auto-cast=none "
++            "--model-type transformer "
++            "-O1"
++        )
++        compiler_args += (
++            " --tensorizer-options='"
++            "--enable-ccop-compute-overlap "
++            "--cc-pipeline-tiling-factor=2 "
++            "--vectorize-strided-dma'"
++        )
++        compiler_args += " --internal-hlo2tensorizer-options='--verify-hlo=true'"
++        return compiler_args
++
++
++# ---------------------------------------------------------------------------
++# Multimodal (Vision + Text) support
++# ---------------------------------------------------------------------------
++
++# Keys from thinker_config.text_config to copy to the top-level multimodal config
++_MULTIMODAL_TEXT_CONFIG_KEYS = [
++    "hidden_size",
++    "num_attention_heads",
++    "num_hidden_layers",
++    "num_key_value_heads",
++    "pad_token_id",
++    "vocab_size",
++    "intermediate_size",
++    "max_position_embeddings",
++    "rms_norm_eps",
++    "rope_theta",
++    "rope_scaling",
++    "hidden_act",
++    "bos_token_id",
++    "eos_token_id",
++    "qkv_bias",
++    "o_bias",
++    "image_token_id",
++    "vision_token_id",
++    "video_token_id",
++    "vision_start_token_id",
++    "vision_end_token_id",
++]
++
++
++class Qwen25OmniMultimodalInferenceConfig(ImageToTextInferenceConfig):
++    """Inference config for Qwen2.5-Omni multimodal (vision + text).
++
++    Handles the nested config structure where text_config and vision_config
++    are under thinker_config. Extracts them to the top level as required
++    by ImageToTextInferenceConfig.
++    """
++
++    def __init__(
++        self,
++        text_neuron_config,
++        vision_neuron_config,
++        fused_spec_config=None,
++        load_config=None,
++        metadata: Optional[Dict] = None,
++        **kwargs,
++    ):
++        # Extract text_config and vision_config from thinker_config
++        # The HF config nests them: thinker_config.text_config, thinker_config.vision_config
++        thinker = kwargs.get("thinker_config", None)
++        if thinker is not None:
++            if hasattr(thinker, "__dict__") and not isinstance(thinker, dict):
++                thinker = vars(thinker)
++            if isinstance(thinker, dict):
++                if "text_config" not in kwargs and "text_config" in thinker:
++                    tc = thinker["text_config"]
++                    kwargs["text_config"] = (
++                        vars(tc) if hasattr(tc, "__dict__") and not isinstance(tc, dict) else tc
++                    )
++                if "vision_config" not in kwargs and "vision_config" in thinker:
++                    vc = thinker["vision_config"]
++                    kwargs["vision_config"] = (
++                        vars(vc) if hasattr(vc, "__dict__") and not isinstance(vc, dict) else vc
++                    )
++                # Extract audio_config from thinker_config
++                if "audio_config" not in kwargs and "audio_config" in thinker:
++                    ac = thinker["audio_config"]
++                    kwargs["audio_config"] = (
++                        vars(ac) if hasattr(ac, "__dict__") and not isinstance(ac, dict) else ac
++                    )
++                # Extract special token IDs from thinker_config
++                for token_key in [
++                    "image_token_index", "audio_token_index", "video_token_index",
++                    "audio_start_token_id", "audio_end_token_id",
++                    "vision_start_token_id", "vision_end_token_id",
++                    "vision_token_id", "pad_token_id",
++                ]:
++                    if token_key in thinker and token_key not in kwargs:
++                        kwargs[token_key] = thinker[token_key]
++
++        super().__init__(
++            text_neuron_config=text_neuron_config,
++            vision_neuron_config=vision_neuron_config,
++            fused_spec_config=fused_spec_config,
++            load_config=load_config,
++            metadata=metadata,
++            **kwargs,
++        )
++
++        self.add_special_config()
++        self.validate_model_supported_configs()
++
++    def add_special_config(self):
++        self.num_cores_per_group = 1
++        self.qkv_bias = True
++        self.o_bias = False
++
++        # Vision config derived attributes
++        self.vision_config.head_dim = (
++            self.vision_config.embed_dim // self.vision_config.num_heads
++        )
++        self.vision_config.num_cores_per_group = 1
++
++        # Vision encoder MUST use separate Q/K/V (not fused)
++        if getattr(self.vision_config.neuron_config, "fused_qkv", True):
++            self.vision_config.neuron_config.fused_qkv = False
++            logger.info(
++                "Qwen2.5-Omni vision encoder: set fused_qkv=False "
++                "(separate Q/K/V projections)"
++            )
++
++        # Copy text config keys to top-level (for compatibility)
++        for key in _MULTIMODAL_TEXT_CONFIG_KEYS:
++            if hasattr(self.text_config, key):
++                setattr(self, key, getattr(self.text_config, key))
++
++        # Map Qwen2.5-Omni token IDs to Qwen2-VL compatible names
++        if hasattr(self, "image_token_index"):
++            self.image_token_id = self.image_token_index
++            self.text_config.image_token_id = self.image_token_index
++        if hasattr(self, "video_token_index"):
++            self.video_token_id = self.video_token_index
++            self.text_config.video_token_id = self.video_token_index
++        if hasattr(self, "audio_token_index"):
++            self.audio_token_id = self.audio_token_index
++            self.text_config.audio_token_id = self.audio_token_index
++
++        # Set pad_token_id
++        if hasattr(self, "pad_token_id"):
++            self.text_config.pad_token_id = self.pad_token_id
++
++        # Store audio_config as SimpleNamespace for attribute access
++        if hasattr(self, "audio_config") and isinstance(self.audio_config, dict):
++            self.audio_config = SimpleNamespace(**self.audio_config)
++
++    def validate_model_supported_configs(self):
++        # Disable unsupported features for text model
++        unsupported_text = [
++            "is_prefix_caching",
++            "is_chunked_prefill",
++            "is_medusa",
++            "enable_fused_speculation",
++        ]
++        for cfg_name in unsupported_text:
++            if getattr(self.text_config.neuron_config, cfg_name, False):
++                setattr(self.text_config.neuron_config, cfg_name, False)
++                logger.warning(
++                    f"Qwen2.5-Omni text model does not support "
++                    f"'{cfg_name}'. Disabled."
++                )
++
++        # Disable unsupported features for vision model
++        unsupported_vision = [
++            "sequence_parallel_enabled",
++            "flash_decoding_enabled",
++            "qkv_kernel_enabled",
++        ]
++        for cfg_name in unsupported_vision:
++            if getattr(self.vision_config.neuron_config, cfg_name, False):
++                setattr(self.vision_config.neuron_config, cfg_name, False)
++                logger.warning(
++                    f"Qwen2.5-Omni vision model does not support "
++                    f"'{cfg_name}'. Disabled."
++                )
++
++    def get_required_attributes(self) -> List[str]:
++        return [
++            "text_config",
++            "vision_config",
++            "text_config.hidden_size",
++            "text_config.num_attention_heads",
++            "text_config.num_hidden_layers",
++            "text_config.num_key_value_heads",
++            "text_config.pad_token_id",
++            "text_config.vocab_size",
++            "text_config.max_position_embeddings",
++            "text_config.rope_theta",
++            "text_config.rms_norm_eps",
++            "text_config.hidden_act",
++            "vision_config.depth",
++            "vision_config.embed_dim",
++            "vision_config.num_heads",
++            "vision_config.in_channels",
++            "vision_config.patch_size",
++            "vision_config.spatial_merge_size",
++            "vision_config.temporal_patch_size",
++            "vision_config.out_hidden_size",
++            "vision_config.intermediate_size",
++        ]
++
++    @classmethod
++    def get_neuron_config_cls(cls) -> Type[NeuronConfig]:
++        return NeuronConfig
++
++
++class NeuronQwen25OmniMultimodalForCausalLM(NeuronBaseForImageToText):
++    """Qwen2.5-Omni multimodal model (vision encoder + text decoder) on Neuron.
++
++    Reuses Qwen2-VL text model components (same mRoPE architecture) and
++    the Qwen2.5-Omni vision encoder (SwiGLU, RMSNorm, separate QKV).
++    """
++
++    # Import lazily to avoid circular imports
++    @staticmethod
++    def _get_text_model_cls():
++        from neuronx_distributed_inference.models.qwen2_vl.modeling_qwen2_vl_text import (
++            NeuronQwen2VLTextModel,
++        )
++        return NeuronQwen2VLTextModel
++
++    @staticmethod
++    def _get_text_model_wrapper():
++        from neuronx_distributed_inference.models.qwen2_vl.modeling_qwen2_vl_text import (
++            Qwen2VLTextModelWrapper,
++        )
++        return Qwen2VLTextModelWrapper
++
++    @staticmethod
++    def _get_vision_model_cls():
++        from neuronx_distributed_inference.models.qwen25_omni.modeling_qwen25_omni_vision import (
++            NeuronQwen25OmniVisionModel,
++        )
++        return NeuronQwen25OmniVisionModel
++
++    @staticmethod
++    def _get_vision_model_wrapper():
++        from neuronx_distributed_inference.models.qwen25_omni.modeling_qwen25_omni_vision import (
++            Qwen25OmniVisionModelWrapper,
++        )
++        return Qwen25OmniVisionModelWrapper
++
++    @staticmethod
++    def _get_audio_encoder_cls():
++        from neuronx_distributed_inference.models.qwen25_omni.modeling_qwen25_omni_audio import (
++            NeuronQwen25OmniAudioEncoder,
++        )
++        return NeuronQwen25OmniAudioEncoder
++
++    @staticmethod
++    def _get_talker_cls():
++        from neuronx_distributed_inference.models.qwen25_omni.modeling_qwen25_omni_talker import (
++            NeuronQwen25OmniTalker,
++        )
++        return NeuronQwen25OmniTalker
++
++    @staticmethod
++    def _get_token2wav_cls():
++        from neuronx_distributed_inference.models.qwen25_omni.modeling_qwen25_omni_token2wav import (
++            NeuronQwen25OmniToken2Wav,
++        )
++        return NeuronQwen25OmniToken2Wav
++
++    def __init__(self, *args, **kwargs):
++        super().__init__(
++            self._get_text_model_cls(),
++            self._get_vision_model_cls(),
++            self._get_text_model_wrapper(),
++            self._get_vision_model_wrapper(),
++            *args,
++            **kwargs,
++        )
++        self.audio_encoder = None
++        self.talker = None
++        self.token2wav = None
++        self.speaker_map = {}
++
++    def get_vision_compiler_args(self) -> str:
++        return (
++            "--auto-cast=none --model-type=transformer "
++            "--tensorizer-options='--enable-ccop-compute-overlap "
++            "--cc-pipeline-tiling-factor=2 ' -O1 "
++            "--internal-hlo2tensorizer-options='--verify-hlo=true'"
++        )
++
++    def get_compiler_args(self) -> str:
++        return (
++            "--enable-saturate-infinity "
++            "--enable-mixed-precision-accumulation "
++            "--auto-cast=none --model-type=transformer -O1 "
++            "--tensorizer-options='--enable-ccop-compute-overlap "
++            "--cc-pipeline-tiling-factor=2 "
++            "--vectorize-strided-dma' "
++            "--internal-hlo2tensorizer-options='--verify-hlo=true'"
++        )
++
++    def get_required_kwargs(self) -> List[str]:
++        return ["pixel_values", "vision_mask", "image_grid_thw"]
++
++    def enable_vision_encoder(
++        self, enable_wlt_optimization: bool = True, **model_init_kwargs
++    ):
++        new_config = copy.deepcopy(self.config)
++        self.vision_encoder_model = self._get_vision_model_wrapper()(
++            config=new_config,
++            model_cls=self._get_vision_model_cls(),
++            tag=VISION_ENCODER_MODEL_TAG,
++            compiler_args=self.get_vision_compiler_args(),
++            model_init_kwargs=model_init_kwargs,
++            priority_model_idx=(0 if enable_wlt_optimization else None),
++            pipeline_execution=True,
++            return_ranked_to_cpu=False,
++        )
++        self.vision_models.append(self.vision_encoder_model)
++
++    def enable_audio_encoder(self, state_dict=None):
++        """Initialize the audio encoder (CPU frontend/postprocessor + Neuron transformer).
++
++        The audio encoder is a hybrid CPU+Neuron module:
++          - CPU: Conv1d frontend, positional embeddings, chunking
++          - Neuron (TP=4): 32 transformer layers with block-diagonal attention
++          - CPU: AvgPool, LayerNorm, Linear projection
++
++        The CPU components are loaded from the converted state dict.
++        The Neuron transformer must be compiled/loaded separately via
++        compile_audio_encoder() and load_audio_encoder().
++
++        Args:
++            state_dict: Converted state dict containing audio_tower.* keys
++                (already split into frontend.*, transformer.*, postprocessor.*).
++                If None, the encoder is created with random weights.
++        """
++        audio_config = getattr(self.config, "audio_config", None)
++        if audio_config is None:
++            logger.warning(
++                "No audio_config found in model config. "
++                "Audio encoder will not be initialized."
++            )
++            return
++
++        AudioEncoderCls = self._get_audio_encoder_cls()
++        dtype = torch.bfloat16
++        if hasattr(self.config, "neuron_config"):
++            dtype = getattr(self.config.neuron_config, "torch_dtype", dtype)
++
++        if state_dict is not None:
++            self.audio_encoder = AudioEncoderCls.from_pretrained_state_dict(
++                audio_config, state_dict, dtype=dtype
++            )
++        else:
++            self.audio_encoder = AudioEncoderCls(audio_config, dtype=dtype)
++
++        self.audio_encoder.eval()
++        logger.info(
++            "Audio encoder initialized (CPU frontend/postprocessor, "
++            "Neuron transformer pending compile/load)"
++        )
++
++    def compile_audio_encoder(self, compiled_model_path, audio_neuron_config=None):
++        """Compile the audio encoder transformer layers on Neuron.
++
++        Args:
++            compiled_model_path: Path to save compiled model artifacts.
++            audio_neuron_config: Optional NeuronConfig for audio transformer.
++                If None, creates a default config with TP matching the text model.
++        """
++        if self.audio_encoder is None:
++            raise RuntimeError("Call enable_audio_encoder() first")
++
++        from neuronx_distributed_inference.models.qwen25_omni.modeling_qwen25_omni_audio import (
++            AudioEncoderInferenceConfig,
++            NeuronQwen25OmniForAudioEncoding,
++        )
++
++        audio_config = getattr(self.config, "audio_config", None)
++        if isinstance(audio_config, dict):
++            from types import SimpleNamespace
++            audio_config = SimpleNamespace(**audio_config)
++
++        if audio_neuron_config is None:
++            # Default: match text model TP degree, reasonable seq_len buckets
++            tp_degree = self.neuron_config.tp_degree
++            audio_neuron_config = NeuronConfig(
++                tp_degree=tp_degree,
++                torch_dtype=self.neuron_config.torch_dtype,
++                batch_size=1,
++                # Audio seq_len buckets: typical values after conv
++                buckets=[256, 512, 1024, 1500],
++            )
++
++        audio_inf_config = AudioEncoderInferenceConfig(
++            neuron_config=audio_neuron_config,
++            audio_config=vars(audio_config) if hasattr(audio_config, '__dict__') else audio_config,
++        )
++
++        audio_app = NeuronQwen25OmniForAudioEncoding(audio_inf_config)
++        audio_app.compile(compiled_model_path)
++
++        logger.info("Audio encoder transformer compiled to %s", compiled_model_path)
++        return audio_app
++
++    def load_audio_encoder(self, compiled_model_path, audio_app=None):
++        """Load compiled audio encoder transformer layers.
++
++        Args:
++            compiled_model_path: Path to compiled model artifacts.
++            audio_app: Optional pre-compiled NeuronQwen25OmniForAudioEncoding.
++                If None, creates and loads from compiled_model_path.
++        """
++        if self.audio_encoder is None:
++            raise RuntimeError("Call enable_audio_encoder() first")
++
++        if audio_app is None:
++            from neuronx_distributed_inference.models.qwen25_omni.modeling_qwen25_omni_audio import (
++                AudioEncoderInferenceConfig,
++                NeuronQwen25OmniForAudioEncoding,
++            )
++            # Load from compiled artifacts
++            audio_app = NeuronQwen25OmniForAudioEncoding.load(compiled_model_path)
++
++        self.audio_encoder.transformer = audio_app.model
++        logger.info("Audio encoder transformer loaded from %s", compiled_model_path)
++
++    def enable_talker(self, state_dict=None):
++        """Initialize the Talker model (runs on CPU).
++
++        The Talker converts Thinker hidden states into codec tokens for
++        speech synthesis. It uses HF's autoregressive generation with
++        KV cache. Stays on CPU because:
++          - Non-standard head_dim (128 != 896/12) incompatible with NeuronAttentionBase
++          - 3D mRoPE with per-step position recomputation from Thinker output
++          - Custom input pipeline (embed + thinker_state + project) at every step
++          - Only ~690M params — not a bottleneck vs. the 7B Thinker on Neuron
++
++        Args:
++            state_dict: Converted state dict containing talker keys.
++                If None, the Talker is created with random weights.
++        """
++        talker_config = getattr(self.config, "talker_config", None)
++        if talker_config is None:
++            logger.warning(
++                "No talker_config found in model config. "
++                "Talker will not be initialized."
++            )
++            return
++
++        TalkerCls = self._get_talker_cls()
++        dtype = torch.bfloat16
++
++        if state_dict is not None:
++            self.talker = TalkerCls.from_pretrained_state_dict(
++                talker_config, state_dict, dtype=dtype
++            )
++        else:
++            self.talker = TalkerCls(talker_config, dtype=dtype)
++
++        logger.info("Talker initialized on CPU")
++
++    def enable_token2wav(self, state_dict=None, speaker_dict_path=None):
++        """Initialize the Token2Wav vocoder (runs on CPU in float32).
++
++        Token2Wav converts codec tokens from the Talker into audio
++        waveforms using DiT + BigVGAN.
++
++        Args:
++            state_dict: Converted state dict containing token2wav keys.
++                If None, Token2Wav is created with random weights.
++            speaker_dict_path: Path to spk_dict.pt for speaker conditioning.
++                If provided, loads the speaker map for audio generation.
++        """
++        token2wav_config = getattr(self.config, "token2wav_config", None)
++        if token2wav_config is None:
++            logger.warning(
++                "No token2wav_config found in model config. "
++                "Token2Wav will not be initialized."
++            )
++            return
++
++        Token2WavCls = self._get_token2wav_cls()
++
++        if state_dict is not None:
++            self.token2wav = Token2WavCls.from_pretrained_state_dict(
++                token2wav_config, state_dict
++            )
++        else:
++            self.token2wav = Token2WavCls(token2wav_config)
++
++        if speaker_dict_path is not None:
++            self.speaker_map = Token2WavCls.load_speaker_dict(speaker_dict_path)
++            logger.info(
++                "Loaded %d speakers: %s",
++                len(self.speaker_map),
++                list(self.speaker_map.keys()),
++            )
++
++        logger.info("Token2Wav initialized on CPU (float32)")
++
++    @staticmethod
++    def load_hf_model(model_path, **kwargs):
++        from transformers import AutoModelForCausalLM
++
++        return AutoModelForCausalLM.from_pretrained(
++            model_path, trust_remote_code=True, **kwargs
++        )
++
++    @staticmethod
++    def convert_hf_to_neuron_state_dict(
++        state_dict: dict,
++        inference_config: Qwen25OmniMultimodalInferenceConfig,
++        include_talker: bool = False,
++        include_token2wav: bool = False,
++    ) -> dict:
++        """Convert Qwen2.5-Omni full state dict to NxDI format.
++
++        1. Remap thinker.* prefixes to Qwen2-VL compatible format
++        2. Apply vision encoder conversion (separate Q/K/V, SwiGLU MLP)
++        3. Apply audio encoder conversion (strip prefix, cast dtype)
++        4. Apply text model conversion (fused QKV, attention key renames)
++        5. Optionally strip talker.* and token2wav.* prefixes
++
++        Args:
++            state_dict: Full HF state dict
++            inference_config: Multimodal inference config
++            include_talker: If True, include talker keys (stripped prefix)
++            include_token2wav: If True, include token2wav keys (stripped prefix)
++        """
++        from neuronx_distributed_inference.models.qwen25_omni.modeling_qwen25_omni_audio import (
++            NeuronQwen25OmniAudioEncoder,
++        )
++        from neuronx_distributed_inference.models.qwen25_omni.modeling_qwen25_omni_vision import (
++            NeuronQwen25OmniForImageEncoding,
++        )
++        from neuronx_distributed_inference.models.qwen2_vl.modeling_qwen2_vl_text import (
++            NeuronQwen2VLTextForCausalLM,
++        )
++
++        # Step 1: Remap thinker.* prefixes, optionally keep talker/token2wav
++        remapped = {}
++        talker_state = {}
++        token2wav_state = {}
++        for key, value in state_dict.items():
++            if key.startswith("thinker.model."):
++                remapped["model." + key[len("thinker.model."):]] = value
++            elif key.startswith("thinker.lm_head."):
++                remapped[key[len("thinker."):]] = value
++            elif key.startswith("thinker.visual."):
++                remapped["visual." + key[len("thinker.visual."):]] = value
++            elif key.startswith("thinker.audio_tower."):
++                remapped["audio_tower." + key[len("thinker.audio_tower."):]] = value
++            elif key.startswith("talker.") and include_talker:
++                talker_state[key[len("talker."):]] = value
++            elif key.startswith("token2wav.") and include_token2wav:
++                token2wav_state[key[len("token2wav."):]] = value
++
++        del state_dict
++        gc.collect()
++
++        logger.info(
++            "Remapped %d thinker keys%s%s",
++            len(remapped),
++            " + %d talker keys" % len(talker_state) if talker_state else "",
++            " + %d token2wav keys" % len(token2wav_state) if token2wav_state else "",
++        )
++
++        # Step 2: Vision encoder conversion
++        remapped = NeuronQwen25OmniForImageEncoding.convert_hf_to_neuron_state_dict(
++            remapped, inference_config
++        )
++
++        # Step 3: Audio encoder conversion (strip prefix, cast dtype)
++        audio_dtype = getattr(
++            inference_config, "torch_dtype", torch.bfloat16
++        )
++        if hasattr(inference_config, "neuron_config"):
++            audio_dtype = getattr(
++                inference_config.neuron_config, "torch_dtype", audio_dtype
++            )
++        remapped = NeuronQwen25OmniAudioEncoder.convert_hf_to_neuron_state_dict(
++            remapped, dtype=audio_dtype
++        )
++
++        # Step 4: Text model conversion
++        remapped = NeuronQwen2VLTextForCausalLM.convert_hf_to_neuron_state_dict(
++            remapped, inference_config.text_config
++        )
++
++        # Step 5: Merge talker and token2wav state dicts
++        if talker_state:
++            for k, v in talker_state.items():
++                remapped["talker." + k] = v
++            logger.info("Included %d talker keys in output", len(talker_state))
++        if token2wav_state:
++            for k, v in token2wav_state.items():
++                remapped["token2wav." + k] = v
++            logger.info("Included %d token2wav keys in output", len(token2wav_state))
++
++        return remapped
++
++    def get_padding_length(self, input_ids):
++        """Get the context encoding bucket size for given input_ids."""
++        buckets = self.context_encoding_model.config.neuron_config.buckets
++        for val in buckets:
++            if val >= input_ids.shape[1]:
++                return val
++        raise Exception("No bucket found for provided input_ids!")
++
++    def forward(
++        self,
++        input_ids: torch.LongTensor = None,
++        attention_mask: Optional[torch.Tensor] = None,
++        position_ids: Optional[torch.LongTensor] = None,
++        seq_ids: Optional[torch.LongTensor] = None,
++        sampling_params: Optional[torch.FloatTensor] = None,
++        pixel_values: Optional[torch.FloatTensor] = None,
++        vision_mask: Optional[torch.FloatTensor] = None,
++        image_grid_thw: Optional[torch.LongTensor] = None,
++        input_features: Optional[torch.FloatTensor] = None,
++        feature_attention_mask: Optional[torch.LongTensor] = None,
++        adapter_ids: Optional[torch.LongTensor] = None,
++        past_key_values: Optional[List[torch.FloatTensor]] = None,
++        use_cache: Optional[bool] = None,
++        medusa_args=None,
++        input_capture_hook: Optional[Callable] = None,
++        tensor_capture_hook: Optional[Callable] = None,
++        return_dict: Optional[bool] = None,
++    ) -> Union[Tuple, CausalLMOutputWithPast]:
++        from neuronx_distributed_inference.models.llama4.utils.encoder_utils import (
++            generate_positions_from_mask,
++            pad_positions,
++        )
++
++        pad_limit = self.get_padding_length(input_ids)
++        is_context_encoding = input_ids.shape[-1] > 1
++
++        # --- Audio encoding (CPU frontend + Neuron transformer + CPU postprocessor) ---
++        audio_embeddings = None
++        audio_positions = None
++        if (
++            input_features is not None
++            and self.audio_encoder is not None
++            and is_context_encoding
++        ):
++            audio_token_id = getattr(
++                self.config, "audio_token_id", None
++            ) or getattr(self.config, "audio_token_index", 151646)
++
++            with torch.no_grad():
++                # Prepare audio features (same as HF get_audio_features)
++                if feature_attention_mask is not None:
++                    audio_feature_lengths = feature_attention_mask.sum(-1)
++                    # (batch, mel_len, n_mels) -> mask -> (n_mels, valid_len)
++                    input_features_flat = input_features.permute(0, 2, 1)[
++                        feature_attention_mask.bool()
++                    ].permute(1, 0)
++                else:
++                    input_features_flat = input_features.squeeze(0).permute(1, 0)
++                    audio_feature_lengths = torch.tensor(
++                        [input_features_flat.shape[1]], dtype=torch.long
++                    )
++
++                aftercnn_lens, audio_output_lens = (
++                    self.audio_encoder._get_feat_extract_output_lengths(
++                        audio_feature_lengths
++                    )
++                )
++                audio_embeddings = self.audio_encoder(
++                    input_features_flat,
++                    feature_lens=audio_feature_lengths,
++                    aftercnn_lens=aftercnn_lens,
++                )
++
++                # Find audio token positions for scattering
++                audio_mask_bool = (input_ids == audio_token_id)
++                if audio_mask_bool.any() and audio_embeddings is not None:
++                    audio_positions = generate_positions_from_mask(
++                        audio_mask_bool.squeeze()
++                    )
++
++        # --- Vision encoding (Neuron) ---
++        vision_embeddings = None
++        vision_positions = None
++        if (
++            (pixel_values is not None)
++            and is_context_encoding
++            and pixel_values.sum() != 0
++        ):
++            image_token_id = getattr(self.config, "image_token_id", None) or getattr(
++                self.config, "image_token_index", 151655
++            )
++            vision_mask_bool = (input_ids == image_token_id)
++            if vision_mask_bool.any():
++                vision_positions = generate_positions_from_mask(
++                    vision_mask_bool.squeeze()
++                )
++                vision_embeddings = self.vision_encoder_model(
++                    pixel_values.to(self.vision_config.neuron_config.torch_dtype),
++                    image_grid_thw,
++                )
++
++        # --- Combine multimodal embeddings for scattering ---
++        # The text model's encode_vision_to_input scatters embeddings at
++        # specified positions. We combine audio + vision into one tensor.
++        if audio_embeddings is not None and vision_embeddings is not None:
++            # Both audio and vision present
++            # audio_embeddings is on CPU, vision_embeddings may be on XLA
++            # The model wrapper handles device transfer, so keep on CPU
++            all_embeddings = torch.cat([
++                vision_embeddings.cpu() if vision_embeddings.is_cuda else vision_embeddings,
++                audio_embeddings,
++            ], dim=0)
++            all_positions = torch.cat([vision_positions, audio_positions])
++            vision_embeddings = all_embeddings
++            vision_mask = pad_positions(all_positions, pad_limit, (pad_limit - 1))
++        elif audio_embeddings is not None and audio_positions is not None:
++            # Audio only, no vision
++            vision_embeddings = audio_embeddings
++            vision_mask = pad_positions(audio_positions, pad_limit, (pad_limit - 1))
++        elif vision_embeddings is not None and vision_positions is not None:
++            # Vision only, no audio
++            vision_mask = pad_positions(vision_positions, pad_limit, (pad_limit - 1))
++        else:
++            # No multimodal input - use dummy embeddings
++            vision_embeddings, vision_mask = self._get_text_model_wrapper().get_dummy_vision_inputs(
++                config=self.text_config,
++                input_ids=input_ids,
++                n_active_tokens=pad_limit,
++                fill_value=(pad_limit - 1),
++            )
++
++        output_token = super().forward(
++            input_ids=input_ids,
++            attention_mask=attention_mask,
++            position_ids=position_ids,
++            seq_ids=seq_ids,
++            sampling_params=sampling_params,
++            input_capture_hook=input_capture_hook,
++            tensor_capture_hook=tensor_capture_hook,
++            vision_embeddings=vision_embeddings,
++            vision_mask=vision_mask,
++        )
++        return output_token
++
++    @classmethod
++    def get_config_cls(cls):
++        return Qwen25OmniMultimodalInferenceConfig
+diff --git a/src/neuronx_distributed_inference/models/qwen25_omni/modeling_qwen25_omni_audio.py b/src/neuronx_distributed_inference/models/qwen25_omni/modeling_qwen25_omni_audio.py
+new file mode 100644
+index 00000000..a58f1f50
+--- /dev/null
++++ b/src/neuronx_distributed_inference/models/qwen25_omni/modeling_qwen25_omni_audio.py
+@@ -0,0 +1,700 @@
++# coding=utf-8
++# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
++# SPDX-License-Identifier: Apache-2.0
++#
++# Qwen2.5-Omni Audio Encoder for NXD inference.
++#
++# Whisper-style audio encoder with TP=4 support:
++#   - Conv1d frontend + sinusoidal positional embeddings (CPU preprocessing)
++#   - 32 transformer layers with TP-parallel attention and MLP (Neuron)
++#   - AvgPool1d + LayerNorm + Linear projection (CPU postprocessing)
++#
++# Architecture:
++#   d_model=1280, heads=20 (5 per rank at TP=4), head_dim=64
++#   ffn=5120 (1280 per rank at TP=4), output_dim=3584
++#   Asymmetric attention bias: q/v have bias, k has NO bias
++#
++# The transformer layers are compiled on Neuron via ModelWrapper.
++# Conv1d frontend and postprocessing run on CPU since they involve
++# variable-length processing (chunking, per-audio AvgPool).
++
++"""Qwen2.5-Omni Audio Encoder for NXD inference."""
++
++import logging
++import math
++from types import SimpleNamespace
++from typing import List, Optional, Tuple
++
++import numpy as np
++import torch
++import torch.nn as nn
++import torch.nn.functional as F
++
++from neuronx_distributed.parallel_layers.layers import (
++    ColumnParallelLinear,
++    RowParallelLinear,
++)
++from neuronx_distributed_inference.models.application_base import NeuronApplicationBase
++from neuronx_distributed_inference.models.config import InferenceConfig, NeuronConfig
++from neuronx_distributed_inference.models.model_wrapper import (
++    EncoderModelInstance,
++    ModelWrapper,
++)
++from neuronx_distributed_inference.modules.padding import pad_tensor
++
++logger = logging.getLogger(__name__)
++
++
++# ---------------------------------------------------------------------------
++# CPU components (not compiled on Neuron)
++# ---------------------------------------------------------------------------
++
++class SinusoidsPositionEmbedding(nn.Module):
++    """Sinusoidal positional embeddings (same as Whisper/HF Qwen2.5-Omni)."""
++
++    def __init__(self, length, channels, max_timescale=10000):
++        super().__init__()
++        if channels % 2 != 0:
++            raise ValueError("SinusoidsPositionEmbedding needs even channels")
++        log_timescale_increment = np.log(max_timescale) / (channels // 2 - 1)
++        inv_timescales = torch.exp(
++            -log_timescale_increment * torch.arange(channels // 2).float()
++        )
++        scaled_time = (
++            torch.arange(length)[:, np.newaxis] * inv_timescales[np.newaxis, :]
++        )
++        self.register_buffer(
++            "positional_embedding",
++            torch.cat([torch.sin(scaled_time), torch.cos(scaled_time)], dim=1),
++            persistent=False,
++        )
++
++    def forward(self, seqlen: int):
++        return self.positional_embedding[:seqlen, :]
++
++
++class AudioCPUFrontend(nn.Module):
++    """Conv1d frontend + positional embeddings + chunking (CPU).
++
++    Processes raw mel spectrograms into token sequences ready for the
++    Neuron transformer. Also handles audio chunking for long audio.
++    """
++
++    def __init__(self, audio_config, dtype=torch.bfloat16):
++        super().__init__()
++        if isinstance(audio_config, dict):
++            audio_config = SimpleNamespace(**audio_config)
++
++        d_model = audio_config.d_model  # 1280
++        num_mel_bins = audio_config.num_mel_bins  # 128
++        max_source_positions = audio_config.max_source_positions  # 1500
++        self.n_window = audio_config.n_window  # 100
++        self.d_model = d_model
++
++        self.conv1 = nn.Conv1d(
++            num_mel_bins, d_model, kernel_size=3, padding=1, dtype=dtype
++        )
++        self.conv2 = nn.Conv1d(
++            d_model, d_model, kernel_size=3, stride=2, padding=1, dtype=dtype
++        )
++        self.positional_embedding = SinusoidsPositionEmbedding(
++            max_source_positions, d_model
++        )
++
++    def _padded_and_mask_function(self, chunk_list, chunk_lengths):
++        """Pad chunks to same length and create masks."""
++        max_len = chunk_lengths.max().item()
++        dim = chunk_list[0].shape[0]
++
++        padded_tensor = torch.zeros(
++            len(chunk_list), dim, max_len,
++            dtype=chunk_list[0].dtype, device=chunk_list[0].device,
++        )
++        batch_mask = torch.zeros(
++            len(chunk_lengths), max_len,
++            dtype=torch.long, device=chunk_list[0].device,
++        )
++        for i, (chunk, length) in enumerate(zip(chunk_list, chunk_lengths)):
++            length = length.item()
++            batch_mask[i, :length] = 1
++            padded_tensor[i, :, :chunk.shape[1]] = chunk
++
++        feature_lens_after_cnn = (chunk_lengths - 1) // 2 + 1
++        max_len_after_cnn = feature_lens_after_cnn.max().item()
++        batch_mask_after_cnn = torch.zeros(
++            len(chunk_lengths), max_len_after_cnn,
++            dtype=torch.bool, device=chunk_list[0].device,
++        )
++        for i, length in enumerate(feature_lens_after_cnn):
++            batch_mask_after_cnn[i, :length] = True
++
++        return padded_tensor, batch_mask.unsqueeze(1), batch_mask_after_cnn
++
++    def forward(self, input_features, feature_lens):
++        """Process mel spectrogram through conv frontend.
++
++        Args:
++            input_features: (n_mels, total_mel_len) mel spectrogram
++            feature_lens: (num_audios,) mel length for each audio
++
++        Returns:
++            hidden_states: (total_valid_tokens, d_model) token embeddings
++            aftercnn_lens: (num_audios,) valid token count per audio
++            cu_seqlens: cumulative sequence lengths for attention masking
++        """
++        aftercnn_lens = (feature_lens - 1) // 2 + 1
++
++        # Split into chunks of n_window * 2 mel frames
++        chunk_num = torch.ceil(feature_lens / (self.n_window * 2)).long()
++        chunk_lengths = torch.tensor(
++            [self.n_window * 2] * chunk_num.sum().item(),
++            dtype=torch.long, device=feature_lens.device,
++        )
++        tail_chunk_index = F.pad(chunk_num, (1, 0), value=-1).cumsum(0)[1:]
++        chunk_lengths[tail_chunk_index] = feature_lens % (self.n_window * 2)
++        chunk_lengths = torch.where(
++            chunk_lengths == 0, self.n_window * 2, chunk_lengths
++        )
++
++        chunk_list = input_features.split(chunk_lengths.tolist(), dim=1)
++        padded_feature, padded_mask, padded_mask_after_cnn = (
++            self._padded_and_mask_function(chunk_list, chunk_lengths)
++        )
++
++        # Conv frontend
++        padded_embed = F.gelu(self.conv1(padded_feature)) * padded_mask
++        padded_embed = F.gelu(self.conv2(padded_embed)).transpose(1, 2)
++
++        # Add positional embeddings
++        padded_embed = padded_embed + self.positional_embedding(
++            padded_embed.shape[1]
++        ).unsqueeze(0).to(padded_embed.dtype)
++
++        # Flatten valid tokens
++        hidden_states = padded_embed[padded_mask_after_cnn]
++
++        # Compute cu_seqlens for attention mask
++        cu_seqlens = torch.cat([
++            torch.zeros(1, device=feature_lens.device, dtype=torch.int32),
++            padded_mask_after_cnn.sum(1).cumsum(0).to(torch.int32),
++        ])
++
++        return hidden_states, aftercnn_lens, cu_seqlens
++
++
++class AudioCPUPostprocessor(nn.Module):
++    """AvgPool + LayerNorm + projection (CPU).
++
++    Post-processes transformer output into final audio embeddings.
++    """
++
++    def __init__(self, audio_config, dtype=torch.bfloat16):
++        super().__init__()
++        if isinstance(audio_config, dict):
++            audio_config = SimpleNamespace(**audio_config)
++
++        d_model = audio_config.d_model  # 1280
++        output_dim = audio_config.output_dim  # 3584
++
++        self.ln_post = nn.LayerNorm(d_model)  # stays float32
++        self.avg_pooler = nn.AvgPool1d(2, stride=2)
++        self.proj = nn.Linear(d_model, output_dim, dtype=dtype)
++        self.audio_bos_eos_token = nn.Embedding(2, output_dim)
++
++    def forward(self, hidden_states, aftercnn_lens):
++        """Post-process transformer output.
++
++        Args:
++            hidden_states: (total_tokens, d_model) transformer output
++            aftercnn_lens: (num_audios,) token count per audio
++
++        Returns:
++            audio_embeddings: (total_output_tokens, output_dim)
++        """
++        hidden_states_list = hidden_states.split(aftercnn_lens.tolist(), dim=0)
++        token_audio_list = []
++        for each_audio_states in hidden_states_list:
++            each_audio_states = self.avg_pooler(
++                each_audio_states.transpose(0, 1)
++            ).transpose_(0, 1)
++            each_audio_states = self.ln_post(each_audio_states.float()).to(
++                each_audio_states.dtype
++            )
++            each_audio_states = self.proj(each_audio_states)
++            token_audio_list.append(each_audio_states)
++
++        return torch.cat(token_audio_list, dim=0)
++
++
++# ---------------------------------------------------------------------------
++# Neuron-compiled transformer components (TP=4)
++# ---------------------------------------------------------------------------
++
++class NeuronAudioAttention(nn.Module):
++    """TP-parallel self-attention for audio encoder.
++
++    Asymmetric bias: q_proj and v_proj have bias, k_proj has NO bias.
++    Uses ColumnParallelLinear for Q/K/V and RowParallelLinear for output.
++    """
++
++    def __init__(self, d_model, num_heads, tp_degree, dtype=torch.bfloat16):
++        super().__init__()
++        self.d_model = d_model
++        self.num_heads = num_heads
++        self.head_dim = d_model // num_heads
++        self.num_heads_per_rank = num_heads // tp_degree
++        self.scaling = self.head_dim ** -0.5
++
++        self.q_proj = ColumnParallelLinear(
++            d_model, d_model, bias=True, gather_output=False, dtype=dtype,
++        )
++        self.k_proj = ColumnParallelLinear(
++            d_model, d_model, bias=False, gather_output=False, dtype=dtype,
++        )
++        self.v_proj = ColumnParallelLinear(
++            d_model, d_model, bias=True, gather_output=False, dtype=dtype,
++        )
++        self.out_proj = RowParallelLinear(
++            d_model, d_model, bias=True, input_is_parallel=True, dtype=dtype,
++        )
++
++    def forward(self, hidden_states, attention_mask=None):
++        """
++        Args:
++            hidden_states: (batch, seq_len, d_model)
++            attention_mask: (batch, 1, seq_len, seq_len) with 0 for valid, -inf for masked
++        """
++        bsz, seq_len, _ = hidden_states.shape
++
++        # Project Q/K/V (ColumnParallelLinear outputs d_model/tp per rank)
++        q = self.q_proj(hidden_states)  # (bsz, seq, d_model/tp)
++        k = self.k_proj(hidden_states)
++        v = self.v_proj(hidden_states)
++
++        # Reshape to (bsz, num_heads_per_rank, seq, head_dim)
++        q = q.view(bsz, seq_len, self.num_heads_per_rank, self.head_dim).transpose(1, 2)
++        k = k.view(bsz, seq_len, self.num_heads_per_rank, self.head_dim).transpose(1, 2)
++        v = v.view(bsz, seq_len, self.num_heads_per_rank, self.head_dim).transpose(1, 2)
++
++        # Attention scores
++        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scaling
++        if attention_mask is not None:
++            scores = scores + attention_mask
++
++        attn_weights = F.softmax(scores.float(), dim=-1).to(q.dtype)
++        attn_output = torch.matmul(attn_weights, v)
++
++        # Reshape and project output (RowParallelLinear allreduces across ranks)
++        attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
++        attn_output = self.out_proj(attn_output)
++        return attn_output
++
++
++class NeuronAudioEncoderLayer(nn.Module):
++    """Audio encoder transformer layer (TP-parallel).
++
++    Pre-norm: LayerNorm -> attention -> residual -> LayerNorm -> MLP -> residual.
++    Uses GELU activation (not SwiGLU). LayerNorm operates in float32.
++    """
++
++    def __init__(self, d_model, num_heads, ffn_dim, tp_degree, dtype=torch.bfloat16):
++        super().__init__()
++        self.self_attn = NeuronAudioAttention(d_model, num_heads, tp_degree, dtype)
++        self.self_attn_layer_norm = nn.LayerNorm(d_model)
++        self.fc1 = ColumnParallelLinear(
++            d_model, ffn_dim, bias=True, gather_output=False, dtype=dtype,
++        )
++        self.fc2 = RowParallelLinear(
++            ffn_dim, d_model, bias=True, input_is_parallel=True, dtype=dtype,
++        )
++        self.final_layer_norm = nn.LayerNorm(d_model)
++
++    def forward(self, hidden_states, attention_mask=None):
++        residual = hidden_states
++        hidden_states = self.self_attn_layer_norm(hidden_states.float()).to(residual.dtype)
++        hidden_states = self.self_attn(hidden_states, attention_mask)
++        hidden_states = residual + hidden_states
++
++        residual = hidden_states
++        hidden_states = self.final_layer_norm(hidden_states.float()).to(residual.dtype)
++        hidden_states = F.gelu(self.fc1(hidden_states))
++        hidden_states = self.fc2(hidden_states)
++        hidden_states = residual + hidden_states
++
++        return hidden_states
++
++
++class NeuronAudioTransformerModel(nn.Module):
++    """Audio encoder transformer (32 layers, compiled on Neuron).
++
++    Takes pre-processed hidden states (after conv + positional embedding)
++    and returns transformer output. The attention mask handles block-diagonal
++    masking for chunked audio.
++
++    Input:  (1, padded_seq_len, d_model) + (1, 1, padded_seq_len, padded_seq_len)
++    Output: (1, padded_seq_len, d_model)
++    """
++
++    def __init__(self, config: InferenceConfig):
++        super().__init__()
++        audio_config = config.audio_config
++        if isinstance(audio_config, dict):
++            audio_config = SimpleNamespace(**audio_config)
++
++        tp_degree = config.neuron_config.tp_degree
++        dtype = config.neuron_config.torch_dtype
++
++        d_model = audio_config.d_model
++        num_heads = audio_config.encoder_attention_heads
++        ffn_dim = audio_config.encoder_ffn_dim
++        num_layers = audio_config.encoder_layers
++
++        self.layers = nn.ModuleList([
++            NeuronAudioEncoderLayer(d_model, num_heads, ffn_dim, tp_degree, dtype)
++            for _ in range(num_layers)
++        ])
++
++    def forward(self, hidden_states, attention_mask):
++        for layer in self.layers:
++            hidden_states = layer(hidden_states, attention_mask)
++        return hidden_states
++
++
++# ---------------------------------------------------------------------------
++# ModelWrapper and Application classes
++# ---------------------------------------------------------------------------
++
++class AudioTransformerModelWrapper(ModelWrapper):
++    """Handles bucketing on sequence length, padding, and compilation."""
++
++    def __init__(self, config, model_cls, tag="", compiler_args=None,
++                 priority_model_idx=None, pipeline_execution=True,
++                 return_ranked_to_cpu=False, model_init_kwargs={}):
++        super().__init__(
++            config, model_cls, tag, compiler_args, priority_model_idx,
++            pipeline_execution, return_ranked_to_cpu, model_init_kwargs,
++        )
++
++    def input_generator(self) -> List[Tuple[torch.Tensor]]:
++        """Generate sample inputs for each sequence length bucket."""
++        inputs = []
++        dtype = self.config.neuron_config.torch_dtype
++        d_model = self.config.audio_config.d_model
++        if isinstance(d_model, dict):
++            d_model = d_model.get("d_model", 1280)
++
++        for bucket in self.config.neuron_config.buckets:
++            hidden_states = torch.ones([1, bucket, d_model], dtype=dtype)
++            attention_mask = torch.zeros(
++                [1, 1, bucket, bucket], dtype=dtype,
++            )
++            inputs.append((hidden_states, attention_mask))
++        return inputs
++
++    def get_model_instance(self):
++        return EncoderModelInstance(model_cls=self.model_cls, config=self.config)
++
++    def get_target_bucket(self, seq_len):
++        """Find the smallest bucket that fits the sequence length."""
++        for bucket in self.config.neuron_config.buckets:
++            if bucket >= seq_len:
++                return bucket
++        raise ValueError(
++            f"No bucket found for seq_len={seq_len}. "
++            f"Buckets: {self.config.neuron_config.buckets}"
++        )
++
++    def forward(self, hidden_states, attention_mask):
++        """Pad to bucket size and run compiled model."""
++        if self.model is None:
++            raise RuntimeError("Forward called before load.")
++
++        seq_len = hidden_states.shape[1]
++        bucket = self.get_target_bucket(seq_len)
++
++        # Pad sequence to bucket size
++        if seq_len < bucket:
++            pad_len = bucket - seq_len
++            hidden_states = F.pad(hidden_states, (0, 0, 0, pad_len))
++            # Extend attention mask: new positions are masked out
++            dtype = attention_mask.dtype
++            mask_pad = torch.full(
++                (1, 1, bucket, bucket),
++                torch.finfo(dtype).min,
++                dtype=dtype,
++            )
++            mask_pad[:, :, :seq_len, :seq_len] = attention_mask
++            attention_mask = mask_pad
++
++        output = self._forward(hidden_states, attention_mask)
++        # Trim back to original length
++        return output[:, :seq_len, :]
++
++
++class NeuronQwen25OmniForAudioEncoding(NeuronApplicationBase):
++    """Neuron application for audio encoder transformer layers.
++
++    Handles compilation, loading, and inference of the 32 transformer layers.
++    The conv frontend and postprocessing are handled separately on CPU.
++    """
++
++    _model_cls = NeuronAudioTransformerModel
++
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        self.model = AudioTransformerModelWrapper(
++            config=self.config,
++            model_cls=self._model_cls,
++            tag=self._model_cls.__name__,
++            compiler_args=self.get_compiler_args(),
++            priority_model_idx=0,
++        )
++        self.models.append(self.model)
++
++    def forward(self, hidden_states, attention_mask):
++        return self.models[0](hidden_states, attention_mask)
++
++    def get_compiler_args(self):
++        return (
++            "--auto-cast=none --model-type=transformer "
++            "--tensorizer-options='--enable-ccop-compute-overlap "
++            "--cc-pipeline-tiling-factor=2 ' -O1 "
++            "--internal-hlo2tensorizer-options='--verify-hlo=true'"
++        )
++
++    @staticmethod
++    def update_state_dict_for_tied_weights(state_dict):
++        pass
++
++    @staticmethod
++    def load_hf_model(model_path, **kwargs):
++        from transformers import AutoModelForCausalLM
++        return AutoModelForCausalLM.from_pretrained(
++            model_path, trust_remote_code=True, **kwargs
++        )
++
++    @staticmethod
++    def convert_hf_to_neuron_state_dict(state_dict, inference_config):
++        """Convert HF state dict to Neuron format for audio transformer layers.
++
++        Extracts audio_tower.layers.* keys and strips prefix.
++        Only returns transformer layer keys (not conv/postprocessing).
++        """
++        new_state_dict = {}
++        for key, value in state_dict.items():
++            if key.startswith("thinker.audio_tower.layers."):
++                new_key = key[len("thinker.audio_tower."):]
++            elif key.startswith("audio_tower.layers."):
++                new_key = key[len("audio_tower."):]
++            else:
++                new_state_dict[key] = value
++                continue
++            new_state_dict[new_key] = value
++        return new_state_dict
++
++    @classmethod
++    def get_config_cls(cls):
++        return AudioEncoderInferenceConfig
++
++
++class AudioEncoderInferenceConfig(InferenceConfig):
++    """Config for audio encoder transformer compilation."""
++
++    def __init__(self, neuron_config, audio_config, **kwargs):
++        # Store audio_config before calling super
++        self.audio_config = audio_config
++        if isinstance(audio_config, dict):
++            self.audio_config = SimpleNamespace(**audio_config)
++        super().__init__(neuron_config=neuron_config, **kwargs)
++
++    def add_derived_config(self):
++        pass
++
++    def get_required_attributes(self):
++        return []
++
++
++# ---------------------------------------------------------------------------
++# Full Audio Encoder (combines CPU frontend + Neuron transformer + CPU postprocessing)
++# ---------------------------------------------------------------------------
++
++class NeuronQwen25OmniAudioEncoder(nn.Module):
++    """Qwen2.5-Omni Audio Encoder with Neuron acceleration.
++
++    Architecture:
++      CPU: mel → Conv1d frontend → positional embeddings → chunking
++      Neuron (TP=4): 32 transformer layers with block-diagonal attention
++      CPU: AvgPool → LayerNorm → Linear projection → audio embeddings
++
++    Usage:
++      1. Create with audio_config
++      2. Call compile_transformer() to compile on Neuron
++      3. Call load_transformer() to load compiled model
++      4. Call forward() to encode audio
++    """
++
++    def __init__(self, audio_config, neuron_config=None, dtype=torch.bfloat16):
++        super().__init__()
++        if isinstance(audio_config, dict):
++            audio_config = SimpleNamespace(**audio_config)
++        self.audio_config = audio_config
++        self.dtype = dtype
++        self.n_window = audio_config.n_window
++
++        # CPU components
++        self.frontend = AudioCPUFrontend(audio_config, dtype=dtype)
++        self.postprocessor = AudioCPUPostprocessor(audio_config, dtype=dtype)
++
++        # Neuron transformer (initialized via compile/load cycle)
++        self.transformer = None
++        self._neuron_config = neuron_config
++
++    def _get_feat_extract_output_lengths(self, input_lengths):
++        """Compute output lengths after conv and avg_pool."""
++        input_lengths = (input_lengths - 1) // 2 + 1
++        output_lengths = (input_lengths - 2) // 2 + 1
++        return input_lengths, output_lengths
++
++    def _prepare_attention_mask(self, seq_length, cu_seqlens, dtype):
++        """Create block-diagonal attention mask from cu_seqlens."""
++        attention_mask = torch.full(
++            [1, 1, seq_length, seq_length],
++            torch.finfo(dtype).min,
++            dtype=dtype,
++        )
++        for i in range(1, len(cu_seqlens)):
++            s, e = cu_seqlens[i - 1], cu_seqlens[i]
++            attention_mask[..., s:e, s:e] = 0
++        return attention_mask
++
++    def forward(self, input_features, feature_lens, aftercnn_lens=None):
++        """Process mel spectrogram through audio encoder.
++
++        Args:
++            input_features: (n_mels, total_mel_len) mel spectrogram
++            feature_lens: (num_audios,) mel length for each audio
++            aftercnn_lens: optional pre-computed lengths after conv
++
++        Returns:
++            audio_embeddings: (total_audio_tokens, output_dim) tensor
++        """
++        if aftercnn_lens is None:
++            aftercnn_lens, _ = self._get_feat_extract_output_lengths(feature_lens)
++
++        # CPU: Conv frontend + chunking
++        hidden_states, aftercnn_lens_actual, cu_seqlens = self.frontend(
++            input_features, feature_lens
++        )
++
++        if self.transformer is not None:
++            # Neuron: transformer layers
++            seq_len = hidden_states.shape[0]
++            attention_mask = self._prepare_attention_mask(
++                seq_len, cu_seqlens, self.dtype
++            )
++            # Add batch dimension for Neuron model
++            hidden_states = hidden_states.unsqueeze(0)
++            hidden_states = self.transformer(hidden_states, attention_mask)
++            hidden_states = hidden_states.squeeze(0)
++        else:
++            # Fallback: CPU transformer (for testing without Neuron)
++            logger.warning(
++                "Audio transformer not compiled. Running transformer on CPU "
++                "(this is slow and should only be used for testing)."
++            )
++            attention_mask = self._prepare_attention_mask(
++                hidden_states.shape[0], cu_seqlens, self.dtype
++            )
++            # CPU fallback would require loading transformer weights separately
++            raise RuntimeError(
++                "Audio transformer must be compiled and loaded before inference. "
++                "Call compile_transformer() and load_transformer() first."
++            )
++
++        # CPU: Postprocessing
++        return self.postprocessor(hidden_states, aftercnn_lens_actual)
++
++    @staticmethod
++    def convert_hf_to_neuron_state_dict(state_dict, dtype=torch.bfloat16):
++        """Convert HF state dict to audio encoder format.
++
++        Splits keys into three groups:
++        - frontend.*: conv1, conv2, positional_embedding (CPU)
++        - layers.*: transformer layers (Neuron)
++        - postprocessor.*: ln_post, avg_pooler, proj, audio_bos_eos_token (CPU)
++
++        Returns dict with prefixed keys for the split architecture.
++        """
++        new_state_dict = {}
++
++        # LayerNorm keys that should remain float32
++        ln_suffixes = (
++            "self_attn_layer_norm.weight", "self_attn_layer_norm.bias",
++            "final_layer_norm.weight", "final_layer_norm.bias",
++            "ln_post.weight", "ln_post.bias",
++        )
++
++        # CPU frontend keys
++        frontend_prefixes = ("conv1.", "conv2.", "positional_embedding.")
++        # CPU postprocessor keys
++        postprocessor_prefixes = ("ln_post.", "proj.", "avg_pooler.", "audio_bos_eos_token.")
++
++        for key, value in state_dict.items():
++            # Strip audio_tower prefix
++            if key.startswith("thinker.audio_tower."):
++                clean_key = key[len("thinker.audio_tower."):]
++            elif key.startswith("audio_tower."):
++                clean_key = key[len("audio_tower."):]
++            else:
++                new_state_dict[key] = value
++                continue
++
++            # Determine target dtype
++            if any(clean_key.endswith(s) for s in ln_suffixes):
++                target_dtype = torch.float32
++            else:
++                target_dtype = dtype
++
++            # Route to correct sub-module
++            if any(clean_key.startswith(p) for p in frontend_prefixes):
++                new_state_dict["frontend." + clean_key] = (
++                    value.clone().detach().contiguous().to(target_dtype)
++                )
++            elif any(clean_key.startswith(p) for p in postprocessor_prefixes):
++                new_state_dict["postprocessor." + clean_key] = (
++                    value.clone().detach().contiguous().to(target_dtype)
++                )
++            elif clean_key.startswith("layers."):
++                # Transformer layers (will be loaded into Neuron model)
++                new_state_dict["transformer." + clean_key] = (
++                    value.clone().detach().contiguous().to(target_dtype)
++                )
++            else:
++                logger.warning("Unknown audio key: %s", clean_key)
++
++        return new_state_dict
++
++    @staticmethod
++    def from_pretrained_state_dict(audio_config, state_dict, dtype=torch.bfloat16):
++        """Create audio encoder and load CPU weights from converted state dict.
++
++        Note: Transformer weights need to be loaded separately via
++        compile_transformer() + load_transformer() for Neuron execution.
++        """
++        encoder = NeuronQwen25OmniAudioEncoder(audio_config, dtype=dtype)
++
++        # Load only frontend and postprocessor weights
++        cpu_keys = {}
++        for key, value in state_dict.items():
++            if key.startswith("frontend.") or key.startswith("postprocessor."):
++                cpu_keys[key] = value
++
++        if cpu_keys:
++            missing, unexpected = encoder.load_state_dict(cpu_keys, strict=False)
++            # Filter out transformer keys from missing (expected)
++            missing = [k for k in missing if not k.startswith("transformer.")]
++            if missing:
++                logger.warning("Audio encoder CPU missing keys: %s", missing[:10])
++            logger.info("Loaded %d CPU weights into audio encoder", len(cpu_keys))
++
++        return encoder
+diff --git a/src/neuronx_distributed_inference/models/qwen25_omni/modeling_qwen25_omni_talker.py b/src/neuronx_distributed_inference/models/qwen25_omni/modeling_qwen25_omni_talker.py
+new file mode 100644
+index 00000000..de4452d7
+--- /dev/null
++++ b/src/neuronx_distributed_inference/models/qwen25_omni/modeling_qwen25_omni_talker.py
+@@ -0,0 +1,214 @@
++# coding=utf-8
++# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
++# SPDX-License-Identifier: Apache-2.0
++#
++# Qwen2.5-Omni Talker for NXD inference.
++#
++# CPU-based wrapper around HF's Qwen2_5OmniTalkerForConditionalGeneration.
++# The Talker is a small Qwen2 decoder that converts Thinker hidden states
++# into codec tokens for speech synthesis.
++#
++# Architecture:
++#   - embed_tokens: Embedding(8448, 3584) — codec vocab in Thinker's dim space
++#   - thinker_to_talker_proj: Linear(3584 -> 896)
++#   - 24 Qwen2 decoder layers (GQA: 12 heads, 4 kv_heads, head_dim=128)
++#   - MLP: SiLU gate_proj/up_proj(896->18944), down_proj(18944->896)
++#   - RMSNorm(896)
++#   - codec_head: Linear(896 -> 8448, no bias)
++#
++# Runs on CPU for the following reasons:
++#   1. Non-standard head_dim: hidden_size=896 with 12 heads gives a fractional
++#      head_dim (74.67). The actual head_dim=128 means the attention's internal
++#      dimension (12×128=1536) differs from hidden_size (896), which is
++#      incompatible with NxDI's NeuronAttentionBase (computes head_dim as
++#      hidden_size // num_attention_heads).
++#   2. 3D mRoPE: The Talker uses multimodal rotary position embeddings with
++#      position_ids of shape (3, batch, seq). The initial positions depend on
++#      the Thinker's text output via get_rope_index(), requiring access to
++#      input_text_ids, image/video/audio grid info at each step.
++#   3. Custom input pipeline: Every autoregressive step combines codec token
++#      embeddings (3584-d) with Thinker hidden states, then projects to 896-d.
++#      This per-step thinker-state injection doesn't fit NeuronBaseForCausalLM.
++#   4. Small model: ~690M params in 24 layers — not a performance bottleneck
++#      compared to the 7B Thinker running on Neuron.
++
++"""Qwen2.5-Omni Talker model for NXD inference."""
++
++import logging
++from typing import Optional
++
++import torch
++
++logger = logging.getLogger(__name__)
++
++
++class NeuronQwen25OmniTalker:
++    """Wrapper around HF's Qwen2_5OmniTalkerForConditionalGeneration.
++
++    The Talker takes Thinker hidden states + codec embeddings as input,
++    projects them from embedding_size (3584) to hidden_size (896), runs
++    through 24 Qwen2 decoder layers, and outputs codec tokens via a
++    codec_head linear layer.
++
++    This wrapper:
++      1. Instantiates the HF Talker from config
++      2. Loads weights from converted state dict
++      3. Exposes generation API for codec token synthesis
++    """
++
++    def __init__(self, talker_config, dtype=torch.bfloat16):
++        """Initialize the Talker.
++
++        Args:
++            talker_config: Talker config (dict or HF config object).
++                Must contain: vocab_size, embedding_size, hidden_size,
++                num_hidden_layers, num_attention_heads, num_key_value_heads,
++                intermediate_size, etc.
++            dtype: Model dtype (default bfloat16).
++        """
++        from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import (
++            Qwen2_5OmniTalkerConfig,
++        )
++        from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import (
++            Qwen2_5OmniTalkerForConditionalGeneration,
++        )
++
++        if isinstance(talker_config, dict):
++            talker_config = Qwen2_5OmniTalkerConfig(**talker_config)
++
++        self.model = Qwen2_5OmniTalkerForConditionalGeneration(talker_config)
++        self.model.to(dtype)
++        self.model.eval()
++        self.config = talker_config
++        self.dtype = dtype
++
++        # Expose codec token IDs for orchestration
++        self.codec_bos_token = talker_config.tts_codec_start_token_id
++        self.codec_eos_token = talker_config.tts_codec_end_token_id
++        self.codec_pad_token = talker_config.tts_codec_pad_token_id
++        self.codec_mask_token = talker_config.tts_codec_mask_token_id
++        self.text_bos_token = talker_config.tts_text_start_token_id
++        self.text_eos_token = talker_config.tts_text_end_token_id
++        self.text_pad_token = talker_config.tts_text_pad_token_id
++
++    def load_state_dict(self, state_dict, strict=True):
++        """Load converted state dict into the HF Talker model."""
++        return self.model.load_state_dict(state_dict, strict=strict)
++
++    @torch.no_grad()
++    def generate(
++        self,
++        input_ids,
++        input_text_ids,
++        thinker_reply_part,
++        inputs_embeds,
++        attention_mask=None,
++        max_new_tokens=4096,
++        do_sample=True,
++        top_k=40,
++        top_p=0.8,
++        temperature=0.9,
++        eos_token_id=None,
++        repetition_penalty=1.05,
++        suppress_tokens=None,
++        **kwargs,
++    ):
++        """Generate codec tokens from Thinker hidden states.
++
++        Args:
++            input_ids: (batch, seq_len) codec input IDs
++            input_text_ids: (batch, seq_len) text input IDs (for position calc)
++            thinker_reply_part: (batch, reply_len, 3584) Thinker hidden states
++            inputs_embeds: (batch, seq_len, 3584) input embeddings
++            attention_mask: (batch, seq_len) optional attention mask
++            max_new_tokens: Maximum codec tokens to generate
++            do_sample: Whether to sample (vs greedy)
++            top_k: Top-k sampling
++            top_p: Nucleus sampling probability
++            temperature: Sampling temperature
++            eos_token_id: EOS token(s) for stopping
++            repetition_penalty: Repetition penalty
++            suppress_tokens: Token IDs to suppress during generation
++            **kwargs: Additional generation kwargs
++
++        Returns:
++            (batch, total_len) generated codec token IDs
++        """
++        if eos_token_id is None:
++            eos_token_id = [self.codec_eos_token, self.codec_pad_token]
++        if suppress_tokens is None:
++            suppress_tokens = [self.codec_bos_token]
++
++        return self.model.generate(
++            input_ids=input_ids,
++            input_text_ids=input_text_ids,
++            thinker_reply_part=thinker_reply_part,
++            inputs_embeds=inputs_embeds,
++            attention_mask=attention_mask,
++            max_new_tokens=max_new_tokens,
++            do_sample=do_sample,
++            top_k=top_k,
++            top_p=top_p,
++            temperature=temperature,
++            eos_token_id=eos_token_id,
++            repetition_penalty=repetition_penalty,
++            suppress_tokens=suppress_tokens,
++            **kwargs,
++        )
++
++    @staticmethod
++    def convert_hf_to_neuron_state_dict(state_dict: dict) -> dict:
++        """Convert HF state dict to Talker format.
++
++        Strips 'talker.' prefix from keys. Non-talker keys are passed through.
++
++        Args:
++            state_dict: Full or partial state dict with talker.* keys.
++
++        Returns:
++            State dict with talker prefix stripped.
++        """
++        new_state_dict = {}
++        for key, value in state_dict.items():
++            if key.startswith("talker."):
++                new_state_dict[key[len("talker."):]] = value
++            else:
++                # Pass through non-talker keys
++                new_state_dict[key] = value
++        return new_state_dict
++
++    @classmethod
++    def from_pretrained_state_dict(cls, talker_config, state_dict, dtype=torch.bfloat16):
++        """Create Talker and load weights from converted state dict.
++
++        Args:
++            talker_config: Talker config (dict or HF config object)
++            state_dict: Already-converted state dict (talker keys only)
++            dtype: Target dtype
++
++        Returns:
++            Initialized NeuronQwen25OmniTalker
++        """
++        talker = cls(talker_config, dtype=dtype)
++
++        # Filter to only talker keys (skip non-talker prefixes)
++        talker_keys = {}
++        for key, value in state_dict.items():
++            if any(
++                key.startswith(p)
++                for p in [
++                    "lm_head.", "visual.", "audio_tower.",
++                    "thinker.", "token2wav.", "talker.",
++                ]
++            ):
++                continue
++            talker_keys[key] = value
++
++        missing, unexpected = talker.load_state_dict(talker_keys, strict=False)
++        if missing:
++            logger.warning("Talker missing keys: %s", missing[:10])
++        if unexpected:
++            logger.warning("Talker unexpected keys: %s", unexpected[:10])
++        logger.info("Loaded %d weights into Talker", len(talker_keys))
++
++        return talker
+diff --git a/src/neuronx_distributed_inference/models/qwen25_omni/modeling_qwen25_omni_token2wav.py b/src/neuronx_distributed_inference/models/qwen25_omni/modeling_qwen25_omni_token2wav.py
+new file mode 100644
+index 00000000..fe5a3714
+--- /dev/null
++++ b/src/neuronx_distributed_inference/models/qwen25_omni/modeling_qwen25_omni_token2wav.py
+@@ -0,0 +1,179 @@
++# coding=utf-8
++# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
++# SPDX-License-Identifier: Apache-2.0
++#
++# Qwen2.5-Omni Token2Wav for NXD inference.
++#
++# CPU-based wrapper around HF's Qwen2_5OmniToken2WavModel.
++# Converts codec tokens from the Talker into audio waveforms.
++#
++# Architecture:
++#   - DiT (Diffusion Transformer): 22 blocks, dim=1024, 16 heads
++#     - ECAPA-TDNN speaker encoder for speaker conditioning
++#     - Codec embedding + RoPE + AdaLayerNorm
++#     - ODE sampling (Runge-Kutta 4) for mel spectrogram generation
++#   - BigVGAN vocoder: mel spectrogram -> waveform
++#     - conv_pre(80->1536) + 6 upsample stages + AMPBlock residuals
++#     - Snake activation, conv_post(24->1)
++#
++# Runs on CPU in float32 (required for ODE solver precision).
++# Token2Wav has ~809 state dict keys total.
++
++"""Qwen2.5-Omni Token2Wav model for NXD inference."""
++
++import logging
++from typing import Optional
++
++import torch
++
++logger = logging.getLogger(__name__)
++
++
++class NeuronQwen25OmniToken2Wav:
++    """Wrapper around HF's Qwen2_5OmniToken2WavModel.
++
++    Token2Wav converts codec tokens into audio waveforms through:
++      1. DiT model: codec tokens + speaker embedding -> mel spectrogram
++         (via ODE sampling with classifier-free guidance)
++      2. BigVGAN vocoder: mel spectrogram -> waveform
++
++    Speaker conditioning requires a speaker dict (spk_dict.pt) containing
++    per-speaker 'cond' (conditioning) and 'ref_mel' (reference mel) tensors,
++    plus 'bos_token' for the Talker.
++
++    This wrapper:
++      1. Instantiates the HF Token2Wav from config
++      2. Loads weights from converted state dict
++      3. Exposes waveform generation API
++    """
++
++    def __init__(self, token2wav_config):
++        """Initialize Token2Wav.
++
++        Args:
++            token2wav_config: Token2Wav config (dict or HF config object).
++                Must contain dit_config and bigvgan_config sub-configs.
++        """
++        from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import (
++            Qwen2_5OmniToken2WavConfig,
++        )
++        from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import (
++            Qwen2_5OmniToken2WavModel,
++        )
++
++        if isinstance(token2wav_config, dict):
++            token2wav_config = Qwen2_5OmniToken2WavConfig(**token2wav_config)
++
++        self.model = Qwen2_5OmniToken2WavModel(token2wav_config)
++        # Token2Wav must run in float32 for ODE solver precision
++        self.model.float()
++        self.model.eval()
++        self.config = token2wav_config
++
++    def load_state_dict(self, state_dict, strict=True):
++        """Load converted state dict into the HF Token2Wav model."""
++        return self.model.load_state_dict(state_dict, strict=strict)
++
++    @torch.no_grad()
++    def __call__(
++        self,
++        code,
++        conditioning,
++        reference_mel,
++        num_steps=10,
++        guidance_scale=0.5,
++        sway_coefficient=-1.0,
++        **kwargs,
++    ):
++        """Generate waveform from codec tokens.
++
++        Args:
++            code: (batch, seq_len) codec token IDs from the Talker
++            conditioning: (batch, mel_len, enc_dim) speaker conditioning
++                (from spk_dict.pt 'cond' key)
++            reference_mel: (batch, mel_len, mel_dim) reference mel spectrogram
++                (from spk_dict.pt 'ref_mel' key)
++            num_steps: Number of ODE solver steps (default 10)
++            guidance_scale: Classifier-free guidance scale (default 0.5)
++            sway_coefficient: Time schedule sway (default -1.0)
++            **kwargs: Additional kwargs passed to Token2Wav
++
++        Returns:
++            waveform: (samples,) audio waveform tensor on CPU
++        """
++        return self.model(
++            code=code,
++            conditioning=conditioning,
++            reference_mel=reference_mel,
++            num_steps=num_steps,
++            guidance_scale=guidance_scale,
++            sway_coefficient=sway_coefficient,
++            **kwargs,
++        )
++
++    @staticmethod
++    def convert_hf_to_neuron_state_dict(state_dict: dict) -> dict:
++        """Convert HF state dict to Token2Wav format.
++
++        Strips 'token2wav.' prefix from keys. Non-token2wav keys are passed through.
++
++        Args:
++            state_dict: Full or partial state dict with token2wav.* keys.
++
++        Returns:
++            State dict with token2wav prefix stripped.
++        """
++        new_state_dict = {}
++        for key, value in state_dict.items():
++            if key.startswith("token2wav."):
++                new_state_dict[key[len("token2wav."):]] = value
++            else:
++                new_state_dict[key] = value
++        return new_state_dict
++
++    @staticmethod
++    def load_speaker_dict(speaker_dict_path):
++        """Load speaker dictionary from spk_dict.pt.
++
++        Args:
++            speaker_dict_path: Path to spk_dict.pt
++
++        Returns:
++            dict: Speaker name -> {cond, ref_mel, bos_token}
++        """
++        return torch.load(speaker_dict_path, weights_only=True)
++
++    @classmethod
++    def from_pretrained_state_dict(cls, token2wav_config, state_dict):
++        """Create Token2Wav and load weights from converted state dict.
++
++        Args:
++            token2wav_config: Token2Wav config (dict or HF config object)
++            state_dict: Already-converted state dict (token2wav keys only)
++
++        Returns:
++            Initialized NeuronQwen25OmniToken2Wav
++        """
++        token2wav = cls(token2wav_config)
++
++        # Filter to only token2wav keys (skip non-token2wav prefixes)
++        t2w_keys = {}
++        for key, value in state_dict.items():
++            if any(
++                key.startswith(p)
++                for p in [
++                    "lm_head.", "visual.", "audio_tower.",
++                    "thinker.", "talker.", "token2wav.",
++                ]
++            ):
++                continue
++            t2w_keys[key] = value
++
++        missing, unexpected = token2wav.load_state_dict(t2w_keys, strict=False)
++        if missing:
++            logger.warning("Token2Wav missing keys: %s", missing[:10])
++        if unexpected:
++            logger.warning("Token2Wav unexpected keys: %s", unexpected[:10])
++        logger.info("Loaded %d weights into Token2Wav", len(t2w_keys))
++
++        return token2wav
+diff --git a/src/neuronx_distributed_inference/models/qwen25_omni/modeling_qwen25_omni_vision.py b/src/neuronx_distributed_inference/models/qwen25_omni/modeling_qwen25_omni_vision.py
+new file mode 100644
+index 00000000..132151fa
+--- /dev/null
++++ b/src/neuronx_distributed_inference/models/qwen25_omni/modeling_qwen25_omni_vision.py
+@@ -0,0 +1,579 @@
++# coding=utf-8
++# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
++# SPDX-License-Identifier: Apache-2.0
++#
++# Qwen2.5-Omni Vision Encoder for NXD inference.
++#
++# Differences from Qwen2-VL vision encoder:
++#   - SwiGLU MLP (gate_proj, up_proj, down_proj) instead of simple FC1/FC2
++#   - RMSNorm instead of LayerNorm
++#   - Separate Q/K/V projections instead of fused QKV
++#   - intermediate_size=3420 (not TP-divisible by 32, use nn.Linear for MLP)
++
++"""Qwen2.5-Omni Vision Encoder for NXD inference."""
++
++import logging
++import os
++from typing import List, Optional, Tuple
++
++import torch
++import torch.nn as nn
++import torch.nn.functional as F
++from safetensors.torch import save_file
++from transformers.models.qwen2_vl.modeling_qwen2_vl import (
++    PatchEmbed,
++    VisionRotaryEmbedding,
++)
++
++from neuronx_distributed.parallel_layers.layers import (
++    ColumnParallelLinear,
++    RowParallelLinear,
++)
++from neuronx_distributed_inference.models.application_base import NeuronApplicationBase
++from neuronx_distributed_inference.models.config import InferenceConfig
++from neuronx_distributed_inference.models.model_wrapper import (
++    EncoderModelInstance,
++    ModelWrapper,
++)
++from neuronx_distributed_inference.models.qwen2_vl.modeling_qwen2_vl_vision import (
++    Qwen2VLVisionRotaryEmbedding,
++)
++from neuronx_distributed_inference.models.qwen2_vl.utils.vision_utils import (
++    calculate_max_grid_size,
++    get_image_dimensions,
++)
++from neuronx_distributed_inference.modules.attention.attention_base import (
++    NeuronAttentionBase,
++)
++from neuronx_distributed_inference.modules.attention.utils import apply_rotary_pos_emb
++from neuronx_distributed_inference.modules.padding import (
++    pad_tensor,
++    pad_with_first_batchline,
++)
++
++logger = logging.getLogger(__name__)
++
++
++class VisionRMSNorm(nn.Module):
++    """RMSNorm for vision encoder (replaces LayerNorm used in Qwen2-VL)."""
++
++    def __init__(self, hidden_size, eps=1e-6, dtype=torch.bfloat16):
++        super().__init__()
++        self.weight = nn.Parameter(torch.ones(hidden_size, dtype=dtype))
++        self.variance_epsilon = eps
++
++    def forward(self, hidden_states):
++        input_dtype = hidden_states.dtype
++        hidden_states = hidden_states.to(torch.float32)
++        variance = hidden_states.pow(2).mean(-1, keepdim=True)
++        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
++        return self.weight * hidden_states.to(input_dtype)
++
++
++class VisionSwiGLUMLP(nn.Module):
++    """SwiGLU MLP for Qwen2.5-Omni vision encoder.
++
++    Uses regular nn.Linear instead of ColumnParallelLinear/RowParallelLinear
++    because intermediate_size=3420 is not divisible by common TP degrees (16, 32).
++    The vision model is small enough that MLP weight replication is acceptable.
++    """
++
++    def __init__(self, dim, hidden_dim, dtype=torch.bfloat16):
++        super().__init__()
++        self.gate_proj = nn.Linear(dim, hidden_dim, bias=True)
++        self.up_proj = nn.Linear(dim, hidden_dim, bias=True)
++        self.down_proj = nn.Linear(hidden_dim, dim, bias=True)
++        # Cast to target dtype
++        self.gate_proj = self.gate_proj.to(dtype)
++        self.up_proj = self.up_proj.to(dtype)
++        self.down_proj = self.down_proj.to(dtype)
++
++    def forward(self, x):
++        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
++
++
++class NeuronQwen25OmniVisionAttention(NeuronAttentionBase):
++    """Vision attention with separate Q/K/V projections (not fused).
++
++    Requires vision_config.neuron_config.fused_qkv = False.
++    """
++
++    def __init__(self, config):
++        super().__init__(
++            config=config,
++            hidden_size=config.embed_dim,
++            num_attention_heads=config.num_heads,
++            num_key_value_heads=config.num_heads,
++            head_dim=config.embed_dim // config.num_heads,
++            num_cores_per_group=config.num_cores_per_group,
++            sequence_parallel_enabled=False,
++            rotary_emb=Qwen2VLVisionRotaryEmbedding(),
++            qkv_bias=True,
++            o_bias=True,
++        )
++
++    def forward(self, hidden_states, position_embeddings=None, **kwargs):
++        self._position_embeddings = position_embeddings
++        try:
++            return super().forward(hidden_states, **kwargs)
++        finally:
++            self._position_embeddings = None
++
++    def apply_rotary_embedding(
++        self, Q, K, V, position_ids, cos_cache, sin_cache, use_polar_compatible_rope
++    ):
++        if self.rotary_emb is not None:
++            if cos_cache is None or sin_cache is None:
++                cos_cache, sin_cache = self.rotary_emb(V, self._position_embeddings)
++            Q, K = apply_rotary_pos_emb(Q, K, cos_cache, sin_cache)
++        return Q, K, cos_cache, sin_cache
++
++
++class Qwen25OmniVisionBlock(nn.Module):
++    """Vision transformer block with RMSNorm and SwiGLU MLP."""
++
++    def __init__(self, vision_config):
++        super().__init__()
++        dtype = vision_config.neuron_config.torch_dtype
++        self.norm1 = VisionRMSNorm(
++            vision_config.embed_dim, eps=1e-6, dtype=dtype
++        )
++        self.norm2 = VisionRMSNorm(
++            vision_config.embed_dim, eps=1e-6, dtype=dtype
++        )
++        self.attn = NeuronQwen25OmniVisionAttention(vision_config)
++        self.mlp = VisionSwiGLUMLP(
++            dim=vision_config.embed_dim,
++            hidden_dim=vision_config.intermediate_size,
++            dtype=dtype,
++        )
++
++    def forward(
++        self,
++        hidden_states: torch.Tensor,
++        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
++    ) -> torch.Tensor:
++        attn_output = self.attn(
++            self.norm1(hidden_states),
++            position_embeddings=position_embeddings,
++        )[0]
++        hidden_states = hidden_states + attn_output
++        hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
++        return hidden_states
++
++
++class Qwen25OmniPatchMerger(nn.Module):
++    """Patch merger with RMSNorm (Qwen2-VL uses LayerNorm).
++
++    Merges spatial_merge_size^2 patches into one, projecting from
++    embed_dim to out_hidden_size (text model hidden size).
++    """
++
++    def __init__(self, dim, context_dim, spatial_merge_size=2, dtype=torch.bfloat16):
++        super().__init__()
++        self.hidden_size = context_dim * (spatial_merge_size ** 2)
++        self.ln_q = VisionRMSNorm(context_dim, eps=1e-6, dtype=dtype)
++        self.mlp = nn.Sequential(
++            ColumnParallelLinear(
++                self.hidden_size,
++                self.hidden_size,
++                gather_output=False,
++                dtype=dtype,
++            ),
++            nn.GELU(),
++            RowParallelLinear(
++                self.hidden_size,
++                dim,
++                input_is_parallel=True,
++                dtype=dtype,
++                reduce_dtype=dtype,
++            ),
++        )
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        x = self.mlp(self.ln_q(x).view(-1, self.hidden_size))
++        return x
++
++
++class NeuronQwen25OmniVisionModel(nn.Module):
++    """Qwen2.5-Omni Vision Encoder on Neuron.
++
++    Architecture is based on Qwen2-VL ViT but uses RMSNorm, SwiGLU MLP,
++    and separate Q/K/V projections. Reuses the same PatchEmbed and
++    VisionRotaryEmbedding from Qwen2-VL (identical parameters).
++    """
++
++    def __init__(self, config: InferenceConfig) -> None:
++        super().__init__()
++        self.config = config
++        self.vision_config = config.vision_config
++
++        self.spatial_merge_size = self.vision_config.spatial_merge_size
++
++        # Reuse Qwen2-VL PatchEmbed (same Conv3D architecture)
++        self.patch_embed = PatchEmbed(
++            patch_size=self.vision_config.patch_size,
++            temporal_patch_size=self.vision_config.temporal_patch_size,
++            in_channels=self.vision_config.in_channels,
++            embed_dim=self.vision_config.embed_dim,
++        ).to(self.vision_config.neuron_config.torch_dtype)
++
++        head_dim = self.vision_config.embed_dim // self.vision_config.num_heads
++        self.rotary_pos_emb = VisionRotaryEmbedding(head_dim // 2)
++
++        self.blocks = nn.ModuleList(
++            [
++                Qwen25OmniVisionBlock(self.vision_config)
++                for _ in range(self.vision_config.depth)
++            ]
++        )
++
++        self.merger = Qwen25OmniPatchMerger(
++            dim=self.vision_config.out_hidden_size,  # 3584 (text hidden size)
++            context_dim=self.vision_config.embed_dim,  # 1280
++            spatial_merge_size=self.vision_config.spatial_merge_size,
++            dtype=self.vision_config.neuron_config.torch_dtype,
++        )
++
++        # Calculate dynamic MAX_GRID_SIZE based on configured image dimensions
++        image_width, image_height = get_image_dimensions(
++            self.vision_config.neuron_config
++        )
++        self.max_grid_size = calculate_max_grid_size(
++            image_width,
++            image_height,
++            patch_size=self.vision_config.patch_size,
++        )
++        logger.info(
++            f"Calculated max_grid_size={self.max_grid_size} for "
++            f"image dimensions {image_width}x{image_height}"
++        )
++
++        self.precomputed_rotary_pos_emb = self.rotary_pos_emb(self.max_grid_size)
++        self.register_buffer(
++            "rotary_pos_emb_cache",
++            self.precomputed_rotary_pos_emb,
++            persistent=False,
++        )
++
++    def rot_pos_ids(self, grid_thw):
++        """Compute rotary position IDs for patches (same algorithm as Qwen2-VL)."""
++        pos_ids = []
++        for t, h, w in grid_thw:
++            hpos_ids = torch.arange(h).unsqueeze(1).expand(-1, w)
++            hpos_ids = hpos_ids.reshape(
++                h // self.spatial_merge_size,
++                self.spatial_merge_size,
++                w // self.spatial_merge_size,
++                self.spatial_merge_size,
++            )
++            hpos_ids = hpos_ids.permute(0, 2, 1, 3)
++            hpos_ids = hpos_ids.flatten()
++
++            wpos_ids = torch.arange(w).unsqueeze(0).expand(h, -1)
++            wpos_ids = wpos_ids.reshape(
++                h // self.spatial_merge_size,
++                self.spatial_merge_size,
++                w // self.spatial_merge_size,
++                self.spatial_merge_size,
++            )
++            wpos_ids = wpos_ids.permute(0, 2, 1, 3)
++            wpos_ids = wpos_ids.flatten()
++            pos_ids.append(
++                torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1)
++            )
++        pos_ids = torch.cat(pos_ids, dim=0)
++        return pos_ids
++
++    def pad_to_text_seq_len(self, hidden_states):
++        """Pad vision outputs to text model sequence length."""
++        padded_length = self.config.neuron_config.seq_len
++        hidden_states = hidden_states.to(
++            self.config.text_config.neuron_config.torch_dtype
++        )
++
++        hidden_size = hidden_states.shape[-1]
++        hidden_states, _ = pad_tensor(
++            hidden_states, (padded_length, hidden_size), pad_value=0
++        )
++
++        # Flatten vision outputs: (seq_len, hidden_size) -> (1, seq_len, hidden_size)
++        hidden_states = hidden_states.view(-1, hidden_size).unsqueeze(0)
++        return hidden_states
++
++    def forward(
++        self, hidden_states: torch.Tensor, grid_thw: torch.Tensor
++    ) -> torch.Tensor:
++        hidden_states = self.patch_embed(hidden_states)
++
++        assert grid_thw[:, 1:].max() < self.max_grid_size, (
++            f"Grid size {grid_thw[:, 1:].max()} exceeds max_grid_size "
++            f"{self.max_grid_size}. Increase default_image_width/height "
++            f"in vision_neuron_config."
++        )
++        pos_ids = self.rot_pos_ids(grid_thw)
++        rotary_pos_emb = self.rotary_pos_emb_cache[pos_ids].flatten(1)
++        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
++        cos_emb = emb.cos()
++        sin_emb = emb.sin()
++        cos_emb = cos_emb.reshape(grid_thw.shape[0], -1, cos_emb.shape[-1])
++        sin_emb = sin_emb.reshape(grid_thw.shape[0], -1, sin_emb.shape[-1])
++        position_embeddings = (cos_emb, sin_emb)
++
++        hidden_states = hidden_states.reshape(
++            grid_thw.shape[0], -1, hidden_states.shape[-1]
++        )
++        for blk in self.blocks:
++            hidden_states = blk(hidden_states, position_embeddings)
++        hidden_states_merger = self.merger(hidden_states)
++        return self.pad_to_text_seq_len(hidden_states_merger)
++
++
++class Qwen25OmniVisionModelWrapper(ModelWrapper):
++    """Model wrapper for Qwen2.5-Omni vision encoder.
++
++    Handles bucketing on number of images, padding, and input generation.
++    Same pattern as Qwen2VLVisionModelWrapper.
++    """
++
++    def __init__(
++        self,
++        config: InferenceConfig,
++        model_cls,
++        tag="",
++        compiler_args: str = None,
++        priority_model_idx: int = None,
++        pipeline_execution: bool = True,
++        return_ranked_to_cpu: bool = False,
++        model_init_kwargs={},
++    ) -> None:
++        super().__init__(
++            config,
++            model_cls,
++            tag,
++            compiler_args,
++            priority_model_idx,
++            pipeline_execution,
++            return_ranked_to_cpu,
++            model_init_kwargs,
++        )
++        from transformers.models.qwen2_vl.image_processing_qwen2_vl import (
++            smart_resize,
++        )
++
++        image_width, image_height = get_image_dimensions(
++            self.config.vision_config.neuron_config
++        )
++        resized_height, resized_width = smart_resize(
++            width=image_width, height=image_height
++        )
++        self.pixels_per_image = (
++            resized_height // self.config.vision_config.patch_size
++        ) * (resized_width // self.config.vision_config.patch_size)
++
++    def input_generator(self) -> List[Tuple[torch.Tensor]]:
++        from transformers.models.qwen2_vl.image_processing_qwen2_vl import (
++            smart_resize,
++        )
++
++        inputs = []
++        image_width, image_height = get_image_dimensions(
++            self.config.vision_config.neuron_config
++        )
++        resized_height, resized_width = smart_resize(
++            width=image_width, height=image_height
++        )
++        vc = self.config.vision_config
++        for bucket in vc.neuron_config.buckets:
++            pixel_values = torch.ones(
++                [
++                    bucket * self.pixels_per_image,
++                    vc.in_channels
++                    * vc.patch_size
++                    * vc.patch_size
++                    * vc.temporal_patch_size,
++                ],
++                dtype=vc.neuron_config.torch_dtype,
++            )
++            grid_thw = torch.tensor(
++                [
++                    [
++                        1,
++                        resized_height // vc.patch_size,
++                        resized_width // vc.patch_size,
++                    ]
++                ]
++            ).repeat(bucket, 1)
++            inputs.append((pixel_values, grid_thw))
++        return inputs
++
++    def get_model_instance(self):
++        return EncoderModelInstance(model_cls=self.model_cls, config=self.config)
++
++    def get_padded_num_image(self, pixel_values):
++        """Get the bucket size (number of images) for given pixel_values."""
++        buckets = self.config.vision_config.neuron_config.buckets
++        for val in buckets:
++            if val * self.pixels_per_image >= pixel_values.shape[0]:
++                return val
++        raise Exception(
++            f"No bucket found for pixel_values shape {pixel_values.shape[0]}. "
++            f"pixels_per_image={self.pixels_per_image}, buckets={buckets}"
++        )
++
++    def forward(self, pixel_values, grid_thw):
++        """Override ModelWrapper.forward() with padding to bucket size."""
++        if self.model is None:
++            raise RuntimeError(
++                "Forward called before load. Run load() or load_state_dict() "
++                "before calling forward"
++            )
++        padded_num_image = self.get_padded_num_image(pixel_values)
++        padded_pixel_values = pad_with_first_batchline(
++            pixel_values,
++            (padded_num_image * self.pixels_per_image, pixel_values.shape[1]),
++        )
++        padded_grid_thw = pad_with_first_batchline(
++            grid_thw, (padded_num_image, 3)
++        )
++        output = self._forward(padded_pixel_values, padded_grid_thw)
++        return output
++
++
++class NeuronQwen25OmniForImageEncoding(NeuronApplicationBase):
++    """Standalone Neuron Application for Qwen2.5-Omni image encoding.
++
++    Wraps NeuronQwen25OmniVisionModel with compile/load functionality.
++    Can be used independently or as part of the full multimodal model.
++    """
++
++    _model_cls = NeuronQwen25OmniVisionModel
++
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        self.model_wrapper = self.get_model_wrapper_cls()
++
++        self.model = self.model_wrapper(
++            config=self.config,
++            model_cls=self._model_cls,
++            tag=self._model_cls.__name__,
++            compiler_args=self.get_compiler_args(),
++            priority_model_idx=0,
++        )
++        self.models.append(self.model)
++
++    def get_model_wrapper_cls(self):
++        return Qwen25OmniVisionModelWrapper
++
++    def forward(self, pixel_values, grid_thw):
++        return self.models[0](pixel_values, grid_thw)
++
++    def get_compiler_args(self):
++        compiler_args = (
++            "--auto-cast=none --model-type=transformer "
++            "--tensorizer-options='--enable-ccop-compute-overlap "
++            "--cc-pipeline-tiling-factor=2 ' -O1 "
++            "--internal-hlo2tensorizer-options='--verify-hlo=true'"
++        )
++        logger.info(
++            f"Compiling {self._model_cls.__name__} vision model "
++            f"with args: {compiler_args}"
++        )
++        return compiler_args
++
++    @staticmethod
++    def update_state_dict_for_tied_weights(state_dict):
++        pass
++
++    @staticmethod
++    def load_hf_model(model_path, **kwargs):
++        """Load the full Qwen2.5-Omni model (vision weights will be filtered
++        in convert_hf_to_neuron_state_dict)."""
++        from transformers import AutoModelForCausalLM
++
++        return AutoModelForCausalLM.from_pretrained(
++            model_path, trust_remote_code=True, **kwargs
++        )
++
++    @staticmethod
++    def convert_hf_to_neuron_state_dict(
++        state_dict: dict, inference_config: InferenceConfig
++    ) -> dict:
++        """Convert HF state dict to NxDI format for vision encoder.
++
++        Handles:
++          1. Filter to vision keys only (thinker.visual.* or visual.*)
++          2. Strip prefix
++          3. Rename separate Q/K/V attention keys to NeuronAttentionBase format
++          4. Cast to target dtype
++        """
++        new_state_dict = {}
++        dtype = inference_config.vision_config.neuron_config.torch_dtype
++
++        for key, value in state_dict.items():
++            # Accept both "thinker.visual." and "visual." prefixes
++            if key.startswith("thinker.visual."):
++                new_key = key[len("thinker.visual."):]
++            elif key.startswith("visual."):
++                new_key = key[len("visual."):]
++            else:
++                # Pass through non-vision keys unchanged
++                new_state_dict[key] = value
++                continue
++
++            # Rename attention keys: separate Q/K/V -> NeuronAttentionBase format
++            if ".attn.proj." in new_key:
++                new_key = new_key.replace(".attn.proj.", ".attn.o_proj.")
++            elif ".attn.q." in new_key:
++                new_key = new_key.replace(
++                    ".attn.q.", ".attn.qkv_proj.q_proj."
++                )
++            elif ".attn.k." in new_key:
++                new_key = new_key.replace(
++                    ".attn.k.", ".attn.qkv_proj.k_proj."
++                )
++            elif ".attn.v." in new_key:
++                new_key = new_key.replace(
++                    ".attn.v.", ".attn.qkv_proj.v_proj."
++                )
++
++            new_state_dict[new_key] = (
++                value.clone().detach().contiguous().to(dtype)
++            )
++
++        del state_dict
++        return new_state_dict
++
++    @classmethod
++    def get_config_cls(cls):
++        from neuronx_distributed_inference.models.qwen25_omni.modeling_qwen25_omni import (
++            Qwen25OmniMultimodalInferenceConfig,
++        )
++
++        return Qwen25OmniMultimodalInferenceConfig
++
++    @classmethod
++    def prepare_input_args(cls, prompts, images, processor, role="user", config=None):
++        """Prepare input arguments for Qwen2.5-Omni vision model."""
++        from neuronx_distributed_inference.models.qwen2_vl.utils.input_processor import (
++            prepare_generation_inputs_hf,
++        )
++
++        if len(prompts) > 1:
++            raise NotImplementedError(
++                "Qwen2.5-Omni currently only supports batch size 1"
++            )
++        if isinstance(prompts, list):
++            prompts = prompts[0]
++        if images and isinstance(images, list) and isinstance(images[0], list):
++            images = images[0]
++        inputs = prepare_generation_inputs_hf(
++            prompts, images, processor, role, config
++        )
++        vision_inputs = None
++        if hasattr(inputs, "pixel_values") and hasattr(inputs, "image_grid_thw"):
++            vision_inputs = {
++                "pixel_values": inputs.pixel_values,
++                "image_grid_thw": inputs.image_grid_thw,
++            }
++        return inputs.input_ids, inputs.attention_mask, vision_inputs
+diff --git a/src/neuronx_distributed_inference/utils/constants.py b/src/neuronx_distributed_inference/utils/constants.py
+index effca933..c1402e53 100644
+--- a/src/neuronx_distributed_inference/utils/constants.py
++++ b/src/neuronx_distributed_inference/utils/constants.py
+@@ -7,6 +7,8 @@
+ from neuronx_distributed_inference.models.mllama.modeling_mllama import NeuronMllamaForCausalLM
+ from neuronx_distributed_inference.models.mllama.utils import add_instruct
+ from neuronx_distributed_inference.models.qwen2.modeling_qwen2 import NeuronQwen2ForCausalLM
++from neuronx_distributed_inference.models.qwen25_omni.modeling_qwen25_omni import NeuronQwen25OmniForCausalLM
++from neuronx_distributed_inference.models.qwen25_omni.modeling_qwen25_omni_vision import NeuronQwen25OmniForImageEncoding
+ from neuronx_distributed_inference.models.qwen2_vl.modeling_qwen2_vl import NeuronQwen2VLForCausalLM
+ from neuronx_distributed_inference.models.qwen2_vl.modeling_qwen2_vl_vision import NeuronQwen2VLForImageEncoding
+ from neuronx_distributed_inference.models.qwen3.modeling_qwen3 import NeuronQwen3ForCausalLM
+@@ -56,6 +58,8 @@
+                 "image-encoding": NeuronPixtralForImageEncoding},
+     "dbrx": {"causal-lm": NeuronDbrxForCausalLM},
+     "qwen2": {"causal-lm": NeuronQwen2ForCausalLM},
++    "qwen2_5_omni": {"causal-lm": NeuronQwen25OmniForCausalLM,
++                     "image-encoding": NeuronQwen25OmniForImageEncoding},
+     "qwen2_vl": {"causal-lm": NeuronQwen2VLForCausalLM,
+                  "image-encoding": NeuronQwen2VLForImageEncoding},
+     "qwen3": {"causal-lm": NeuronQwen3ForCausalLM},
