@@ -129,11 +129,27 @@ The DeltaNet forward path can be controlled via environment variables:
 
 | Env Var | Forward Path | Use Case |
 |---------|-------------|----------|
-| `USE_NKI_FUSED=1` | Fused chunked NKI kernel | Best CTE performance (default for SDK 2.29) |
+| *(default)* | Fused chunked NKI kernel | **Default CTE path** -- required for 2B (PyTorch chunked hits compiler ICE) |
+| `USE_NKI_FUSED=0` | Disable fused | Falls through to other env-var options below |
 | `USE_NKI_CHUNKED=1` | Per-chunk NKI kernel | Legacy, superseded by fused |
 | `USE_NKI=1` | Per-token NKI kernel | TKG (always used for token generation) |
 | `DELTANET_SEQUENTIAL=1` | Sequential PyTorch | Debugging/reference |
-| *(none)* | PyTorch chunked | Default fallback for CTE |
+| `USE_PYTORCH_CHUNK=1` | PyTorch chunked | **Hits compiler ICE on 2B** -- do not use |
+
+**Note:** The PyTorch chunked forward (`_chunk_forward`) creates 5D tensors that trigger neuronx-cc codegen ICE (NCC_INLA001) with 2B dimensions. The fused NKI kernel is the default and required path.
+
+## Benchmarks
+
+Measured on trn2.3xlarge, TP=4, LNC=2, seq_len=128, batch_size=1, BF16:
+
+| Metric | Value |
+|--------|-------|
+| **TTFT (time to first token)** | 158.9 ms |
+| **Token generation throughput** | 70.6 tok/s |
+| **Compilation time** | ~2 min (TKG + CTE) |
+| **Model loading time** | ~9 s |
+| **Warmup time** | ~0.5 s |
+| **BF16 model size** | ~4.3 GB |
 
 ## Caveats
 
@@ -209,4 +225,4 @@ This contrib is adapted from the Qwen3.5-27B contrib. The core DeltaNet NKI kern
 
 AWS Neuron
 
-**Last Updated:** 2026-04-22
+**Last Updated:** 2026-04-23
