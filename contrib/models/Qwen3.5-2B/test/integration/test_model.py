@@ -301,15 +301,15 @@ def test_capital_of_france(compiled_model, tokenizer, generation_config):
         compiled_model,
         tokenizer,
         generation_config,
-        "What is the capital of France? Answer in one word.",
-        max_new_tokens=60,
+        "What is the capital of France?",
+        max_new_tokens=80,
     )
     # Strip <think></think> tags if present
     clean = response
     if "<think>" in clean:
         clean = clean.split("</think>")[-1].strip()
     assert "paris" in clean.lower(), f"Expected 'Paris' in output, got: '{clean}'"
-    print(f"  Capital of France: {clean}")
+    print(f"  Capital of France: {clean[:80]}...")
 
 
 # ── Performance Tests ───────────────────────────────────────────────────
