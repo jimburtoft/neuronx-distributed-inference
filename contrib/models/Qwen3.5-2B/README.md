@@ -291,6 +291,6 @@ This contrib is adapted from the Qwen3.5-27B contrib. The core DeltaNet NKI kern
 
 ## Maintainer
 
-AWS Neuron
+Jim Burtoft ([@jimburtoft](https://github.com/jimburtoft))
 
 **Last Updated:** 2026-04-23
