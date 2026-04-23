@@ -236,6 +236,27 @@ All benchmarks on trn2.3xlarge, TP=4, LNC=2, BF16, SDK 2.29. Chat-formatted prom
 | 2 | 1024 | Verified | Multi-user serving config |
 | 4 | 512 | Verified | High-throughput short context |
 
+### TP=1 Exploration (trn2.3xlarge, LNC=2)
+
+TP=1 places the full model on a single NeuronCore. With 4 cores available (LNC=2), this enables running 4 independent model copies (DP=4) for higher aggregate throughput.
+
+**Known issues:**
+- **BS=1 does not compile at TP=1** (neuronx-cc exit code 70). Use BS>=2.
+- **LNC=1 does not work** — `libneuronxla` compiler embeds `--logical-nc-config=2` regardless of `NEURON_LOGICAL_NC_CONFIG` env var. Framework-level issue.
+- **Compilation is 5-8x slower** than TP=4 (~10-17 min vs ~2 min per config).
+
+| BS | seq_len | TTFT (ms) | Throughput (tok/s) | Per-Request (tok/s) | Correct |
+|:--:|:-------:|:---------:|:------------------:|:-------------------:|:-------:|
+| 2 | 128 | 68.4 | 163.5 | 81.8 | PASS |
+| 4 | 128 | 99.0 | 255.3 | 63.8 | PASS |
+| 8 | 128 | 206.1 | 339.6 | 42.5 | PASS |
+| 2 | 1024 | 245.9 | 134.9 | 67.4 | PASS |
+| 4 | 512 | 254.2 | 218.2 | 54.5 | PASS |
+| 2 | 4096 | 1036.4 | 74.0 | 37.0 | PASS |
+| 4 | 2048 | 997.9 | 137.5 | 34.4 | PASS |
+
+**TP=1 DP=4 theoretical aggregate** (4 independent models): BS=2/sl128 → 4 × 163.5 = **654 tok/s** (vs TP=4 BS=8: 410 tok/s).
+
 ### SDK Configuration
 
 | Component | Version |
