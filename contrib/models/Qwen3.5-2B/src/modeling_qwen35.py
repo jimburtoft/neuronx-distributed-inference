@@ -898,14 +898,17 @@ class NeuronGatedDeltaNet(nn.Module):
             else:
                 new_rec_state = new_state_bf16 + self.recurrent_state_buffer * 0
         else:
-            # CTE: fused, chunk, NKI, or sequential forward
-            use_nki_fused = os.environ.get("USE_NKI_FUSED") == "1"
+            # CTE: fused NKI kernel by default (PyTorch _chunk_forward hits
+            # neuronx-cc codegen ICE NCC_INLA001 with 2B dimensions).
+            # Override with env vars for debugging/benchmarking.
+            use_nki_fused = os.environ.get("USE_NKI_FUSED", "1") != "0"
             use_nki_chunked = os.environ.get("USE_NKI_CHUNKED") == "1"
             use_nki = os.environ.get("USE_NKI") == "1"
             use_sequential = os.environ.get("DELTANET_SEQUENTIAL") == "1"
+            use_pytorch_chunk = os.environ.get("USE_PYTORCH_CHUNK") == "1"
 
-            if use_nki_fused:
-                output, final_state = self._fused_chunked_forward(
+            if use_pytorch_chunk:
+                output, final_state = self._chunk_forward(
                     query, key, value, g, beta, output_final_state=True
                 )
             elif use_nki_chunked:
@@ -920,8 +923,12 @@ class NeuronGatedDeltaNet(nn.Module):
                 output, final_state = self._sequential_forward(
                     query, key, value, g, beta, output_final_state=True
                 )
+            elif use_nki_fused:
+                output, final_state = self._fused_chunked_forward(
+                    query, key, value, g, beta, output_final_state=True
+                )
             else:
-                output, final_state = self._chunk_forward(
+                output, final_state = self._fused_chunked_forward(
                     query, key, value, g, beta, output_final_state=True
                 )
 
