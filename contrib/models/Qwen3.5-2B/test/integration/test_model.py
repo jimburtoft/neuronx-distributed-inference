@@ -158,7 +158,7 @@ def generation_config(tokenizer):
 
 
 def _generate(model, tokenizer, generation_config, prompt, max_new_tokens=20):
-    """Generate text using the NXDI model."""
+    """Generate text using the NXDI model (raw text prompt)."""
     from neuronx_distributed_inference.utils.hf_adapter import (
         HuggingFaceGenerationAdapter,
     )
@@ -172,6 +172,40 @@ def _generate(model, tokenizer, generation_config, prompt, max_new_tokens=20):
         max_new_tokens=max_new_tokens,
     )
     return outputs[0].tolist(), tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+
+def _chat_generate(
+    model, tokenizer, generation_config, user_message, max_new_tokens=50
+):
+    """Generate text using the NXDI model with chat template formatting.
+
+    Qwen3.5-2B is a chat model that expects <|im_start|>/<|im_end|> formatting.
+    Raw text prompts produce echoey output; chat-formatted prompts work correctly.
+    """
+    from neuronx_distributed_inference.utils.hf_adapter import (
+        HuggingFaceGenerationAdapter,
+    )
+
+    messages = [{"role": "user", "content": user_message}]
+    text = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    inputs = tokenizer(text, padding=True, return_tensors="pt")
+    gen_model = HuggingFaceGenerationAdapter(model)
+    outputs = gen_model.generate(
+        inputs.input_ids,
+        generation_config=generation_config,
+        attention_mask=inputs.attention_mask,
+        max_new_tokens=max_new_tokens,
+    )
+    full_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    # Extract just the assistant response (after the user message)
+    # The decoded text includes "user\n{msg}\nassistant\n{response}"
+    if "assistant" in full_text:
+        response = full_text.split("assistant", 1)[-1].strip()
+    else:
+        response = full_text
+    return outputs[0].tolist(), response
 
 
 def _is_repetitive(text, max_repeat=5):
@@ -218,33 +252,39 @@ def test_model_generates(compiled_model, tokenizer, generation_config):
 @requires_model_path
 def test_output_coherence(compiled_model, tokenizer, generation_config):
     """Output should contain multiple words and not be excessively repetitive."""
-    _, text = _generate(
+    _, response = _chat_generate(
         compiled_model,
         tokenizer,
         generation_config,
-        "The capital of France is",
-        max_new_tokens=30,
+        "What is the capital of France?",
+        max_new_tokens=50,
     )
-    generated = text[len("The capital of France is") :].strip()
-    words = generated.split()
-    assert len(words) >= 3, f"Expected >= 3 words, got {len(words)}: '{generated}'"
-    assert not _is_repetitive(generated), (
-        f"Output is excessively repetitive: '{generated}'"
-    )
-    print(f"  Output coherent ({len(words)} words): {generated[:80]}...")
+    # Strip <think></think> tags if present
+    clean = response
+    if "<think>" in clean:
+        clean = clean.split("</think>")[-1].strip()
+    words = clean.split()
+    assert len(words) >= 3, f"Expected >= 3 words, got {len(words)}: '{clean}'"
+    assert not _is_repetitive(clean), f"Output is excessively repetitive: '{clean}'"
+    print(f"  Output coherent ({len(words)} words): {clean[:80]}...")
 
 
 @requires_model_path
 def test_top_token_valid(compiled_model, tokenizer, generation_config):
     """First generated token should be a valid decodable token."""
-    tokens, _ = _generate(
+    tokens, _ = _chat_generate(
         compiled_model,
         tokenizer,
         generation_config,
         "Hello!",
         max_new_tokens=1,
     )
-    input_len = len(tokenizer.encode("Hello!"))
+    # Chat template adds special tokens, so input_len is the chat-formatted length
+    messages = [{"role": "user", "content": "Hello!"}]
+    chat_text = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    input_len = len(tokenizer.encode(chat_text))
     first_new = tokens[input_len]
     assert 0 <= first_new < tokenizer.vocab_size, (
         f"Token {first_new} out of vocab range"
@@ -256,19 +296,20 @@ def test_top_token_valid(compiled_model, tokenizer, generation_config):
 
 @requires_model_path
 def test_capital_of_france(compiled_model, tokenizer, generation_config):
-    """'The capital of France is' should produce 'Paris' in generated text."""
-    tokens, text = _generate(
+    """'What is the capital of France?' should produce 'Paris' in response."""
+    _, response = _chat_generate(
         compiled_model,
         tokenizer,
         generation_config,
-        "The capital of France is",
-        max_new_tokens=15,
+        "What is the capital of France? Answer in one word.",
+        max_new_tokens=30,
     )
-    generated = text[len("The capital of France is") :].strip()
-    assert "paris" in generated.lower(), (
-        f"Expected 'Paris' in output, got: '{generated}'"
-    )
-    print(f"  Capital of France: {generated}")
+    # Strip <think></think> tags if present
+    clean = response
+    if "<think>" in clean:
+        clean = clean.split("</think>")[-1].strip()
+    assert "paris" in clean.lower(), f"Expected 'Paris' in output, got: '{clean}'"
+    print(f"  Capital of France: {clean}")
 
 
 # ── Performance Tests ───────────────────────────────────────────────────
@@ -336,31 +377,32 @@ def test_performance_throughput(compiled_model, tokenizer, generation_config):
 
 @requires_model_path
 def test_multi_prompt_generation(compiled_model, tokenizer, generation_config):
-    """Multiple prompts should produce coherent outputs."""
-    prompts = [
-        "The capital of France is",
-        "def fibonacci(n):",
-        "The largest ocean on Earth is",
-        "To make a chocolate cake, you need",
+    """Multiple chat prompts should produce coherent outputs."""
+    user_messages = [
+        "What is the capital of France?",
+        "Write a Python fibonacci function.",
+        "What is the largest ocean on Earth?",
+        "List two ingredients for a chocolate cake.",
     ]
 
-    for prompt in prompts:
-        _, text = _generate(
+    for msg in user_messages:
+        _, response = _chat_generate(
             compiled_model,
             tokenizer,
             generation_config,
-            prompt,
-            max_new_tokens=30,
+            msg,
+            max_new_tokens=50,
         )
-        generated = text[len(prompt) :].strip()
-        words = generated.split()
-        assert len(words) >= 2, (
-            f"Prompt '{prompt}' generated too few words: '{generated}'"
+        # Strip <think></think> tags if present
+        clean = response
+        if "<think>" in clean:
+            clean = clean.split("</think>")[-1].strip()
+        words = clean.split()
+        assert len(words) >= 2, f"Message '{msg}' generated too few words: '{clean}'"
+        assert not _is_repetitive(clean), (
+            f"Message '{msg}' produced repetitive output: '{clean}'"
         )
-        assert not _is_repetitive(generated), (
-            f"Prompt '{prompt}' produced repetitive output: '{generated}'"
-        )
-        print(f"  '{prompt[:30]}...' -> {generated[:60]}...")
+        print(f"  '{msg[:30]}...' -> {clean[:60]}...")
 
 
 # ── Standalone runner ───────────────────────────────────────────────────
