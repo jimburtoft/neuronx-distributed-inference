@@ -1250,7 +1250,7 @@ class NeuronQwen35Attention(NeuronAttentionBase):
         if NKILIB_PATCH_ACTIVE:
             return _flash_fwd_call(Q, K, V, use_causal_mask=True), None
 
-        # Fallback: softmax path
+        # Fallback: softmax path (use 3D tensors to avoid compiler ICE with 4D patterns)
         if head_dim > 128:
             # GQA: expand K/V heads to match Q heads
             num_q_heads = Q.shape[1]
@@ -1267,16 +1267,29 @@ class NeuronQwen35Attention(NeuronAttentionBase):
                     .expand(-1, -1, kv_rep, -1, -1)
                     .reshape(bsz, num_q_heads, q_len, head_dim)
                 )
-            attn_weights = torch.matmul(Q, K.transpose(-1, -2)) / math.sqrt(head_dim)
-            if attention_mask is not None:
-                if attention_mask.dtype == torch.bool:
-                    attn_weights = attn_weights.masked_fill(~attention_mask, -65504.0)
-                else:
-                    attn_weights = attn_weights + attention_mask
+            # Reshape to 3D (B*H, S, d) to avoid neuronx-cc codegen ICE with 4D
+            # attention weight tensors (NCC_INLA001: Expected 2D tensor but got 4D AP)
+            Q_3d = Q.reshape(bsz * num_q_heads, q_len, head_dim)
+            K_3d = K.reshape(bsz * num_q_heads, q_len, head_dim)
+            V_3d = V.reshape(bsz * num_q_heads, q_len, head_dim)
+            attn_weights = torch.bmm(Q_3d, K_3d.transpose(-1, -2)) / math.sqrt(head_dim)
+            # Build causal mask for 3D: (1, S, S) broadcast over B*H
+            causal_mask = torch.triu(
+                torch.full(
+                    (q_len, q_len),
+                    -65504.0,
+                    dtype=attn_weights.dtype,
+                    device=attn_weights.device,
+                ),
+                diagonal=1,
+            ).unsqueeze(0)
+            attn_weights = attn_weights + causal_mask
             attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
                 Q.dtype
             )
-            return torch.matmul(attn_weights, V), None
+            attn_output = torch.bmm(attn_weights, V_3d)
+            # Reshape back to 4D (B, H, S, d)
+            return attn_output.reshape(bsz, num_q_heads, q_len, head_dim), None
 
         return _flash_fwd_call(Q, K, V, use_causal_mask=True), None
 
