@@ -393,7 +393,12 @@ def _patch_fused_tkg_with_selection_bias(model=None):
 
         router_mm_dtype = nl.float32
 
-        # FP8 scales: use getattr since the module may be non-quantized
+        # FP8 scales: use getattr since the module may be non-quantized.
+        # NxDI's QuantizedExpertFused layers store scales in a compact form
+        # that may not have a leading E dimension (e.g. [1, 1, 2*I_TP] for
+        # gate_up when blockwise scale covers all experts in one block).
+        # The nkilib kernel expects [E, 2, I_TP] for gate_up and [E, H] for
+        # down, so we broadcast if needed.
         gate_up_scale = None
         down_scale = None
         if self.config.quantized:
@@ -402,10 +407,35 @@ def _patch_fused_tkg_with_selection_bias(model=None):
             E = self.num_local_experts
 
             if raw_gu_scale is not None:
-                gate_up_scale = get_data(raw_gu_scale.view(E, 2, -1))
+                gu_data = get_data(raw_gu_scale)
+                gu_numel = gu_data.numel()
+                I_TP = self.expert_mlps.routed_experts_mlp_config.intermediate_size // (
+                    self.expert_mlps.moe_tensor_model_parallel_group.size()
+                )
+                expected_numel = E * 2 * I_TP
+                if gu_numel == expected_numel:
+                    # Full per-expert scales: reshape directly
+                    gate_up_scale = gu_data.view(E, 2, -1)
+                elif gu_numel == 2 * I_TP:
+                    # Per-channel scale shared across experts: [1, 1, 2*I_TP]
+                    # Broadcast to [E, 2, I_TP]
+                    gate_up_scale = gu_data.view(1, 2, I_TP).expand(E, -1, -1)
+                else:
+                    # Fallback: try to broadcast on first dim
+                    gate_up_scale = gu_data.reshape(-1, 2, I_TP).expand(E, -1, -1)
 
             if raw_dn_scale is not None:
-                down_scale = get_data(raw_dn_scale.view(E, -1))
+                dn_data = get_data(raw_dn_scale)
+                dn_numel = dn_data.numel()
+                H = self.hidden_size
+                expected_dn = E * H
+                if dn_numel == expected_dn:
+                    down_scale = dn_data.view(E, -1)
+                elif dn_numel == H:
+                    # Per-channel scale shared across experts
+                    down_scale = dn_data.view(1, H).expand(E, -1)
+                else:
+                    down_scale = dn_data.reshape(-1, H).expand(E, -1)
 
         common_args = dict(
             inp=get_data(hidden_states),
