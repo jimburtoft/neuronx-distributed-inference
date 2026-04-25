@@ -1447,26 +1447,19 @@ class NeuronMiniMaxM2ForCausalLM(NeuronBaseForCausalLM):
         super().__init__(*args, **kwargs)
 
     def _apply_fused_tkg_selection_bias(self):
-        """Patch fused MoE TKG kernels with selection_bias.
+        """Ensure the class-level fused MoE TKG selection_bias patch is applied.
 
-        Called from compile() and load() when moe_fused_nki_kernel_enabled=True.
-        Must run after super().__init__ creates the model layers via
-        enable_context_encoding() / enable_token_generation().
+        The patch is class-level (on MoEFusedTKG._moe_fused_tkg_kernel) and is
+        normally applied when ``import compat`` runs in __init__. This method
+        serves as a safety net — it re-calls the (idempotent) patch function
+        from compile()/load() so the kernel is ready before tracing begins.
         """
         if not getattr(self.config, "moe_fused_nki_kernel_enabled", False):
-            return
-        if getattr(self, "_fused_tkg_patched", False):
             return
         try:
             import compat
 
-            n = compat._patch_fused_tkg_with_selection_bias(self)
-            import logging as _logging
-
-            _logging.getLogger(__name__).info(
-                "compat: Patched %d layers with selection_bias fused TKG", n
-            )
-            self._fused_tkg_patched = True
+            compat._patch_fused_tkg_with_selection_bias()
         except Exception as e:
             import logging as _logging
 

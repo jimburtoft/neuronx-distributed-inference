@@ -304,30 +304,26 @@ def _patch_expert_fused_linear_forward():
     return True
 
 
-def _patch_fused_tkg_with_selection_bias(model):
-    """Patch MoEFusedTKG._moe_fused_tkg_kernel on each MoE layer to inject
-    MiniMax-M2's e_score_correction_bias as selection_bias.
+def _patch_fused_tkg_with_selection_bias(model=None):
+    """Monkey-patch MoEFusedTKG._moe_fused_tkg_kernel at the CLASS level to
+    inject selection_bias from RouterTopKWithBias.
 
     MiniMax-M2 uses sigmoid routing with a learned per-expert bias for top-K
     expert *selection* (the bias doesn't affect affinity weights). The stock
-    MoEFusedTKG kernel doesn't know about this bias. This patch:
-
-    1. Copies the bias from RouterTopKWithBias on each decoder layer
-    2. Registers it as a buffer on the fused_tkg module (so it moves to XLA device)
-    3. Replaces _moe_fused_tkg_kernel with a version that passes
-       selection_bias=bias.unsqueeze(0)  [1, E] to the nkilib moe_block_tkg kernel
+    MoEFusedTKG kernel doesn't know about this bias. This patch replaces
+    _moe_fused_tkg_kernel on the MoEFusedTKG class so all instances use our
+    version that passes selection_bias=router.e_score_correction_bias.unsqueeze(0).
 
     The nkilib kernel (branch feature/selection-bias-routing) adds the bias to
     sigmoid scores for top-K selection only, then uses the unbiased sigmoid
     scores as affinity weights — matching MiniMax-M2's RouterTopKWithBias.forward().
 
     Args:
-        model: NeuronMiniMaxM2ForCausalLM instance (after super().__init__).
+        model: Unused (kept for API compat). Patch is class-level.
     """
-    import types
-
     try:
         from neuronx_distributed.modules.moe.moe_fused_tkg import (
+            MoEFusedTKG,
             ExpertAffinityScaleMode,
             ROUTER_ACT_FN_MAPPING,
             get_kernel_activation_func_id,
@@ -342,8 +338,6 @@ def _patch_fused_tkg_with_selection_bias(model):
         return 0
 
     # Import the nkilib moe_block_tkg kernel directly and wrap with nki.jit.
-    # NxDI SDK 2.28 doesn't expose moe_block_tkg_kernel as a module-level export
-    # (SDK 2.29+ does). We import from nkilib and wrap ourselves.
     try:
         from nkilib.core.moe_block.moe_block_tkg import moe_block_tkg
         import nki
@@ -357,255 +351,166 @@ def _patch_fused_tkg_with_selection_bias(model):
         )
         return 0
 
-    # Walk decoder layers to find MoE modules with fused TKG.
-    # NxDI model hierarchy: CausalLM -> models[] (wrappers) -> model -> layers[]
-    # We need to patch ALL model instances (CTE and TKG have separate models).
-    # The TKG model is the one that actually uses MoEFusedTKG.
-    all_layers = []
-    if hasattr(model, "models"):
-        for m in model.models:
-            inner = getattr(m, "model", m)
-            if hasattr(inner, "layers"):
-                all_layers.extend(enumerate(inner.layers))
-    elif hasattr(model, "model") and hasattr(model.model, "layers"):
-        all_layers = list(enumerate(model.model.layers))
-    elif hasattr(model, "layers"):
-        all_layers = list(enumerate(model.layers))
+    if getattr(MoEFusedTKG, "_minimax_selection_bias_patched", False):
+        logger.debug("MoEFusedTKG already patched with selection_bias")
+        return 1
 
-    if not all_layers:
-        logger.warning("Could not find decoder layers on model, skipping patch")
-        return 0
+    _orig_method = MoEFusedTKG._moe_fused_tkg_kernel
 
-    patched_count = 0
-    for layer_idx, layer in all_layers:
-        # Get the MoE module
-        moe_module = getattr(layer, "block_sparse_moe", None)
-        if moe_module is None:
-            continue
+    def _patched_moe_fused_tkg_kernel(self, hidden_states, residual=None):
+        """Replacement _moe_fused_tkg_kernel that injects selection_bias.
 
-        # The MoE module wraps: moe_module.moe is the NxDI MoE, or it IS the MoE
-        # In MiniMax-M2, block_sparse_moe IS the MoE wrapper from initialize_minimax_m2_moe_module
-        # which returns MoE(...). The fused_tkg is on moe_module.moe_fused_tkg.
-        fused_tkg = getattr(moe_module, "moe_fused_tkg", None)
-        if fused_tkg is None or not hasattr(fused_tkg, "_moe_fused_tkg_kernel"):
-            continue
+        Based on NxDI stock MoEFusedTKG._moe_fused_tkg_kernel with one
+        addition: selection_bias kwarg passed to the nkilib kernel.
 
-        # Get the selection bias from the router
-        # The router is on fused_tkg.router (set during MoEFusedTKG.__init__)
-        router = getattr(fused_tkg, "router", None)
-        if router is None:
-            logger.warning("Layer %d: No router on fused_tkg, skipping", layer_idx)
-            continue
+        Falls back to stock method if router has no e_score_correction_bias.
+        """
+        import neuronxcc.nki.language as nl
 
-        bias_param = getattr(router, "e_score_correction_bias", None)
+        # Check if router has selection bias; if not, fall back to stock
+        bias_param = getattr(self.router, "e_score_correction_bias", None)
         if bias_param is None:
-            logger.warning(
-                "Layer %d: Router has no e_score_correction_bias, skipping",
-                layer_idx,
+            return _orig_method(self, hidden_states, residual)
+
+        hidden_states_shape = hidden_states.shape
+        if self.expert_mlps.routed_experts_mlp_config.early_expert_affinity_modulation:
+            expert_affinities_scaling_mode = ExpertAffinityScaleMode.PRE_SCALE
+        else:
+            expert_affinities_scaling_mode = ExpertAffinityScaleMode.POST_SCALE
+        local_rank = self.expert_mlps.spmd_rank.get_rank()
+        local_ep_rank = (
+            local_rank // self.expert_mlps.moe_tensor_model_parallel_group.size()
+        )
+        grid = self.logical_nc_config
+        (
+            shared_experts_gate_proj_weight,
+            shared_experts_up_proj_weight,
+            shared_experts_down_proj_weight,
+        ) = self._slice_shared_experts_weights()
+
+        def get_data(t):
+            return t.data if t is not None and hasattr(t, "data") else t
+
+        router_mm_dtype = nl.float32
+
+        # FP8 scales: use getattr since the module may be non-quantized
+        gate_up_scale = None
+        down_scale = None
+        if self.config.quantized:
+            raw_gu_scale = getattr(self.expert_mlps.mlp_op.gate_up_proj, "scale", None)
+            raw_dn_scale = getattr(self.expert_mlps.mlp_op.down_proj, "scale", None)
+            E = self.num_local_experts
+
+            if raw_gu_scale is not None:
+                gate_up_scale = get_data(raw_gu_scale.view(E, 2, -1))
+
+            if raw_dn_scale is not None:
+                down_scale = get_data(raw_dn_scale.view(E, -1))
+
+        common_args = dict(
+            inp=get_data(hidden_states),
+            gamma=get_data(self.post_attention_layernorm.weight.unsqueeze(0)),
+            router_weights=get_data(self.router.weight_T),
+            shared_expert_gate_w=get_data(shared_experts_gate_proj_weight),
+            shared_expert_up_w=get_data(shared_experts_up_proj_weight),
+            shared_expert_down_w=get_data(shared_experts_down_proj_weight),
+            expert_gate_up_weights=get_data(
+                self.expert_mlps.mlp_op.gate_up_proj.weight.view(
+                    self.num_local_experts, self.hidden_size, 2, -1
+                )
+            ),
+            expert_down_weights=get_data(self.expert_mlps.mlp_op.down_proj.weight),
+            expert_gate_up_weights_scale=gate_up_scale,
+            expert_down_weights_scale=down_scale,
+            eps=self.post_attention_layernorm.variance_epsilon,
+            top_k=self.num_experts_per_tok,
+            router_act_fn=ROUTER_ACT_FN_MAPPING[self.router.act_fn],
+            expert_affinities_scaling_mode=expert_affinities_scaling_mode,
+            router_mm_dtype=router_mm_dtype,
+        )
+
+        if self.expert_mlps.routed_experts_mlp_config.hidden_size_actual is not None:
+            common_args["hidden_actual"] = (
+                self.expert_mlps.routed_experts_mlp_config.hidden_size_actual
             )
-            continue
 
-        # Register bias as a buffer on fused_tkg so it's moved to XLA device.
-        # Using .data.clone() to detach from the original parameter's graph.
-        # NOTE: This buffer holds the init-time placeholder value (arange).
-        # The real checkpoint values are loaded into router.e_score_correction_bias
-        # via replace_weights(). The replacement kernel accesses the parameter
-        # directly (self.router.e_score_correction_bias), not this buffer.
-        # The buffer exists only as a backup / debugging aid.
-        fused_tkg.register_buffer("_minimax_selection_bias", bias_param.data.clone())
-
-        def _make_replacement_method():
-            """Create a replacement for _moe_fused_tkg_kernel with selection_bias."""
-
-            def replacement_moe_fused_tkg_kernel(self, hidden_states, residual=None):
-                """Replacement _moe_fused_tkg_kernel that injects selection_bias.
-
-                Based on NxDI stock MoEFusedTKG._moe_fused_tkg_kernel with one
-                addition: selection_bias kwarg passed to the NKI kernel.
-                """
-                import neuronxcc.nki.language as nl
-
-                hidden_states_shape = hidden_states.shape
-                if self.expert_mlps.routed_experts_mlp_config.early_expert_affinity_modulation:
-                    expert_affinities_scaling_mode = ExpertAffinityScaleMode.PRE_SCALE
-                else:
-                    expert_affinities_scaling_mode = ExpertAffinityScaleMode.POST_SCALE
-                local_rank = self.expert_mlps.spmd_rank.get_rank()
-                local_ep_rank = (
-                    local_rank
-                    // self.expert_mlps.moe_tensor_model_parallel_group.size()
-                )
-                grid = self.logical_nc_config
-                (
-                    shared_experts_gate_proj_weight,
-                    shared_experts_up_proj_weight,
-                    shared_experts_down_proj_weight,
-                ) = self._slice_shared_experts_weights()
-
-                def get_data(t):
-                    return t.data if t is not None and hasattr(t, "data") else t
-
-                # Stock NxDI hardcodes router_mm_dtype=nl.float32.
-                # MiniMax-M2's router config dtype is torch.float32, so this matches.
-                router_mm_dtype = nl.float32
-
-                # FP8 scales: use getattr since the module may be non-quantized
-                # (ExpertFusedColumnParallelLinear without .scale) when
-                # modules_to_not_convert excluded expert_mlps from NxDI convert.
-                # Scales get set later via replace_weights from checkpoint.
-                # During tracing, we need placeholder scales of the right shape.
-                gate_up_scale = None
-                down_scale = None
-                if self.config.quantized:
-                    raw_gu_scale = getattr(
-                        self.expert_mlps.mlp_op.gate_up_proj, "scale", None
-                    )
-                    raw_dn_scale = getattr(
-                        self.expert_mlps.mlp_op.down_proj, "scale", None
-                    )
-                    E = self.num_local_experts
-
-                    if raw_gu_scale is not None:
-                        gate_up_scale = get_data(raw_gu_scale.view(E, 2, -1))
-
-                    if raw_dn_scale is not None:
-                        down_scale = get_data(raw_dn_scale.view(E, -1))
-
-                common_args = dict(
-                    inp=get_data(hidden_states),
-                    gamma=get_data(self.post_attention_layernorm.weight.unsqueeze(0)),
-                    router_weights=get_data(self.router.weight_T),
-                    shared_expert_gate_w=get_data(shared_experts_gate_proj_weight),
-                    shared_expert_up_w=get_data(shared_experts_up_proj_weight),
-                    shared_expert_down_w=get_data(shared_experts_down_proj_weight),
-                    expert_gate_up_weights=get_data(
-                        self.expert_mlps.mlp_op.gate_up_proj.weight.view(
-                            self.num_local_experts, self.hidden_size, 2, -1
-                        )
-                    ),
-                    expert_down_weights=get_data(
-                        self.expert_mlps.mlp_op.down_proj.weight
-                    ),
-                    expert_gate_up_weights_scale=gate_up_scale,
-                    expert_down_weights_scale=down_scale,
-                    eps=self.post_attention_layernorm.variance_epsilon,
-                    top_k=self.num_experts_per_tok,
-                    router_act_fn=ROUTER_ACT_FN_MAPPING[self.router.act_fn],
-                    expert_affinities_scaling_mode=expert_affinities_scaling_mode,
-                    router_mm_dtype=router_mm_dtype,
-                )
-
-                if (
-                    self.expert_mlps.routed_experts_mlp_config.hidden_size_actual
-                    is not None
-                ):
-                    common_args["hidden_actual"] = (
-                        self.expert_mlps.routed_experts_mlp_config.hidden_size_actual
-                    )
-
-                total_tokens = hidden_states_shape[0] * hidden_states_shape[1]
-                perc_experts_loaded = (
-                    total_tokens * self.num_experts_per_tok / self.num_local_experts
-                )
-
-                kernel_call = moe_block_tkg_kernel
-                is_all_expert = (
-                    perc_experts_loaded >= DEFAULT_SELECTIVE_LOADING_THRESHOLD
-                )
-
-                if kernel_call:
-                    routed_experts_mlp_config = (
-                        self.expert_mlps.routed_experts_mlp_config
-                    )
-                    kernel_activation_func_id = get_kernel_activation_func_id(
-                        ACTFunc.validate(routed_experts_mlp_config.hidden_act),
-                        routed_experts_mlp_config.glu_type,
-                    )
-                    optional_kwargs = {}
-                    if routed_experts_mlp_config.gate_clamp_upper_limit is not None:
-                        optional_kwargs["gate_clamp_upper_limit"] = (
-                            routed_experts_mlp_config.gate_clamp_upper_limit
-                        )
-                    if routed_experts_mlp_config.gate_clamp_lower_limit is not None:
-                        optional_kwargs["gate_clamp_lower_limit"] = (
-                            routed_experts_mlp_config.gate_clamp_lower_limit
-                        )
-                    if routed_experts_mlp_config.up_clamp_upper_limit is not None:
-                        optional_kwargs["up_clamp_upper_limit"] = (
-                            routed_experts_mlp_config.up_clamp_upper_limit
-                        )
-                    if routed_experts_mlp_config.up_clamp_lower_limit is not None:
-                        optional_kwargs["up_clamp_lower_limit"] = (
-                            routed_experts_mlp_config.up_clamp_lower_limit
-                        )
-
-                    if is_all_expert:
-                        optional_kwargs["rank_id"] = get_data(
-                            local_ep_rank.reshape(1, 1)
-                        )
-
-                    # --- MiniMax-M2 selection_bias ---
-                    # Use the router's e_score_correction_bias parameter directly.
-                    # This is an nn.Parameter on self.router (RouterTopKWithBias),
-                    # so it gets loaded from checkpoint via replace_weights() and
-                    # is on the XLA device during tracing.
-                    sel_bias = get_data(self.router.e_score_correction_bias)
-                    optional_kwargs["selection_bias"] = sel_bias.unsqueeze(
-                        0
-                    )  # [E] -> [1, E]
-
-                    out, router_logits = kernel_call[grid](
-                        **common_args,
-                        router_bias=get_data(self.router.linear_router.bias)
-                        if self.router.bias
-                        else None,
-                        expert_gate_up_bias=get_data(
-                            self.expert_mlps.mlp_op.gate_up_proj.bias.view(
-                                self.num_local_experts, 2, -1
-                            )
-                        )
-                        if routed_experts_mlp_config.bias
-                        else None,
-                        expert_down_bias=get_data(
-                            self.expert_mlps.mlp_op.down_proj.bias
-                        )
-                        if routed_experts_mlp_config.bias
-                        else None,
-                        shared_expert_gate_bias=None,
-                        shared_expert_up_bias=None,
-                        shared_expert_down_bias=None,
-                        router_pre_norm=not self.router.apply_act_fn_over_topk,
-                        hidden_act_fn=ActFnType(kernel_activation_func_id),
-                        hidden_act_scale_factor=None,
-                        hidden_act_bias=None,
-                        norm_topk_prob=self.config.norm_topk_prob,
-                        is_all_expert=is_all_expert,
-                        **optional_kwargs,
-                    )
-
-                return out.view(hidden_states_shape), router_logits.to(
-                    hidden_states.dtype
-                )
-
-            return replacement_moe_fused_tkg_kernel
-
-        # Bind the replacement method
-        fused_tkg._moe_fused_tkg_kernel = types.MethodType(
-            _make_replacement_method(),
-            fused_tkg,
-        )
-        patched_count += 1
-        logger.info(
-            "Layer %d: Replaced _moe_fused_tkg_kernel with selection_bias version",
-            layer_idx,
+        total_tokens = hidden_states_shape[0] * hidden_states_shape[1]
+        perc_experts_loaded = (
+            total_tokens * self.num_experts_per_tok / self.num_local_experts
         )
 
+        kernel_call = moe_block_tkg_kernel
+        is_all_expert = perc_experts_loaded >= DEFAULT_SELECTIVE_LOADING_THRESHOLD
+
+        if kernel_call:
+            routed_experts_mlp_config = self.expert_mlps.routed_experts_mlp_config
+            kernel_activation_func_id = get_kernel_activation_func_id(
+                ACTFunc.validate(routed_experts_mlp_config.hidden_act),
+                routed_experts_mlp_config.glu_type,
+            )
+            optional_kwargs = {}
+            if routed_experts_mlp_config.gate_clamp_upper_limit is not None:
+                optional_kwargs["gate_clamp_upper_limit"] = (
+                    routed_experts_mlp_config.gate_clamp_upper_limit
+                )
+            if routed_experts_mlp_config.gate_clamp_lower_limit is not None:
+                optional_kwargs["gate_clamp_lower_limit"] = (
+                    routed_experts_mlp_config.gate_clamp_lower_limit
+                )
+            if routed_experts_mlp_config.up_clamp_upper_limit is not None:
+                optional_kwargs["up_clamp_upper_limit"] = (
+                    routed_experts_mlp_config.up_clamp_upper_limit
+                )
+            if routed_experts_mlp_config.up_clamp_lower_limit is not None:
+                optional_kwargs["up_clamp_lower_limit"] = (
+                    routed_experts_mlp_config.up_clamp_lower_limit
+                )
+
+            if is_all_expert:
+                optional_kwargs["rank_id"] = get_data(local_ep_rank.reshape(1, 1))
+
+            # --- MiniMax-M2 selection_bias ---
+            sel_bias = get_data(bias_param)
+            optional_kwargs["selection_bias"] = sel_bias.unsqueeze(0)  # [E] -> [1, E]
+
+            out, router_logits = kernel_call[grid](
+                **common_args,
+                router_bias=get_data(self.router.linear_router.bias)
+                if self.router.bias
+                else None,
+                expert_gate_up_bias=get_data(
+                    self.expert_mlps.mlp_op.gate_up_proj.bias.view(
+                        self.num_local_experts, 2, -1
+                    )
+                )
+                if routed_experts_mlp_config.bias
+                else None,
+                expert_down_bias=get_data(self.expert_mlps.mlp_op.down_proj.bias)
+                if routed_experts_mlp_config.bias
+                else None,
+                shared_expert_gate_bias=None,
+                shared_expert_up_bias=None,
+                shared_expert_down_bias=None,
+                router_pre_norm=not self.router.apply_act_fn_over_topk,
+                hidden_act_fn=ActFnType(kernel_activation_func_id),
+                hidden_act_scale_factor=None,
+                hidden_act_bias=None,
+                norm_topk_prob=self.config.norm_topk_prob,
+                is_all_expert=is_all_expert,
+                **optional_kwargs,
+            )
+
+        return out.view(hidden_states_shape), router_logits.to(hidden_states.dtype)
+
+    MoEFusedTKG._moe_fused_tkg_kernel = _patched_moe_fused_tkg_kernel
+    MoEFusedTKG._minimax_selection_bias_patched = True
     logger.info(
-        "Patched %d MoE layers with selection_bias fused TKG kernel", patched_count
+        "Patched MoEFusedTKG._moe_fused_tkg_kernel (class-level) with selection_bias"
     )
-    return patched_count
+    return 1
 
 
 # Apply patches on import
 _patch_blockwise_shard_hidden()
 _patch_expert_fused_linear_forward()
+_patch_fused_tkg_with_selection_bias()
