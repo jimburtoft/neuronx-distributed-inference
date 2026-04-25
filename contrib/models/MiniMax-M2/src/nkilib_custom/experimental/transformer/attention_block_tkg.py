@@ -57,6 +57,15 @@ from nki.isa.constants import oob_mode
 from nkilib.core.attention.attention_tkg import AttnTKGConfig, attention_tkg
 from nkilib.core.attention.attention_tkg_utils import is_fp8_e4m3
 from nkilib.core.embeddings.rope import RoPE_sbuf
+
+# Check at module level whether AttnTKGConfig supports enable_fa_s_prior_tiling
+# (not available in NKI 0.2.0 / SDK 2.28). Cannot use inspect inside NKI kernels.
+import inspect as _inspect
+
+_ATTN_CFG_HAS_FA_TILING = (
+    "enable_fa_s_prior_tiling" in _inspect.signature(AttnTKGConfig).parameters
+)
+del _inspect
 from nkilib.core.output_projection.output_projection_tkg import output_projection_tkg
 from nkilib.core.qkv.qkv import qkv
 from nkilib.core.utils.allocator import SbufManager, create_auto_alloc_manager
@@ -544,9 +553,7 @@ def attention_block_tkg(
             out_in_sb=do_out_proj or out_in_sb or is_KVDP,
         )
         # enable_fa_s_prior_tiling is only available in newer nkilib versions
-        import inspect
-
-        if "enable_fa_s_prior_tiling" in inspect.signature(AttnTKGConfig).parameters:
+        if _ATTN_CFG_HAS_FA_TILING:
             attn_cfg_kwargs["enable_fa_s_prior_tiling"] = enable_fa_s_prior_tiling
         attn_cfg = AttnTKGConfig(**attn_cfg_kwargs)
 
