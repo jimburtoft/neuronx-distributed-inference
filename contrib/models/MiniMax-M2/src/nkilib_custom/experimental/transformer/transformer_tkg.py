@@ -21,7 +21,12 @@ import nki.isa as nisa
 import nki.language as nl
 
 from nkilib.core.mlp.mlp import mlp
-from nkilib.core.utils.allocator import BufferManager, Logger
+
+try:
+    from nkilib.core.utils.allocator import BufferManager, Logger
+except ImportError:
+    # NKI 0.2.0 (SDK 2.28) renamed BufferManager to SbufManager
+    from nkilib.core.utils.allocator import SbufManager as BufferManager, Logger
 from nkilib.core.utils.common_types import ActFnType, NormType, QuantizationType
 from nkilib.core.utils.kernel_helpers import get_verified_program_sharding_info
 from nkilib.core.utils.tensor_view import TensorView

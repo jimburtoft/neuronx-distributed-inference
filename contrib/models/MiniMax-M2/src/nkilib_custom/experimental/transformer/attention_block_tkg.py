@@ -70,10 +70,17 @@ from nkilib.core.utils.kernel_helpers import (
 )
 from nkilib.core.utils.logging import Logger
 from nkilib.core.utils.tensor_view import TensorView
-from nkilib.experimental.transformer.attention_block_tkg_sharding import (
-    _KVDP_attention_input_collectives,
-    _KVDP_attention_output_collectives,
-)
+
+try:
+    from nkilib.experimental.transformer.attention_block_tkg_sharding import (
+        _KVDP_attention_input_collectives,
+        _KVDP_attention_output_collectives,
+    )
+except ImportError:
+    # NKI 0.2.0 (SDK 2.28) doesn't have KVDP sharding support.
+    # These are only needed when KVDP > 1 (not used for MiniMax-M2 TP=32).
+    _KVDP_attention_input_collectives = None
+    _KVDP_attention_output_collectives = None
 
 
 # TODO(NKI-699): Refactor API to use configuration dataclasses for better clarity
