@@ -373,6 +373,17 @@ def _patch_fused_tkg_with_selection_bias(model=None):
             return _orig_method(self, hidden_states, residual)
 
         hidden_states_shape = hidden_states.shape
+
+        # NKI SBUF tensors collapse size-1 free dimensions, so the nkilib
+        # RMSNorm kernel fails when T=B*S=1 (tensor_reduce axis becomes
+        # invalid). Pad S from 1 to 2 with zeros, run the kernel, then
+        # slice the output back.
+        B, S, H = hidden_states_shape
+        padded = False
+        if B * S == 1:
+            hidden_states = torch.nn.functional.pad(hidden_states, (0, 0, 0, 1))
+            padded = True
+
         if self.expert_mlps.routed_experts_mlp_config.early_expert_affinity_modulation:
             expert_affinities_scaling_mode = ExpertAffinityScaleMode.PRE_SCALE
         else:
@@ -530,6 +541,11 @@ def _patch_fused_tkg_with_selection_bias(model=None):
                 **optional_kwargs,
             )
 
+        # Unpad output if we padded input (take only the first token)
+        if padded:
+            out = out[:, :S, :]
+            if router_logits is not None and router_logits.shape[0] > B * S:
+                router_logits = router_logits[: B * S, :]
         return out.view(hidden_states_shape), router_logits.to(hidden_states.dtype)
 
     MoEFusedTKG._moe_fused_tkg_kernel = _patched_moe_fused_tkg_kernel
