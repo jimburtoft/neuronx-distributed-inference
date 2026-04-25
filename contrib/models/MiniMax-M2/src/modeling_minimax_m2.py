@@ -1446,27 +1446,33 @@ class NeuronMiniMaxM2ForCausalLM(NeuronBaseForCausalLM):
 
         super().__init__(*args, **kwargs)
 
-        # Patch fused MoE TKG kernels with selection_bias AFTER super().__init__
-        # because fused_tkg modules are created during init_model().
-        # This injects e_score_correction_bias into the NKI moe_block_tkg kernel
-        # so the fused kernel handles biased expert selection natively.
-        # Only applies when moe_fused_nki_kernel_enabled=True (i.e. fused TKG path).
-        if ncfg is not None and getattr(ncfg, "moe_fused_nki_kernel_enabled", False):
-            try:
-                import compat
+    def _apply_fused_tkg_selection_bias(self):
+        """Patch fused MoE TKG kernels with selection_bias.
 
-                n = compat._patch_fused_tkg_with_selection_bias(self)
-                import logging as _logging
+        Called from compile() and load() when moe_fused_nki_kernel_enabled=True.
+        Must run after super().__init__ creates the model layers via
+        enable_context_encoding() / enable_token_generation().
+        """
+        if not getattr(self.config, "moe_fused_nki_kernel_enabled", False):
+            return
+        if getattr(self, "_fused_tkg_patched", False):
+            return
+        try:
+            import compat
 
-                _logging.getLogger(__name__).info(
-                    "compat: Patched %d layers with selection_bias fused TKG", n
-                )
-            except Exception as e:
-                import logging as _logging
+            n = compat._patch_fused_tkg_with_selection_bias(self)
+            import logging as _logging
 
-                _logging.getLogger(__name__).warning(
-                    "compat: Failed to patch fused TKG with selection_bias: %s", e
-                )
+            _logging.getLogger(__name__).info(
+                "compat: Patched %d layers with selection_bias fused TKG", n
+            )
+            self._fused_tkg_patched = True
+        except Exception as e:
+            import logging as _logging
+
+            _logging.getLogger(__name__).warning(
+                "compat: Failed to patch fused TKG with selection_bias: %s", e
+            )
 
     @staticmethod
     def load_hf_model(model_path, **kwargs):
@@ -1636,10 +1642,13 @@ class NeuronMiniMaxM2ForCausalLM(NeuronBaseForCausalLM):
         # save_sharded_checkpoint=True serializes shards during compile() and
         # that code path reads scale.partition_stride — patches must be live.
         self._install_fp8_patches()
+        # Patch fused TKG with selection_bias before tracing begins.
+        self._apply_fused_tkg_selection_bias()
         return super().compile(*args, **kwargs)
 
     def load(self, *args, **kwargs):
         self._install_fp8_patches()
+        self._apply_fused_tkg_selection_bias()
         return super().load(*args, **kwargs)
 
     @classmethod

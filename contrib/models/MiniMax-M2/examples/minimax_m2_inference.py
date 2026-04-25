@@ -259,19 +259,34 @@ def create_config(args) -> MiniMaxM2InferenceConfig:
         # Per-channel scales (preprocessing converts blockwise->per-channel)
         quantization_block_size=None,
         quantization_block_axis=None,
-        # Exclude ALL modules from NxD convert() when native FP8.
+        # Exclude modules from NxD convert() for native FP8.
+        # When using fused MoE TKG: only exclude non-MoE modules. The fused kernel
+        # needs QuantizedExpertFused* layers with .scale for FP8 handling.
+        # Without fused TKG: exclude ALL modules (compat.py handles FP8 manually).
         # In dequant mode, no convert() is called (quantized=False).
-        modules_to_not_convert=[
-            "self_attn",
-            "lm_head",
-            "embed_tokens",
-            "norm",
-            "block_sparse_moe",
-            "expert_mlps",
-            "router",
-        ]
-        if use_fp8_native
-        else None,
+        modules_to_not_convert=(
+            [
+                "self_attn",
+                "lm_head",
+                "embed_tokens",
+                "norm",
+                "router",
+            ]
+            if use_fp8_native and use_fused_moe_tkg
+            else (
+                [
+                    "self_attn",
+                    "lm_head",
+                    "embed_tokens",
+                    "norm",
+                    "block_sparse_moe",
+                    "expert_mlps",
+                    "router",
+                ]
+                if use_fp8_native
+                else None
+            )
+        ),
     )
 
     # MiniMax-M2 HF repo has auto_map, requiring trust_remote_code for AutoConfig.

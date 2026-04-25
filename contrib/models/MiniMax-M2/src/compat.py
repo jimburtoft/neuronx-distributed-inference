@@ -357,19 +357,27 @@ def _patch_fused_tkg_with_selection_bias(model):
         )
         return 0
 
-    # Walk decoder layers to find MoE modules with fused TKG
-    layers = None
-    # model.model is the NeuronMiniMaxM2Model, model.model.layers is the ModuleList
-    if hasattr(model, "model") and hasattr(model.model, "layers"):
-        layers = model.model.layers
+    # Walk decoder layers to find MoE modules with fused TKG.
+    # NxDI model hierarchy: CausalLM -> models[] (wrappers) -> model -> layers[]
+    # We need to patch ALL model instances (CTE and TKG have separate models).
+    # The TKG model is the one that actually uses MoEFusedTKG.
+    all_layers = []
+    if hasattr(model, "models"):
+        for m in model.models:
+            inner = getattr(m, "model", m)
+            if hasattr(inner, "layers"):
+                all_layers.extend(enumerate(inner.layers))
+    elif hasattr(model, "model") and hasattr(model.model, "layers"):
+        all_layers = list(enumerate(model.model.layers))
     elif hasattr(model, "layers"):
-        layers = model.layers
-    if layers is None:
+        all_layers = list(enumerate(model.layers))
+
+    if not all_layers:
         logger.warning("Could not find decoder layers on model, skipping patch")
         return 0
 
     patched_count = 0
-    for layer_idx, layer in enumerate(layers):
+    for layer_idx, layer in all_layers:
         # Get the MoE module
         moe_module = getattr(layer, "block_sparse_moe", None)
         if moe_module is None:
@@ -441,12 +449,20 @@ def _patch_fused_tkg_with_selection_bias(model):
                 # MiniMax-M2's router config dtype is torch.float32, so this matches.
                 router_mm_dtype = nl.float32
 
-                # FP8 scales: per-channel (not scalar), just reshape
+                # FP8 scales: use getattr since the module may be non-quantized
+                # (ExpertFusedColumnParallelLinear without .scale) when
+                # modules_to_not_convert excluded expert_mlps from NxDI convert.
+                # Scales get set later via replace_weights from checkpoint.
+                # During tracing, we need placeholder scales of the right shape.
                 gate_up_scale = None
                 down_scale = None
                 if self.config.quantized:
-                    raw_gu_scale = self.expert_mlps.mlp_op.gate_up_proj.scale
-                    raw_dn_scale = self.expert_mlps.mlp_op.down_proj.scale
+                    raw_gu_scale = getattr(
+                        self.expert_mlps.mlp_op.gate_up_proj, "scale", None
+                    )
+                    raw_dn_scale = getattr(
+                        self.expert_mlps.mlp_op.down_proj, "scale", None
+                    )
                     E = self.num_local_experts
 
                     if raw_gu_scale is not None:
