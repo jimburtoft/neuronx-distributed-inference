@@ -814,10 +814,32 @@ class MiniMaxM2InferenceConfig(InferenceConfig):
                 self.intermediate_size = padded
 
     def _enable_moe_fused_nki_kernel(self):
-        """Enable fused MoE NKI kernel if the per-TP intermediate dimension is aligned."""
-        i_tp = self.intermediate_size // self.neuron_config.moe_tp_degree
+        """Enable fused MoE NKI kernel if requested.
+
+        NxDI guards this with MOE_TKG_MK_INTERMEDIATE_PER_TP=128 alignment,
+        but the nkilib moe_block_tkg kernel handles non-aligned I via
+        TiledRange with ceiling division. MiniMax-M2 at TP=32 has I_TP=48,
+        which works in the nkilib kernel but fails the NxDI guard.
+
+        We bypass the alignment check here because:
+        1. Our replacement _moe_fused_tkg_kernel uses moe_block_tkg_kernel
+           from nkilib (not NxDI's internal kernel paths)
+        2. nkilib's TiledRange handles remainderI tiles correctly
+        3. MiniMax-M2 uses bf16/FP8 (not MXFP), so no MX alignment constraints
+        """
         if getattr(self.neuron_config, "moe_fused_nki_kernel_enabled", False):
+            i_tp = self.intermediate_size // self.neuron_config.moe_tp_degree
             if i_tp % MOE_TKG_MK_INTERMEDIATE_PER_TP == 0:
+                self.moe_fused_nki_kernel_enabled = True
+            else:
+                import logging as _log
+
+                _log.getLogger(__name__).info(
+                    "Enabling fused MoE TKG despite I_TP=%d not aligned to %d "
+                    "(nkilib handles partial tiles via TiledRange)",
+                    i_tp,
+                    MOE_TKG_MK_INTERMEDIATE_PER_TP,
+                )
                 self.moe_fused_nki_kernel_enabled = True
 
     def get_required_attributes(self) -> List[str]:
@@ -1423,6 +1445,28 @@ class NeuronMiniMaxM2ForCausalLM(NeuronBaseForCausalLM):
                     pass  # compat.py not present, skip
 
         super().__init__(*args, **kwargs)
+
+        # Patch fused MoE TKG kernels with selection_bias AFTER super().__init__
+        # because fused_tkg modules are created during init_model().
+        # This injects e_score_correction_bias into the NKI moe_block_tkg kernel
+        # so the fused kernel handles biased expert selection natively.
+        # Only applies when moe_fused_nki_kernel_enabled=True (i.e. fused TKG path).
+        if ncfg is not None and getattr(ncfg, "moe_fused_nki_kernel_enabled", False):
+            try:
+                import compat
+
+                n = compat._patch_fused_tkg_with_selection_bias(self)
+                import logging as _logging
+
+                _logging.getLogger(__name__).info(
+                    "compat: Patched %d layers with selection_bias fused TKG", n
+                )
+            except Exception as e:
+                import logging as _logging
+
+                _logging.getLogger(__name__).warning(
+                    "compat: Failed to patch fused TKG with selection_bias: %s", e
+                )
 
     @staticmethod
     def load_hf_model(model_path, **kwargs):

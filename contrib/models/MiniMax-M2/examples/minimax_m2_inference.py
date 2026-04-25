@@ -44,6 +44,18 @@ Usage:
         --batch-size 1 \
         --max-context-length 128 \
         --max-new-tokens 128
+
+    # With FP8 + fused MoE TKG kernel (best FP8 throughput):
+    # Requires: nkilib fork (branch feature/selection-bias-routing)
+    UNSAFE_FP8FNCAST=1 XLA_HANDLE_SPECIAL_SCALAR=1 python minimax_m2_inference.py \
+        --model-path /mnt/models/MiniMax-M2 \
+        --compiled-model-path /mnt/models/MiniMax-M2-compiled-fused-tkg \
+        --quantized-checkpoints-path /mnt/models/MiniMax-M2-fp8-neuron \
+        --fused-moe-tkg \
+        --tp-degree 32 \
+        --batch-size 1 \
+        --max-context-length 128 \
+        --max-new-tokens 128
 """
 
 import argparse
@@ -130,6 +142,14 @@ def parse_args():
         "Model runs entirely in BF16 — avoids CTE DGE compiler issue in SDK 2.29. "
         "Requires --quantized-checkpoints-path or FP8 checkpoint at --model-path.",
     )
+    parser.add_argument(
+        "--fused-moe-tkg",
+        action="store_true",
+        help="Enable fused MoE TKG NKI kernel with selection_bias support. "
+        "Requires nkilib fork (branch feature/selection-bias-routing) installed. "
+        "The fused kernel handles FP8 natively inside the kernel — no external dequant. "
+        "Recommended for best FP8 throughput.",
+    )
     return parser.parse_args()
 
 
@@ -154,10 +174,17 @@ def create_config(args) -> MiniMaxM2InferenceConfig:
     use_nki_attn = args.enable_nki_attention
     use_fp8 = args.quantized_checkpoints_path is not None
     fp8_dequant = getattr(args, "fp8_dequant", False)
+    use_fused_moe_tkg = getattr(args, "fused_moe_tkg", False)
     # Native FP8 inference (quantized=True) — only when FP8 checkpoint provided
     # AND --fp8-dequant is NOT set. With --fp8-dequant, weights are dequanted
     # to BF16 during conversion and the model runs in BF16.
     use_fp8_native = use_fp8 and not fp8_dequant
+    if use_fused_moe_tkg and not use_fp8_native:
+        print(
+            "WARNING: --fused-moe-tkg is most effective with native FP8 "
+            "(--quantized-checkpoints-path without --fp8-dequant). "
+            "Proceeding anyway for BF16 fused TKG."
+        )
     if use_nki_attn:
         print(
             "INFO: NKI attention kernel enabled with in-kernel KV cache update "
@@ -174,6 +201,12 @@ def create_config(args) -> MiniMaxM2InferenceConfig:
             f"INFO: FP8 MoE inference enabled. Loading preprocessed checkpoint from "
             f"{args.quantized_checkpoints_path}. Expert weights stay in FP8 (1 byte/param "
             f"vs 2 for BF16), halving MoE HBM usage."
+        )
+    if use_fused_moe_tkg:
+        print(
+            "INFO: Fused MoE TKG kernel enabled with selection_bias support. "
+            "Requires nkilib fork (branch feature/selection-bias-routing). "
+            "The fused kernel handles FP8 natively — no external dequant for TKG path."
         )
 
     neuron_config = MoENeuronConfig(
@@ -192,13 +225,18 @@ def create_config(args) -> MiniMaxM2InferenceConfig:
         ),
         # Bucketing disabled — single context length for HBM-constrained config
         enable_bucketing=False,
-        # NKI MoE kernels: For native FP8 (use_fp8_native), enable NKI TKG kernels
-        # (MoEFusedTKG handles FP8 scales correctly).
-        # For fp8-dequant or BF16: disabled at TP=32 because intermediate_size/TP=48
-        # causes overhead from internal padding to 128 in the NKI kernel.
-        router_topk_nki_kernel_enabled=use_fp8_native
+        # NKI MoE kernels: Enable when native FP8 or when fused MoE TKG is requested.
+        # The fused TKG kernel requires router_topk and expert_mlp NKI kernels.
+        # For fp8-dequant or BF16 without --fused-moe-tkg: disabled at TP=32 because
+        # intermediate_size/TP=48 causes overhead from internal padding to 128.
+        router_topk_nki_kernel_enabled=(use_fp8_native or use_fused_moe_tkg)
         and not os.environ.get("DISABLE_NKI_MOE"),
-        expert_mlp_nki_kernel_enabled=use_fp8_native
+        expert_mlp_nki_kernel_enabled=(use_fp8_native or use_fused_moe_tkg)
+        and not os.environ.get("DISABLE_NKI_MOE"),
+        # Fused MoE TKG mega-kernel: single kernel for router + expert MLP + shared MLP.
+        # Handles FP8 natively inside the kernel — no external dequant needed for TKG.
+        # Requires nkilib fork with selection_bias support.
+        moe_fused_nki_kernel_enabled=use_fused_moe_tkg
         and not os.environ.get("DISABLE_NKI_MOE"),
         # NKI attention block kernel (fused QKV + RoPE + attention + KV cache)
         attn_block_tkg_nki_kernel_enabled=use_nki_attn,
