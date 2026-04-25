@@ -533,29 +533,47 @@ def attention_block_tkg(
             k_prior = K_cache.reshape(k_shape)
             v_prior = V_cache.reshape((B_attn, 1, S_max_ctx, d_head))
 
-        attn_cfg_kwargs = dict(
-            bs=B_attn,
-            q_head=q_heads_attn,
-            s_active=S_tkg,
-            curr_sprior=S_ctx,
-            full_sprior=S_max_ctx,
-            d_head=d_head,
-            block_len=blk_len if is_block_kv else 0,
-            # tp_k_prior = "kernel needs to transpose K_prior". K_cache_transposed means
-            # K is already transposed in HBM, so the kernel does NOT need to transpose it.
-            tp_k_prior=not K_cache_transposed,
-            strided_mm1=not is_block_kv,
-            use_pos_id=False,
-            fuse_rope=False,
-            use_gpsimd_sb2sb=True,
-            qk_in_sb=True,
-            k_out_in_sb=False,
-            out_in_sb=do_out_proj or out_in_sb or is_KVDP,
-        )
-        # enable_fa_s_prior_tiling is only available in newer nkilib versions
+        # enable_fa_s_prior_tiling is only available in newer nkilib versions.
+        # NKI kernels don't support dict() or **kwargs, so we use if/else.
         if _ATTN_CFG_HAS_FA_TILING:
-            attn_cfg_kwargs["enable_fa_s_prior_tiling"] = enable_fa_s_prior_tiling
-        attn_cfg = AttnTKGConfig(**attn_cfg_kwargs)
+            attn_cfg = AttnTKGConfig(
+                bs=B_attn,
+                q_head=q_heads_attn,
+                s_active=S_tkg,
+                curr_sprior=S_ctx,
+                full_sprior=S_max_ctx,
+                d_head=d_head,
+                block_len=blk_len if is_block_kv else 0,
+                tp_k_prior=not K_cache_transposed,
+                strided_mm1=not is_block_kv,
+                use_pos_id=False,
+                fuse_rope=False,
+                use_gpsimd_sb2sb=True,
+                qk_in_sb=True,
+                k_out_in_sb=False,
+                out_in_sb=do_out_proj or out_in_sb or is_KVDP,
+                enable_fa_s_prior_tiling=enable_fa_s_prior_tiling,
+            )
+        else:
+            attn_cfg = AttnTKGConfig(
+                bs=B_attn,
+                q_head=q_heads_attn,
+                s_active=S_tkg,
+                curr_sprior=S_ctx,
+                full_sprior=S_max_ctx,
+                d_head=d_head,
+                block_len=blk_len if is_block_kv else 0,
+                # tp_k_prior = "kernel needs to transpose K_prior". K_cache_transposed means
+                # K is already transposed in HBM, so the kernel does NOT need to transpose it.
+                tp_k_prior=not K_cache_transposed,
+                strided_mm1=not is_block_kv,
+                use_pos_id=False,
+                fuse_rope=False,
+                use_gpsimd_sb2sb=True,
+                qk_in_sb=True,
+                k_out_in_sb=False,
+                out_in_sb=do_out_proj or out_in_sb or is_KVDP,
+            )
 
         attention_tkg(
             q=Q_tkg_sb,
