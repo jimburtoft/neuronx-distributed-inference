@@ -328,7 +328,6 @@ def _patch_fused_tkg_with_selection_bias(model):
 
     try:
         from neuronx_distributed.modules.moe.moe_fused_tkg import (
-            moe_block_tkg_kernel,
             ExpertAffinityScaleMode,
             ROUTER_ACT_FN_MAPPING,
             get_kernel_activation_func_id,
@@ -339,6 +338,22 @@ def _patch_fused_tkg_with_selection_bias(model):
     except ImportError:
         logger.warning(
             "Cannot import moe_fused_tkg components, skipping selection_bias patch"
+        )
+        return 0
+
+    # Import the nkilib moe_block_tkg kernel directly and wrap with nki.jit.
+    # NxDI SDK 2.28 doesn't expose moe_block_tkg_kernel as a module-level export
+    # (SDK 2.29+ does). We import from nkilib and wrap ourselves.
+    try:
+        from nkilib.core.moe_block.moe_block_tkg import moe_block_tkg
+        import nki
+
+        moe_block_tkg_kernel = nki.jit(moe_block_tkg, mode="torchxla")
+    except ImportError as e:
+        logger.warning(
+            "Cannot import nkilib moe_block_tkg kernel: %s. "
+            "Install nkilib fork (branch feature/selection-bias-routing).",
+            e,
         )
         return 0
 
