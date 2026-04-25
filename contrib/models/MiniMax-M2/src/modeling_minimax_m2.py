@@ -23,6 +23,21 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 from torch import nn
 
+# Patch nkilib modules BEFORE any NxDI imports that trigger nkilib loading.
+# Replaces 6 nkilib modules with custom versions that add:
+#   - Partial RoPE support (rotary_dim < d_head for MiniMax-M2's 64/128 head)
+#   - Flat QK RMSNorm (pre-head-split normalization)
+#   - KV cache B=1 correctness fix
+#   - Torchxla compatibility fixes
+# Source: jimburtoft/nki-library branch feature/minimax-m2-attention
+# No-op if nkilib_custom is not present (e.g. when running Henan's EP=64 path).
+try:
+    from nkilib_custom import patch_nkilib_modules
+
+    patch_nkilib_modules()
+except ImportError:
+    pass
+
 from neuronx_distributed.modules.moe.routing import RouterTopK
 from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.parallel_layers.layers import (
@@ -650,7 +665,9 @@ def convert_minimax_m2_hf_to_neuron_state_dict(
                 old_scale_key = f"{prefix}.{proj}.scale"
                 new_scale_key = f"{prefix}.qkv_proj.{proj}.scale"
                 if old_scale_key in neuron_state_dict:
-                    neuron_state_dict[new_scale_key] = neuron_state_dict.pop(old_scale_key)
+                    neuron_state_dict[new_scale_key] = neuron_state_dict.pop(
+                        old_scale_key
+                    )
 
     # --- Expand MoE blockwise scales along the TP-partitioned dim (FP8 only). ---
     # NxDI's shard_checkpoint splits the scale on its partition dim into
@@ -669,9 +686,7 @@ def convert_minimax_m2_hf_to_neuron_state_dict(
         for layer_idx in range(config.num_hidden_layers):
             # down_proj (RowParallel on intermediate dim). Scale:
             # [E, I_blocks, H_blocks]
-            dp_key = (
-                f"layers.{layer_idx}.block_sparse_moe.expert_mlps.mlp_op.down_proj.scale"
-            )
+            dp_key = f"layers.{layer_idx}.block_sparse_moe.expert_mlps.mlp_op.down_proj.scale"
             if dp_key in neuron_state_dict:
                 s = neuron_state_dict[dp_key]
                 i_blocks = s.shape[1]
@@ -681,7 +696,9 @@ def convert_minimax_m2_hf_to_neuron_state_dict(
                 if i_per_rank < 128:
                     ranks_per_block = 128 // i_per_rank
                     s_exp = s.unsqueeze(2).expand(-1, -1, ranks_per_block, -1)
-                    s_exp = s_exp.reshape(s.shape[0], i_blocks * ranks_per_block, h_blocks)
+                    s_exp = s_exp.reshape(
+                        s.shape[0], i_blocks * ranks_per_block, h_blocks
+                    )
                     assert s_exp.shape[1] == moe_tp, (
                         f"down_proj.scale expansion produced {s_exp.shape[1]} rows, "
                         f"expected moe_tp={moe_tp}"
@@ -694,9 +711,7 @@ def convert_minimax_m2_hf_to_neuron_state_dict(
             # (via _apply_blockwise_scale_stride_fix), so the full scale must
             # have last-dim=moe_tp with gate entries 0..moe_tp/2 and up
             # entries moe_tp/2..moe_tp. Expand each half independently.
-            gu_key = (
-                f"layers.{layer_idx}.block_sparse_moe.expert_mlps.mlp_op.gate_up_proj.scale"
-            )
+            gu_key = f"layers.{layer_idx}.block_sparse_moe.expert_mlps.mlp_op.gate_up_proj.scale"
             if gu_key in neuron_state_dict:
                 s = neuron_state_dict[gu_key]
                 h_blocks = s.shape[1]
@@ -1380,10 +1395,31 @@ class NeuronMiniMaxM2ForCausalLM(NeuronBaseForCausalLM):
         # quantization-layer classes are in effect when NxDI builds the
         # decoder. Gated on quantized=True so the BF16 path is untouched.
         ncfg = kwargs.get("config") or (args[1] if len(args) > 1 else None)
-        if ncfg is not None and getattr(getattr(ncfg, "neuron_config", None), "quantized", False):
+        if ncfg is not None and getattr(
+            getattr(ncfg, "neuron_config", None), "quantized", False
+        ):
             self._apply_ep_scale_fix()
             self._apply_blockwise_scale_stride_fix()
             self._apply_2d_per_channel_fix()
+
+        # When running without expert parallelism (e.g. TP=32, no EP), the
+        # CTE and TKG MoE dispatch paths don't apply FP8 scales correctly:
+        # - CTE's blockwise kernel stub needs restoring from nkilib
+        # - TKG's ExpertFusedLinear does bare FP8 matmul without scales
+        # The compat module patches both paths with in-graph FP8->BF16 dequant.
+        # This is a no-op when EP is used (Henan's TP=64/EP=64 config).
+        if ncfg is not None:
+            moe_ep = getattr(getattr(ncfg, "neuron_config", None), "moe_ep_degree", 1)
+            if moe_ep <= 1:
+                try:
+                    import compat  # noqa: F401 — patches applied on import
+
+                    logger.info(
+                        "compat: FP8 in-graph dequant patches loaded (no EP mode)"
+                    )
+                except ImportError:
+                    pass  # compat.py not present, skip
+
         super().__init__(*args, **kwargs)
 
     @staticmethod
@@ -1465,7 +1501,9 @@ class NeuronMiniMaxM2ForCausalLM(NeuronBaseForCausalLM):
             BaseQuantizeParallelLinear,
         )
 
-        if getattr(BaseQuantizeParallelLinear, "_minimax_m2_blockwise_stride_patched", False):
+        if getattr(
+            BaseQuantizeParallelLinear, "_minimax_m2_blockwise_stride_patched", False
+        ):
             return
 
         _original_setup = BaseQuantizeParallelLinear._setup_for_scale
@@ -1515,11 +1553,18 @@ class NeuronMiniMaxM2ForCausalLM(NeuronBaseForCausalLM):
                 return
             original_from_float = cls.from_float
 
-            def _patched_from_float(klass, mod, q_config=None, _orig=original_from_float):
-                if q_config is not None and q_config.get("quantization_type") == \
-                        QuantizationType.BLOCKWISE_SYMMETRIC:
+            def _patched_from_float(
+                klass, mod, q_config=None, _orig=original_from_float
+            ):
+                if (
+                    q_config is not None
+                    and q_config.get("quantization_type")
+                    == QuantizationType.BLOCKWISE_SYMMETRIC
+                ):
                     q_config = dict(q_config)
-                    q_config["quantization_type"] = QuantizationType.PER_CHANNEL_SYMMETRIC
+                    q_config["quantization_type"] = (
+                        QuantizationType.PER_CHANNEL_SYMMETRIC
+                    )
                     q_config["quantization_per_channel_axis"] = 0
                     q_config.pop("block_axis", None)
                     q_config.pop("block_size", None)
@@ -1560,6 +1605,7 @@ class NeuronMiniMaxM2ForCausalLM(NeuronBaseForCausalLM):
         Skip if the checkpoint directory already contains a Neuron-FP8
         index produced by the preprocess script."""
         import os as _os
+
         qpath = (
             getattr(config.neuron_config, "quantized_checkpoints_path", None)
             or model_path
