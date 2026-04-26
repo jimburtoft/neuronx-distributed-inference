@@ -868,8 +868,12 @@ def convert_minimax_m2_hf_to_neuron_state_dict(
     # ranks share one scale block — we need to replicate scale entries along
     # that dim. Adjacent ranks whose weight falls inside the same 128-wide
     # block genuinely share that block's scale. No-op when the .scale keys
-    # are absent (BF16 path) or moe_tp is large enough (e.g. moe_tp=1).
-    if getattr(config.neuron_config, "quantized", False):
+    # are absent (BF16 path), moe_tp is large enough (e.g. moe_tp=1), or
+    # scales are per-row (2D) rather than block-wise (3D).
+    if (
+        getattr(config.neuron_config, "quantized", False)
+        and not expert_has_per_row_scales
+    ):
         moe_tp = (
             getattr(config.neuron_config, "moe_tp_degree", None)
             or config.neuron_config.tp_degree
