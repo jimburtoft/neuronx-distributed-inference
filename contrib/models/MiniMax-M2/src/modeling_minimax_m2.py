@@ -575,7 +575,9 @@ def initialize_minimax_m2_moe_module(
         gate_up.scale = gu_scale
         # Now set partition metadata on the registered parameter
         gate_up.scale.partition_dim = 1
-        gate_up.scale.partition_stride = 1
+        gate_up.scale.partition_stride = (
+            2  # Must match weight's stride=2 (gate|up interleaved)
+        )
         gate_up.scale.tensor_model_parallel = True
         gate_up.scale.num_partitions = tp_degree
 
