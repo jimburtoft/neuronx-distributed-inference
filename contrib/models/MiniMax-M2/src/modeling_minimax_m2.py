@@ -402,7 +402,10 @@ class RouterTopKWithBias(RouterTopK):
 
 
 def initialize_minimax_m2_moe_module(
-    config: InferenceConfig, rmsnorm=None, init_tkg_module=False
+    config: InferenceConfig,
+    rmsnorm=None,
+    init_tkg_module=False,
+    register_fp8_row_scales=False,
 ):
     """
     Create the MoE module for MiniMax-M2 with e_score_correction_bias.
@@ -414,6 +417,14 @@ def initialize_minimax_m2_moe_module(
 
     The bias values (~8.0-9.5) dominate sigmoid scores (0-1) and are critical
     for correct expert selection. Without them, ~75% of experts are wrong.
+
+    Args:
+        register_fp8_row_scales: If True, register `.scale` nn.Parameters on
+            the gate_up_proj and down_proj modules for native FP8 ROW mode.
+            These parameters receive per-row scales from the preprocessed
+            checkpoint and are passed to the nkilib TKG kernel for FP8
+            dequantization post-matmul. gate_up_proj.scale is partitioned on
+            its last dim (same as weight) so NxDI TP-shards it correctly.
     """
     from neuronx_distributed.modules.moe.expert_mlps_v2 import ExpertMLPsV2
     from neuronx_distributed.modules.moe.model import MoE
@@ -522,6 +533,41 @@ def initialize_minimax_m2_moe_module(
     )
 
     moe.eval()
+
+    # Register FP8 per-row scale parameters on the expert MLP modules.
+    # These must exist BEFORE state dict loading so NxDI can match the
+    # `.scale` keys from the preprocessed checkpoint. The gate_up_proj
+    # scale needs partition metadata matching the weight's TP sharding
+    # (last dim = 2*IM, split across TP ranks). down_proj scale is on
+    # the H dimension which is NOT TP-sharded.
+    if register_fp8_row_scales:
+        gate_up = moe.expert_mlps.mlp_op.gate_up_proj
+        down = moe.expert_mlps.mlp_op.down_proj
+
+        # Use the original (un-padded) intermediate size for scale shapes.
+        # config.intermediate_size may have been padded by _maybe_pad_intermediate
+        # for shard-on-I alignment, but the preprocessing script doesn't pad.
+        moe_im = getattr(config, "moe_intermediate_size", config.intermediate_size)
+
+        # gate_up_proj.scale: [E, 2*IM] — partition on dim=1 (same as weight last dim)
+        # Initialize with ones; real values loaded from checkpoint.
+        gu_scale = nn.Parameter(
+            torch.ones(config.num_local_experts, 2 * moe_im, dtype=torch.float32),
+            requires_grad=False,
+        )
+        gu_scale.partition_dim = 1
+        gu_scale.partition_stride = 1
+        gate_up.scale = gu_scale
+
+        # down_proj.scale: [E, H] — no partitioning (H is output dim, not TP-split)
+        dn_scale = nn.Parameter(
+            torch.ones(
+                config.num_local_experts, config.hidden_size, dtype=torch.float32
+            ),
+            requires_grad=False,
+        )
+        down.scale = dn_scale
+
     return moe
 
 
@@ -568,10 +614,29 @@ def convert_minimax_m2_hf_to_neuron_state_dict(
     # from preprocess_minimax_m2_fp8.py can't be TP-sharded at TP=32.
     # Also dequant attention FP8 weights (per-row .scale) when self_attn is
     # excluded. No-op if no matching .scale keys are present.
+    #
+    # EXCEPTION: When expert MLP scales are per-row (2D), they are compatible
+    # with native FP8 ROW quantization in the nkilib TKG kernel. In this case,
+    # skip dequanting expert MLPs — keep FP8 weights and per-row scales for
+    # the kernel to consume directly. We detect per-row by checking if the
+    # gate_up_proj.scale is 2D (per-row) vs 3D (block-wise).
     mods_to_skip = get_modules_to_not_convert(config.neuron_config) or []
     dequant_patterns = []
+    expert_has_per_row_scales = False
+
     if "expert_mlps" in mods_to_skip or "block_sparse_moe" in mods_to_skip:
-        dequant_patterns.append("expert_mlps.mlp_op")
+        # Check if expert scales are per-row (2D) or block-wise (3D)
+        sample_gu_scale_key = (
+            "layers.0.block_sparse_moe.expert_mlps.mlp_op.gate_up_proj.scale"
+        )
+        if sample_gu_scale_key in neuron_state_dict:
+            sample_scale = neuron_state_dict[sample_gu_scale_key]
+            if sample_scale.dim() == 2:
+                expert_has_per_row_scales = True
+            else:
+                dequant_patterns.append("expert_mlps.mlp_op")
+        # If key not present (e.g. BF16 checkpoint), nothing to dequant
+
     if "self_attn" in mods_to_skip:
         dequant_patterns.append("self_attn")
     if dequant_patterns:
@@ -1401,14 +1466,19 @@ class NeuronMiniMaxM2DecoderLayer(nn.Module):
         )
 
         # Fused MoE kernel absorbs post-attention layernorm
+        fp8_row = getattr(config.neuron_config, "fp8_native_row_mode", False)
         if self.moe_fused_nki_kernel_enabled:
             self.block_sparse_moe = initialize_minimax_m2_moe_module(
                 config=config,
                 rmsnorm=self.post_attention_layernorm,
                 init_tkg_module=True,
+                register_fp8_row_scales=fp8_row,
             )
         else:
-            self.block_sparse_moe = initialize_minimax_m2_moe_module(config=config)
+            self.block_sparse_moe = initialize_minimax_m2_moe_module(
+                config=config,
+                register_fp8_row_scales=fp8_row,
+            )
 
         self.qkv_kernel_enabled = config.neuron_config.qkv_kernel_enabled
         self.sequence_parallel_enabled = config.neuron_config.sequence_parallel_enabled

@@ -56,6 +56,23 @@ Usage:
         --batch-size 1 \
         --max-context-length 128 \
         --max-new-tokens 128
+
+    # With native FP8 ROW quantization (target: best FP8 performance):
+    # Step 1: Preprocess with per-row scales
+    python conversion_script/preprocess_minimax_m2_fp8.py \
+        --hf_model_path /mnt/models/MiniMax-M2 \
+        --save_path /mnt/models/MiniMax-M2-fp8-perrow \
+        --scale-mode per_row
+    # Step 2: Run with --fp8-native-row
+    UNSAFE_FP8FNCAST=1 XLA_HANDLE_SPECIAL_SCALAR=1 python minimax_m2_inference.py \
+        --model-path /mnt/models/MiniMax-M2 \
+        --compiled-model-path /mnt/models/MiniMax-M2-compiled-fp8-row \
+        --quantized-checkpoints-path /mnt/models/MiniMax-M2-fp8-perrow \
+        --fp8-native-row \
+        --tp-degree 32 \
+        --batch-size 1 \
+        --max-context-length 128 \
+        --max-new-tokens 128
 """
 
 import argparse
@@ -150,6 +167,15 @@ def parse_args():
         "The fused kernel handles FP8 natively inside the kernel — no external dequant. "
         "Recommended for best FP8 throughput.",
     )
+    parser.add_argument(
+        "--fp8-native-row",
+        action="store_true",
+        help="Enable native FP8 ROW quantization in the nkilib TKG kernel. "
+        "Requires a per-row preprocessed checkpoint (--scale-mode per_row). "
+        "FP8 weights are kept in HBM and per-row scales are applied post-matmul "
+        "inside the kernel. Implies --fused-moe-tkg. "
+        "This is the target mode for best FP8 performance.",
+    )
     return parser.parse_args()
 
 
@@ -175,6 +201,10 @@ def create_config(args) -> MiniMaxM2InferenceConfig:
     use_fp8 = args.quantized_checkpoints_path is not None
     fp8_dequant = getattr(args, "fp8_dequant", False)
     use_fused_moe_tkg = getattr(args, "fused_moe_tkg", False)
+    fp8_native_row = getattr(args, "fp8_native_row", False)
+    # --fp8-native-row implies --fused-moe-tkg
+    if fp8_native_row:
+        use_fused_moe_tkg = True
     # Native FP8 inference (quantized=True) — only when FP8 checkpoint provided
     # AND --fp8-dequant is NOT set. With --fp8-dequant, weights are dequanted
     # to BF16 during conversion and the model runs in BF16.
@@ -207,6 +237,12 @@ def create_config(args) -> MiniMaxM2InferenceConfig:
             "INFO: Fused MoE TKG kernel enabled with selection_bias support. "
             "Requires nkilib fork (branch feature/selection-bias-routing). "
             "The fused kernel handles FP8 natively — no external dequant for TKG path."
+        )
+    if fp8_native_row:
+        print(
+            "INFO: Native FP8 ROW mode enabled. FP8 expert weights stay in HBM, "
+            "per-row scales applied post-matmul by nkilib TKG kernel. "
+            "Requires per-row preprocessed checkpoint (--scale-mode per_row)."
         )
 
     neuron_config = MoENeuronConfig(
@@ -278,6 +314,10 @@ def create_config(args) -> MiniMaxM2InferenceConfig:
             else None
         ),
     )
+
+    # Native FP8 ROW mode flag — signals modeling_minimax_m2.py to register
+    # .scale parameters and skip BF16 dequant for expert MLP weights.
+    neuron_config.fp8_native_row_mode = fp8_native_row
 
     # MiniMax-M2 HF repo has auto_map, requiring trust_remote_code for AutoConfig.
     hf_config = AutoConfig.from_pretrained(args.model_path, trust_remote_code=True)

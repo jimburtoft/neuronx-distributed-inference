@@ -191,6 +191,7 @@ def process_layer(
     layer_idx: int,
     lazy: LazyWeightMap,
     config: dict,
+    scale_mode: str = "blockwise",
 ) -> Dict[str, torch.Tensor]:
     out: Dict[str, torch.Tensor] = {}
     prefix = f"model.layers.{layer_idx}."
@@ -275,7 +276,10 @@ def process_layer(
     e0_w1_s = lazy.get(f"{prefix}block_sparse_moe.experts.0.w1.weight_scale_inv")
 
     if e0_w1.dtype == torch.float8_e4m3fn and e0_w1_s is not None:
-        sample_w, sample_s = rescale_fp8_weight_blockwise(e0_w1, e0_w1_s)
+        if scale_mode == "per_row":
+            sample_w, sample_s = rescale_fp8_to_per_row(e0_w1, e0_w1_s)
+        else:
+            sample_w, sample_s = rescale_fp8_weight_blockwise(e0_w1, e0_w1_s)
     elif e0_w1.dtype == torch.bfloat16:
         raise NotImplementedError(
             f"Layer {layer_idx} expert 0 w1 is BF16; MiniMax-M2 expects FP8."
@@ -284,39 +288,72 @@ def process_layer(
         sample_w, sample_s = e0_w1, e0_w1_s
 
     intermediate_size, hidden_size = sample_w.shape  # [IM, H]
-    # Packed transpose layout: [num_experts, H, 2*IM] for gate_up.
-    gate_up_proj = torch.empty(
-        num_experts, hidden_size, 2 * intermediate_size, dtype=sample_w.dtype
-    )
-    i_blocks, h_blocks = sample_s.shape  # [IM_blocks, H_blocks]
-    gate_up_scale = torch.empty(
-        num_experts, h_blocks, 2 * i_blocks, dtype=sample_s.dtype
-    )
+
+    if scale_mode == "per_row":
+        # Per-row scales: gate_up scale is [E, 2*IM], down scale is [E, H]
+        gate_up_proj = torch.empty(
+            num_experts, hidden_size, 2 * intermediate_size, dtype=sample_w.dtype
+        )
+        # sample_s shape: [IM, 1] for per-row
+        gate_up_scale = torch.empty(
+            num_experts, 2 * intermediate_size, dtype=torch.float32
+        )
+    else:
+        # Block-wise scales: gate_up scale is [E, H_blocks, 2*IM_blocks]
+        gate_up_proj = torch.empty(
+            num_experts, hidden_size, 2 * intermediate_size, dtype=sample_w.dtype
+        )
+        i_blocks, h_blocks = sample_s.shape  # [IM_blocks, H_blocks]
+        gate_up_scale = torch.empty(
+            num_experts, h_blocks, 2 * i_blocks, dtype=sample_s.dtype
+        )
 
     e0_w2 = lazy.get(f"{prefix}block_sparse_moe.experts.0.w2.weight")
     e0_w2_s = lazy.get(f"{prefix}block_sparse_moe.experts.0.w2.weight_scale_inv")
     if e0_w2.dtype == torch.float8_e4m3fn and e0_w2_s is not None:
-        sample_dw, sample_ds = rescale_fp8_weight_blockwise(e0_w2, e0_w2_s)
+        if scale_mode == "per_row":
+            sample_dw, sample_ds = rescale_fp8_to_per_row(e0_w2, e0_w2_s)
+        else:
+            sample_dw, sample_ds = rescale_fp8_weight_blockwise(e0_w2, e0_w2_s)
     else:
         raise NotImplementedError(
             f"Layer {layer_idx} expert 0 w2 dtype {e0_w2.dtype} not handled."
         )
-    d_h_blocks, d_i_blocks = sample_ds.shape  # [H_blocks, IM_blocks]
-    down_proj = torch.empty(
-        num_experts, intermediate_size, hidden_size, dtype=sample_dw.dtype
-    )
-    down_scale = torch.empty(num_experts, d_i_blocks, d_h_blocks, dtype=sample_ds.dtype)
+
+    if scale_mode == "per_row":
+        down_proj = torch.empty(
+            num_experts, intermediate_size, hidden_size, dtype=sample_dw.dtype
+        )
+        # sample_ds shape: [H, 1] for per-row
+        down_scale = torch.empty(num_experts, hidden_size, dtype=torch.float32)
+    else:
+        d_h_blocks, d_i_blocks = sample_ds.shape  # [H_blocks, IM_blocks]
+        down_proj = torch.empty(
+            num_experts, intermediate_size, hidden_size, dtype=sample_dw.dtype
+        )
+        down_scale = torch.empty(
+            num_experts, d_i_blocks, d_h_blocks, dtype=sample_ds.dtype
+        )
 
     # Slot expert 0 (already rescaled above).
     gate_up_proj[0, :, :intermediate_size] = sample_w.T
-    gate_up_scale[0, :, :i_blocks] = sample_s.T
     e0_w3 = lazy.get(f"{prefix}block_sparse_moe.experts.0.w3.weight")
     e0_w3_s = lazy.get(f"{prefix}block_sparse_moe.experts.0.w3.weight_scale_inv")
-    up_w0, up_s0 = rescale_fp8_weight_blockwise(e0_w3, e0_w3_s)
-    gate_up_proj[0, :, intermediate_size:] = up_w0.T
-    gate_up_scale[0, :, i_blocks:] = up_s0.T
-    down_proj[0] = sample_dw.T
-    down_scale[0] = sample_ds.T
+    if scale_mode == "per_row":
+        up_w0, up_s0 = rescale_fp8_to_per_row(e0_w3, e0_w3_s)
+        gate_up_proj[0, :, intermediate_size:] = up_w0.T
+        # Per-row: scale is [IM, 1] → squeeze to [IM]
+        gate_up_scale[0, :intermediate_size] = sample_s.squeeze(-1)
+        gate_up_scale[0, intermediate_size:] = up_s0.squeeze(-1)
+        down_proj[0] = sample_dw.T
+        down_scale[0] = sample_ds.squeeze(-1)
+    else:
+        up_w0, up_s0 = rescale_fp8_weight_blockwise(e0_w3, e0_w3_s)
+        gate_up_proj[0, :, intermediate_size:] = up_w0.T
+        gate_up_scale[0, :, :i_blocks] = sample_s.T
+        gate_up_scale[0, :, i_blocks:] = up_s0.T
+        down_proj[0] = sample_dw.T
+        down_scale[0] = sample_ds.T
     del e0_w1, e0_w1_s, e0_w3, e0_w3_s, e0_w2, e0_w2_s
     del sample_w, sample_s, sample_dw, sample_ds, up_w0, up_s0
 
@@ -327,15 +364,26 @@ def process_layer(
         w3_s = lazy.get(f"{prefix}block_sparse_moe.experts.{e}.w3.weight_scale_inv")
         w2 = lazy.get(f"{prefix}block_sparse_moe.experts.{e}.w2.weight")
         w2_s = lazy.get(f"{prefix}block_sparse_moe.experts.{e}.w2.weight_scale_inv")
-        g_w, g_s = rescale_fp8_weight_blockwise(w1, w1_s)
-        u_w, u_s = rescale_fp8_weight_blockwise(w3, w3_s)
-        d_w, d_s = rescale_fp8_weight_blockwise(w2, w2_s)
-        gate_up_proj[e, :, :intermediate_size] = g_w.T
-        gate_up_proj[e, :, intermediate_size:] = u_w.T
-        gate_up_scale[e, :, :i_blocks] = g_s.T
-        gate_up_scale[e, :, i_blocks:] = u_s.T
-        down_proj[e] = d_w.T
-        down_scale[e] = d_s.T
+        if scale_mode == "per_row":
+            g_w, g_s = rescale_fp8_to_per_row(w1, w1_s)
+            u_w, u_s = rescale_fp8_to_per_row(w3, w3_s)
+            d_w, d_s = rescale_fp8_to_per_row(w2, w2_s)
+            gate_up_proj[e, :, :intermediate_size] = g_w.T
+            gate_up_proj[e, :, intermediate_size:] = u_w.T
+            gate_up_scale[e, :intermediate_size] = g_s.squeeze(-1)
+            gate_up_scale[e, intermediate_size:] = u_s.squeeze(-1)
+            down_proj[e] = d_w.T
+            down_scale[e] = d_s.squeeze(-1)
+        else:
+            g_w, g_s = rescale_fp8_weight_blockwise(w1, w1_s)
+            u_w, u_s = rescale_fp8_weight_blockwise(w3, w3_s)
+            d_w, d_s = rescale_fp8_weight_blockwise(w2, w2_s)
+            gate_up_proj[e, :, :intermediate_size] = g_w.T
+            gate_up_proj[e, :, intermediate_size:] = u_w.T
+            gate_up_scale[e, :, :i_blocks] = g_s.T
+            gate_up_scale[e, :, i_blocks:] = u_s.T
+            down_proj[e] = d_w.T
+            down_scale[e] = d_s.T
         del w1, w1_s, w3, w3_s, w2, w2_s, g_w, g_s, u_w, u_s, d_w, d_s
 
     out[f"{out_prefix}block_sparse_moe.expert_mlps.mlp_op.gate_up_proj.weight"] = (
@@ -383,7 +431,9 @@ def save_shard(
 # ---------------------------------------------------------------------------
 
 
-def process_minimax_m2_checkpoint(hf_model_path: str, save_path: str, tp_degree: int):
+def process_minimax_m2_checkpoint(
+    hf_model_path: str, save_path: str, tp_degree: int, scale_mode: str = "blockwise"
+):
     os.makedirs(save_path, exist_ok=True)
 
     with open(os.path.join(hf_model_path, "model.safetensors.index.json")) as f:
@@ -400,6 +450,7 @@ def process_minimax_m2_checkpoint(hf_model_path: str, save_path: str, tp_degree:
         f"experts={config['num_local_experts']})",
         flush=True,
     )
+    print(f"Scale mode: {scale_mode}", flush=True)
 
     lazy = LazyWeightMap(hf_model_path, weight_map_in)
     weight_map_out: Dict[str, str] = {}
@@ -407,7 +458,7 @@ def process_minimax_m2_checkpoint(hf_model_path: str, save_path: str, tp_degree:
     try:
         for li in range(num_layers):
             t0 = time.time()
-            layer_sd = process_layer(li, lazy, config)
+            layer_sd = process_layer(li, lazy, config, scale_mode=scale_mode)
             filename = f"model_layer{li}.safetensors"
             size = save_shard(layer_sd, save_path, filename, weight_map_out)
             del layer_sd
@@ -476,8 +527,19 @@ def main():
         help="Tensor parallelism (currently informational only; "
         "the framework does the TP sharding at load time).",
     )
+    parser.add_argument(
+        "--scale-mode",
+        choices=["blockwise", "per_row"],
+        default="blockwise",
+        help="Scale mode for expert FP8 weights. "
+        "'blockwise' keeps original 128x128 block-wise scales (default). "
+        "'per_row' requantizes to per-output-row scales for native FP8 matmul "
+        "in the nkilib TKG kernel (ROW quantization).",
+    )
     args = parser.parse_args()
-    process_minimax_m2_checkpoint(args.hf_model_path, args.save_path, args.tp_degree)
+    process_minimax_m2_checkpoint(
+        args.hf_model_path, args.save_path, args.tp_degree, args.scale_mode
+    )
 
 
 if __name__ == "__main__":
