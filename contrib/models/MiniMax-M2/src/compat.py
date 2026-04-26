@@ -338,8 +338,15 @@ def _patch_fused_tkg_with_selection_bias(model=None):
         return 0
 
     # Import the nkilib moe_block_tkg kernel directly and wrap with nki.jit.
+    # Also import nkilib's enum types — the system NxDI enums and nkilib enums
+    # are different Python classes with the same names/values, so we must convert.
     try:
         from nkilib.core.moe_block.moe_block_tkg import moe_block_tkg
+        from nkilib.core.utils.common_types import (
+            RouterActFnType as NkilibRouterActFnType,
+            ActFnType as NkilibActFnType,
+            ExpertAffinityScaleMode as NkilibExpertAffinityScaleMode,
+        )
         import nki
 
         moe_block_tkg_kernel = nki.jit(moe_block_tkg, mode="torchxla")
@@ -350,6 +357,10 @@ def _patch_fused_tkg_with_selection_bias(model=None):
             e,
         )
         return 0
+
+    def _to_nkilib_enum(system_enum_val, nkilib_enum_cls):
+        """Convert a system NxDI enum value to the nkilib equivalent by name."""
+        return nkilib_enum_cls[system_enum_val.name]
 
     if getattr(MoEFusedTKG, "_minimax_selection_bias_patched", False):
         logger.debug("MoEFusedTKG already patched with selection_bias")
@@ -373,28 +384,12 @@ def _patch_fused_tkg_with_selection_bias(model=None):
             return _orig_method(self, hidden_states, residual)
 
         hidden_states_shape = hidden_states.shape
-
-        # NKI SBUF tensors collapse size-1 free dimensions, so the nkilib
-        # RMSNorm kernel fails when T=B*S=1 (tensor_reduce axis becomes
-        # invalid). Pad S from 1 to 2 with zeros, run the kernel, then
-        # slice the output back.
         B, S, H = hidden_states_shape
-        padded = False
-        if B * S == 1:
-            hidden_states = torch.nn.functional.pad(hidden_states, (0, 0, 0, 1))
-            padded = True
-            print(
-                f"[compat] Padded TKG hidden_states from {hidden_states_shape} to {hidden_states.shape}"
-            )
-        else:
-            print(
-                f"[compat] TKG hidden_states shape: {hidden_states_shape}, B*S={B * S}, no padding"
-            )
 
         if self.expert_mlps.routed_experts_mlp_config.early_expert_affinity_modulation:
-            expert_affinities_scaling_mode = ExpertAffinityScaleMode.PRE_SCALE
+            expert_affinities_scaling_mode = NkilibExpertAffinityScaleMode.PRE_SCALE
         else:
-            expert_affinities_scaling_mode = ExpertAffinityScaleMode.POST_SCALE
+            expert_affinities_scaling_mode = NkilibExpertAffinityScaleMode.POST_SCALE
         local_rank = self.expert_mlps.spmd_rank.get_rank()
         local_ep_rank = (
             local_rank // self.expert_mlps.moe_tensor_model_parallel_group.size()
@@ -472,7 +467,9 @@ def _patch_fused_tkg_with_selection_bias(model=None):
             expert_down_weights_scale=down_scale,
             eps=self.post_attention_layernorm.variance_epsilon,
             top_k=self.num_experts_per_tok,
-            router_act_fn=ROUTER_ACT_FN_MAPPING[self.router.act_fn],
+            router_act_fn=_to_nkilib_enum(
+                ROUTER_ACT_FN_MAPPING[self.router.act_fn], NkilibRouterActFnType
+            ),
             expert_affinities_scaling_mode=expert_affinities_scaling_mode,
             router_mm_dtype=router_mm_dtype,
         )
@@ -540,7 +537,7 @@ def _patch_fused_tkg_with_selection_bias(model=None):
                 shared_expert_up_bias=None,
                 shared_expert_down_bias=None,
                 router_pre_norm=not self.router.apply_act_fn_over_topk,
-                hidden_act_fn=ActFnType(kernel_activation_func_id),
+                hidden_act_fn=NkilibActFnType(kernel_activation_func_id),
                 hidden_act_scale_factor=None,
                 hidden_act_bias=None,
                 norm_topk_prob=self.config.norm_topk_prob,
@@ -548,11 +545,6 @@ def _patch_fused_tkg_with_selection_bias(model=None):
                 **optional_kwargs,
             )
 
-        # Unpad output if we padded input (take only the first token)
-        if padded:
-            out = out[:, :S, :]
-            if router_logits is not None and router_logits.shape[0] > B * S:
-                router_logits = router_logits[: B * S, :]
         return out.view(hidden_states_shape), router_logits.to(hidden_states.dtype)
 
     MoEFusedTKG._moe_fused_tkg_kernel = _patched_moe_fused_tkg_kernel
