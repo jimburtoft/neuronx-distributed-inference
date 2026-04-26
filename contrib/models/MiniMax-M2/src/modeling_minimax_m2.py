@@ -540,6 +540,14 @@ def initialize_minimax_m2_moe_module(
     # scale needs partition metadata matching the weight's TP sharding
     # (last dim = 2*IM, split across TP ranks). down_proj scale is on
     # the H dimension which is NOT TP-sharded.
+    #
+    # CRITICAL: NxDI parallel layers (ColumnParallelLinear, etc.) create
+    # their weight with the **per-rank** shape at init time (e.g.
+    # output_size_per_partition = output_size / tp_degree). The XLA trace
+    # runs with these per-rank shapes. shard_children then takes the FULL
+    # checkpoint tensor and slices it to match the per-rank parameter shape.
+    # Therefore, the scale parameter MUST also be created with the per-rank
+    # shape — NOT the full shape.
     if register_fp8_row_scales:
         gate_up = moe.expert_mlps.mlp_op.gate_up_proj
         down = moe.expert_mlps.mlp_op.down_proj
@@ -548,17 +556,19 @@ def initialize_minimax_m2_moe_module(
         # config.intermediate_size may have been padded by _maybe_pad_intermediate
         # for shard-on-I alignment, but the preprocessing script doesn't pad.
         moe_im = getattr(config, "moe_intermediate_size", config.intermediate_size)
+        tp_degree = config.neuron_config.tp_degree
 
-        # gate_up_proj.scale: [E, 2*IM] — partition on dim=1 (same as weight last dim)
-        # Initialize with ones; real values loaded from checkpoint.
+        # gate_up_proj.scale: per-rank shape [E, 2*IM_TP] where IM_TP = IM / tp_degree.
+        # Full checkpoint shape is [E, 2*IM]; shard_children slices dim=1 per rank.
+        im_tp = moe_im // tp_degree
         gu_scale = nn.Parameter(
-            torch.ones(config.num_local_experts, 2 * moe_im, dtype=torch.float32),
+            torch.ones(config.num_local_experts, 2 * im_tp, dtype=torch.float32),
             requires_grad=False,
         )
         gu_scale.partition_dim = 1
         gu_scale.partition_stride = 1
         gu_scale.tensor_model_parallel = True
-        gu_scale.num_partitions = config.neuron_config.tp_degree
+        gu_scale.num_partitions = tp_degree
         gate_up.scale = gu_scale
 
         # down_proj.scale: [E, H] — no partitioning (H is output dim, not TP-split)
