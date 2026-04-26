@@ -603,12 +603,18 @@ def initialize_minimax_m2_moe_module(
         # loading. The module's weight must match the checkpoint dtype for the
         # framework to skip the lossy cast (which discards scale information).
         # We keep the same shape and partition metadata — only the dtype changes.
+        #
+        # IMPORTANT: Same pattern as .scale — assign the bare parameter FIRST,
+        # then set partition attributes AFTER. NxDI's register_empty_parameter
+        # copies param.__dict__ as kwargs to Parameter.__new__() on re-creation,
+        # so custom attrs must not be present at assignment time.
         gate_up_w = gate_up.weight
         fp8_gu_w = nn.Parameter(
             torch.zeros(gate_up_w.shape, dtype=torch.float8_e4m3fn),
             requires_grad=False,
         )
-        # Copy all partition metadata from the original weight
+        gate_up.weight = fp8_gu_w
+        # Copy partition metadata from the original weight AFTER assignment
         for attr in (
             "partition_dim",
             "partition_stride",
@@ -616,14 +622,14 @@ def initialize_minimax_m2_moe_module(
             "num_partitions",
         ):
             if hasattr(gate_up_w, attr):
-                setattr(fp8_gu_w, attr, getattr(gate_up_w, attr))
-        gate_up.weight = fp8_gu_w
+                setattr(gate_up.weight, attr, getattr(gate_up_w, attr))
 
         down_w = down.weight
         fp8_dn_w = nn.Parameter(
             torch.zeros(down_w.shape, dtype=torch.float8_e4m3fn),
             requires_grad=False,
         )
+        down.weight = fp8_dn_w
         for attr in (
             "partition_dim",
             "partition_stride",
@@ -631,8 +637,7 @@ def initialize_minimax_m2_moe_module(
             "num_partitions",
         ):
             if hasattr(down_w, attr):
-                setattr(fp8_dn_w, attr, getattr(down_w, attr))
-        down.weight = fp8_dn_w
+                setattr(down.weight, attr, getattr(down_w, attr))
 
     return moe
 
