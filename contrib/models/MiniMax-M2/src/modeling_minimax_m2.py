@@ -153,8 +153,13 @@ def convert_state_dict_to_fused_qkv(state_dict: Dict[str, Any], cfg: InferenceCo
         if (
             cfg.neuron_config.quantized_mlp_kernel_enabled
             or cfg.neuron_config.quantized
-        ) and f"layers.{layer_idx}.self_attn" not in mods_to_not_conv:
-            _helper_concat_and_delete_qkv(state_dict, layer_idx, "scale")
+        ):
+            # Only fuse .scale keys if they still exist (they may have been
+            # removed by dequant_fp8_scales_to_bf16 when self_attn is in
+            # modules_to_not_convert).
+            q_scale_key = f"layers.{layer_idx}.self_attn.q_proj.scale"
+            if q_scale_key in state_dict:
+                _helper_concat_and_delete_qkv(state_dict, layer_idx, "scale")
     gc.collect()
     return state_dict
 
@@ -182,6 +187,85 @@ def maybe_dequantize_layer(neuron_state_dict: dict, config):
         del neuron_state_dict[key]
 
 
+def dequant_fp8_scales_to_bf16(neuron_state_dict: dict, config, module_patterns=None):
+    """Dequant FP8 weights to BF16 using `.scale` tensors from preprocessing.
+
+    When modules are in modules_to_not_convert (e.g. fused TKG path at TP=32),
+    NxDI doesn't create quantized wrappers, so FP8 weights and scales can't be
+    loaded through the normal quantization path. This function dequants FP8
+    weights to BF16 during state dict conversion and removes the .scale keys.
+
+    Handles both:
+    - Block-wise scales: 3D weights [E, dim1, dim2] with 3D scales [E, s1, s2]
+    - Per-row scales: 2D weights [out, in] with 2D scales [out, 1]
+
+    Args:
+        neuron_state_dict: State dict being converted.
+        config: Inference config (for target dtype).
+        module_patterns: List of substrings to match in key names. If None,
+            matches all .scale keys. E.g. ["expert_mlps.mlp_op"] for expert
+            MLPs only, or ["expert_mlps.mlp_op", "self_attn"] for both.
+    """
+    target_dtype = getattr(config.neuron_config, "torch_dtype", torch.bfloat16)
+    scale_keys_to_remove = []
+
+    for key in list(neuron_state_dict.keys()):
+        if not key.endswith(".scale"):
+            continue
+
+        # Filter by module patterns if specified
+        if module_patterns is not None:
+            if not any(pat in key for pat in module_patterns):
+                continue
+
+        weight_key = key.rsplit(".scale", 1)[0] + ".weight"
+        if weight_key not in neuron_state_dict:
+            continue
+
+        weight = neuron_state_dict[weight_key]
+        scale = neuron_state_dict[key]
+
+        if weight.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
+            continue
+
+        w_float = weight.to(torch.float32)
+        s_float = scale.to(torch.float32)
+
+        ndims = w_float.dim()
+        if ndims == 3:
+            # Block-wise: [E, dim1, dim2] * scale broadcast
+            E, dim1, dim2 = w_float.shape
+            _, s_dim1, s_dim2 = s_float.shape
+            block1 = dim1 // s_dim1
+            block2 = dim2 // s_dim2
+            s_expanded = s_float.repeat_interleave(block1, dim=1).repeat_interleave(
+                block2, dim=2
+            )
+            dequanted = w_float * s_expanded
+        elif ndims == 2:
+            # Per-row: [out, in] * [out, 1] broadcast
+            dequanted = w_float * s_float
+        else:
+            dequanted = w_float
+
+        neuron_state_dict[weight_key] = dequanted.to(target_dtype)
+        scale_keys_to_remove.append(key)
+
+    for key in scale_keys_to_remove:
+        del neuron_state_dict[key]
+
+    if scale_keys_to_remove:
+        import logging as _log
+
+        _log.getLogger(__name__).info(
+            "Dequanted %d FP8 weight tensors to %s (scales removed from state dict)",
+            len(scale_keys_to_remove),
+            target_dtype,
+        )
+
+
+# ---------------------------------------------------------------------------
+# MiniMax-M2 specific modules
 # ---------------------------------------------------------------------------
 # MiniMax-M2 specific modules
 # ---------------------------------------------------------------------------
@@ -478,6 +562,20 @@ def convert_minimax_m2_hf_to_neuron_state_dict(
     # and lose the FP8 path's ~2x throughput advantage.
     if not getattr(config.neuron_config, "quantized", False):
         maybe_dequantize_layer(neuron_state_dict, config)
+
+    # Dequant FP8 weights with block-wise .scale to BF16 for modules that are
+    # excluded from NxDI's quantization conversion. Block-wise 128x128 scales
+    # from preprocess_minimax_m2_fp8.py can't be TP-sharded at TP=32.
+    # Also dequant attention FP8 weights (per-row .scale) when self_attn is
+    # excluded. No-op if no matching .scale keys are present.
+    mods_to_skip = get_modules_to_not_convert(config.neuron_config) or []
+    dequant_patterns = []
+    if "expert_mlps" in mods_to_skip or "block_sparse_moe" in mods_to_skip:
+        dequant_patterns.append("expert_mlps.mlp_op")
+    if "self_attn" in mods_to_skip:
+        dequant_patterns.append("self_attn")
+    if dequant_patterns:
+        dequant_fp8_scales_to_bf16(neuron_state_dict, config, dequant_patterns)
 
     with torch.no_grad():
         tp_degree = config.neuron_config.tp_degree

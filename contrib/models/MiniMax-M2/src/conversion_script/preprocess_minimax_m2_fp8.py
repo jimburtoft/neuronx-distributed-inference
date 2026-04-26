@@ -72,6 +72,7 @@ NEURON_FP8_MAX = 240.0
 # Quantization primitives
 # ---------------------------------------------------------------------------
 
+
 def convert_bf16_to_fp8_per_row(
     weight: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -102,9 +103,7 @@ def rescale_fp8_to_per_row(
         for j in range(scale_w):
             h0, h1 = i * block_h, min((i + 1) * block_h, out_features)
             w0, w1 = j * block_w, min((j + 1) * block_w, in_features)
-            dequantized[h0:h1, w0:w1] = (
-                weight_float[h0:h1, w0:w1] * scale[i, j].item()
-            )
+            dequantized[h0:h1, w0:w1] = weight_float[h0:h1, w0:w1] * scale[i, j].item()
 
     row_max_abs = dequantized.abs().max(dim=1, keepdim=True)[0]
     scales = torch.clamp(row_max_abs / NEURON_FP8_MAX, min=1e-10)
@@ -128,6 +127,7 @@ def rescale_fp8_weight_blockwise(
 # ---------------------------------------------------------------------------
 # Streaming weight access (one open safetensors handle at a time)
 # ---------------------------------------------------------------------------
+
 
 class LazyWeightMap:
     """Lazily fetch tensors from sharded safetensors, keeping one handle live."""
@@ -170,6 +170,7 @@ class LazyWeightMap:
 # Per-tensor helper
 # ---------------------------------------------------------------------------
 
+
 def _maybe_fp8_to_neuron_per_row(
     weight: torch.Tensor, scale: Optional[torch.Tensor]
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -184,6 +185,7 @@ def _maybe_fp8_to_neuron_per_row(
 # ---------------------------------------------------------------------------
 # Per-layer processing
 # ---------------------------------------------------------------------------
+
 
 def process_layer(
     layer_idx: int,
@@ -303,9 +305,7 @@ def process_layer(
     down_proj = torch.empty(
         num_experts, intermediate_size, hidden_size, dtype=sample_dw.dtype
     )
-    down_scale = torch.empty(
-        num_experts, d_i_blocks, d_h_blocks, dtype=sample_ds.dtype
-    )
+    down_scale = torch.empty(num_experts, d_i_blocks, d_h_blocks, dtype=sample_ds.dtype)
 
     # Slot expert 0 (already rescaled above).
     gate_up_proj[0, :, :intermediate_size] = sample_w.T
@@ -338,8 +338,12 @@ def process_layer(
         down_scale[e] = d_s.T
         del w1, w1_s, w3, w3_s, w2, w2_s, g_w, g_s, u_w, u_s, d_w, d_s
 
-    out[f"{out_prefix}block_sparse_moe.expert_mlps.mlp_op.gate_up_proj.weight"] = gate_up_proj
-    out[f"{out_prefix}block_sparse_moe.expert_mlps.mlp_op.gate_up_proj.scale"] = gate_up_scale
+    out[f"{out_prefix}block_sparse_moe.expert_mlps.mlp_op.gate_up_proj.weight"] = (
+        gate_up_proj
+    )
+    out[f"{out_prefix}block_sparse_moe.expert_mlps.mlp_op.gate_up_proj.scale"] = (
+        gate_up_scale
+    )
     out[f"{out_prefix}block_sparse_moe.expert_mlps.mlp_op.down_proj.weight"] = down_proj
     out[f"{out_prefix}block_sparse_moe.expert_mlps.mlp_op.down_proj.scale"] = down_scale
     return out
@@ -348,6 +352,7 @@ def process_layer(
 # ---------------------------------------------------------------------------
 # Shard saving / index
 # ---------------------------------------------------------------------------
+
 
 def save_shard(
     tensors: Dict[str, torch.Tensor],
@@ -376,6 +381,7 @@ def save_shard(
 # ---------------------------------------------------------------------------
 # Main driver
 # ---------------------------------------------------------------------------
+
 
 def process_minimax_m2_checkpoint(hf_model_path: str, save_path: str, tp_degree: int):
     os.makedirs(save_path, exist_ok=True)
@@ -407,7 +413,7 @@ def process_minimax_m2_checkpoint(hf_model_path: str, save_path: str, tp_degree:
             del layer_sd
             gc.collect()
             print(
-                f"  layer {li:2d}  {size/1e9:6.2f} GB in {time.time()-t0:5.1f}s",
+                f"  layer {li:2d}  {size / 1e9:6.2f} GB in {time.time() - t0:5.1f}s",
                 flush=True,
             )
 
@@ -452,7 +458,7 @@ def process_minimax_m2_checkpoint(hf_model_path: str, save_path: str, tp_degree:
         if os.path.isfile(src):
             shutil.copy(src, os.path.join(save_path, name))
 
-    print(f"\nPreprocess complete. total_size={total_size/1e9:.2f} GB", flush=True)
+    print(f"\nPreprocess complete. total_size={total_size / 1e9:.2f} GB", flush=True)
     print(f"  tensors written: {len(weight_map_out)}", flush=True)
     print(f"  output dir: {save_path}", flush=True)
 
@@ -464,9 +470,11 @@ def main():
     parser.add_argument("--hf_model_path", required=True)
     parser.add_argument("--save_path", required=True)
     parser.add_argument(
-        "--tp_degree", type=int, default=64,
+        "--tp_degree",
+        type=int,
+        default=64,
         help="Tensor parallelism (currently informational only; "
-             "the framework does the TP sharding at load time).",
+        "the framework does the TP sharding at load time).",
     )
     args = parser.parse_args()
     process_minimax_m2_checkpoint(args.hf_model_path, args.save_path, args.tp_degree)

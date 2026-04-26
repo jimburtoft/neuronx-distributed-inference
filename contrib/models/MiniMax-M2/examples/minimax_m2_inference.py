@@ -256,36 +256,26 @@ def create_config(args) -> MiniMaxM2InferenceConfig:
         if use_fp8_native
         else "per_tensor_symmetric",
         quantization_dtype="f8e4m3" if use_fp8_native else "int8",
-        # Per-channel scales (preprocessing converts blockwise->per-channel)
+        # Blockwise scales from preprocessing; NxDI does not shard these
         quantization_block_size=None,
         quantization_block_axis=None,
-        # Exclude modules from NxD convert() for native FP8.
-        # When using fused MoE TKG: only exclude non-MoE modules. The fused kernel
-        # needs QuantizedExpertFused* layers with .scale for FP8 handling.
-        # Without fused TKG: exclude ALL modules (compat.py handles FP8 manually).
-        # In dequant mode, no convert() is called (quantized=False).
+        # Exclude ALL modules from NxD convert() for native FP8.
+        # Block-wise expert scales have block dimensions that don't divide
+        # by TP=32, so NxDI's shard_children would crash. Instead, compat.py
+        # handles FP8 dequant manually (CTE path) and the fused TKG kernel
+        # reads scales from raw checkpoint tensors attached to the modules.
         modules_to_not_convert=(
             [
                 "self_attn",
                 "lm_head",
                 "embed_tokens",
                 "norm",
+                "block_sparse_moe",
+                "expert_mlps",
                 "router",
             ]
-            if use_fp8_native and use_fused_moe_tkg
-            else (
-                [
-                    "self_attn",
-                    "lm_head",
-                    "embed_tokens",
-                    "norm",
-                    "block_sparse_moe",
-                    "expert_mlps",
-                    "router",
-                ]
-                if use_fp8_native
-                else None
-            )
+            if use_fp8_native
+            else None
         ),
     )
 

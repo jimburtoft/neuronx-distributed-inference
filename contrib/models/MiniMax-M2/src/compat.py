@@ -71,7 +71,7 @@ def _patch_blockwise_shard_hidden():
 
         import nki
 
-        wrapped_kernel = nki.jit(kernel_fn, mode="torchxla")
+        wrapped_kernel = nki.jit(kernel_fn)
         bw._blockwise_mm_baseline_shard_hidden_nki_call = wrapped_kernel
 
         def _call_shard_hidden_kernel_patched(args):
@@ -349,7 +349,7 @@ def _patch_fused_tkg_with_selection_bias(model=None):
         )
         import nki
 
-        moe_block_tkg_kernel = nki.jit(moe_block_tkg, mode="torchxla")
+        moe_block_tkg_kernel = nki.jit(moe_block_tkg)
     except ImportError as e:
         logger.warning(
             "Cannot import nkilib moe_block_tkg kernel: %s. "
@@ -404,51 +404,65 @@ def _patch_fused_tkg_with_selection_bias(model=None):
         def get_data(t):
             return t.data if t is not None and hasattr(t, "data") else t
 
-        router_mm_dtype = nl.float32
+        # router_mm_dtype must match router_weights dtype (NKI 0.3.0 enforces
+        # that both nc_matmul operands share the same float32/non-float32 class).
+        _TORCH_TO_NKI = {
+            torch.float16: nl.float16,
+            torch.bfloat16: nl.bfloat16,
+            torch.float32: nl.float32,
+        }
+        router_mm_dtype = _TORCH_TO_NKI.get(self.router.weight_T.dtype, nl.bfloat16)
 
-        # FP8 scales: use getattr since the module may be non-quantized.
-        # NxDI's QuantizedExpertFused layers store scales in a compact form
-        # that may not have a leading E dimension (e.g. [1, 1, 2*I_TP] for
-        # gate_up when blockwise scale covers all experts in one block).
-        # The nkilib kernel expects [E, 2, I_TP] for gate_up and [E, H] for
-        # down, so we broadcast if needed.
+        # FP8 handling: When expert_mlps is in modules_to_not_convert (both
+        # fused-TKG and non-fused paths), NxDI doesn't create QuantizedExpertFused
+        # modules. Weights are either:
+        # (a) BF16 if --fp8-dequant was used (dequanted during checkpoint loading)
+        # (b) FP8 if native mode — but block-wise scales can't be TP-sharded, so
+        #     we must dequant in-graph here before passing to the kernel.
         gate_up_scale = None
         down_scale = None
-        if self.config.quantized:
+        gate_up_weights = self.expert_mlps.mlp_op.gate_up_proj.weight
+        down_weights = self.expert_mlps.mlp_op.down_proj.weight
+
+        # If weights are FP8, dequant in-graph to BF16 before the kernel
+        is_fp8 = gate_up_weights.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+        if is_fp8:
+            # Block-wise scales are attached as .scale by the custom checkpoint
+            # loader in modeling_minimax_m2.py, OR we dequant without scales
             raw_gu_scale = getattr(self.expert_mlps.mlp_op.gate_up_proj, "scale", None)
             raw_dn_scale = getattr(self.expert_mlps.mlp_op.down_proj, "scale", None)
-            E = self.num_local_experts
-
             if raw_gu_scale is not None:
-                gu_data = get_data(raw_gu_scale)
-                gu_numel = gu_data.numel()
-                I_TP = self.expert_mlps.routed_experts_mlp_config.intermediate_size // (
-                    self.expert_mlps.moe_tensor_model_parallel_group.size()
-                )
-                expected_numel = E * 2 * I_TP
-                if gu_numel == expected_numel:
-                    # Full per-expert scales: reshape directly
-                    gate_up_scale = gu_data.view(E, 2, -1)
-                elif gu_numel == 2 * I_TP:
-                    # Per-channel scale shared across experts: [1, 1, 2*I_TP]
-                    # Broadcast to [E, 2, I_TP]
-                    gate_up_scale = gu_data.view(1, 2, I_TP).expand(E, -1, -1)
-                else:
-                    # Fallback: try to broadcast on first dim
-                    gate_up_scale = gu_data.reshape(-1, 2, I_TP).expand(E, -1, -1)
+                # Dequant gate_up: [E, H, 2*IM] * scale broadcast
+                gu_w = gate_up_weights.to(torch.bfloat16)
+                gu_s = get_data(raw_gu_scale).to(torch.bfloat16)
+                # Block-wise scale [E, H_blocks, 2*IM_blocks] needs complex broadcast.
+                # For simplicity, use repeat_interleave to expand to full dims.
+                E, H_dim, IM2_dim = gu_w.shape
+                s_E, s_H, s_IM = gu_s.shape
+                block_h = H_dim // s_H
+                block_im = IM2_dim // s_IM
+                gu_s_expanded = gu_s.repeat_interleave(
+                    block_h, dim=1
+                ).repeat_interleave(block_im, dim=2)
+                gate_up_weights = gu_w * gu_s_expanded
 
-            if raw_dn_scale is not None:
-                dn_data = get_data(raw_dn_scale)
-                dn_numel = dn_data.numel()
-                H = self.hidden_size
-                expected_dn = E * H
-                if dn_numel == expected_dn:
-                    down_scale = dn_data.view(E, -1)
-                elif dn_numel == H:
-                    # Per-channel scale shared across experts
-                    down_scale = dn_data.view(1, H).expand(E, -1)
+                dn_w = down_weights.to(torch.bfloat16)
+                if raw_dn_scale is not None:
+                    dn_s = get_data(raw_dn_scale).to(torch.bfloat16)
+                    E2, s_IM2, s_H2 = dn_s.shape
+                    _, IM_dim, H2_dim = dn_w.shape
+                    block_im2 = IM_dim // s_IM2
+                    block_h2 = H2_dim // s_H2
+                    dn_s_expanded = dn_s.repeat_interleave(
+                        block_im2, dim=1
+                    ).repeat_interleave(block_h2, dim=2)
+                    down_weights = dn_w * dn_s_expanded
                 else:
-                    down_scale = dn_data.reshape(-1, H).expand(E, -1)
+                    down_weights = dn_w
+            else:
+                # No scales available, just cast to BF16
+                gate_up_weights = gate_up_weights.to(torch.bfloat16)
+                down_weights = down_weights.to(torch.bfloat16)
 
         common_args = dict(
             inp=get_data(hidden_states),
@@ -458,11 +472,9 @@ def _patch_fused_tkg_with_selection_bias(model=None):
             shared_expert_up_w=get_data(shared_experts_up_proj_weight),
             shared_expert_down_w=get_data(shared_experts_down_proj_weight),
             expert_gate_up_weights=get_data(
-                self.expert_mlps.mlp_op.gate_up_proj.weight.view(
-                    self.num_local_experts, self.hidden_size, 2, -1
-                )
+                gate_up_weights.view(self.num_local_experts, self.hidden_size, 2, -1)
             ),
-            expert_down_weights=get_data(self.expert_mlps.mlp_op.down_proj.weight),
+            expert_down_weights=get_data(down_weights),
             expert_gate_up_weights_scale=gate_up_scale,
             expert_down_weights_scale=down_scale,
             eps=self.post_attention_layernorm.variance_epsilon,
