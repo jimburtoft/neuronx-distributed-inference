@@ -4,7 +4,7 @@ set -e
 # MiMo-V2-Flash FP8 vLLM benchmark on Trn2.
 #
 # Requires a Neuron-FP8 preprocessed checkpoint (see
-# `src/conversion_script/preprocess_mimo_v2_flash_fp8.py`). The configs below
+# `src/conversion_script/preprocess_mimo_v2_fp8.py --attn_bf16`). The configs below
 # all use moe_tp_degree=1 / moe_ep_degree=64 (experts sharded by expert
 # parallelism only, no intra-expert TP split) because moe_tp_degree=64 collapses
 # the per-rank FP8 blockwise scale to a singleton — per-rank expert
@@ -41,6 +41,12 @@ mkdir -p "$RESULTS_DIR"
 # <compiled-path>/weights/tp{N}_sharded_checkpoint.safetensors during compile;
 # load() then reads those directly (~30s) instead of re-sharding the entire
 # checkpoint on every vllm-neuron startup (~10+ min).
+#
+# modules_to_not_convert includes q/k/v_proj because the recommended FP8
+# preprocessing uses --attn_bf16 to keep attention weights in BF16, avoiding
+# the lossy blockwise → per-row FP8 re-quantization that degrades reasoning
+# quality.  If preprocessing without --attn_bf16, remove q/k/v_proj from this
+# list.
 COMMON_MIMO_CONFIG='"tp_degree": 64,
             "logical_nc_config": 2,
             "fused_qkv": false,
@@ -55,7 +61,7 @@ COMMON_MIMO_CONFIG='"tp_degree": 64,
             "quantization_type": "blockwise_symmetric",
             "quantization_block_axis": [1, 2],
             "quantization_block_size": [128, 128],
-            "modules_to_not_convert": ["embed_tokens", "lm_head", "norm", "router", "o_proj"],
+            "modules_to_not_convert": ["embed_tokens", "lm_head", "norm", "router", "o_proj", "q_proj", "k_proj", "v_proj"],
             "blockwise_matmul_config": {"use_shard_on_intermediate_dynamic_while": true, "skip_dma_token": true}'
 
 # Helper: wait for vLLM server to be ready. First-time compilation of a

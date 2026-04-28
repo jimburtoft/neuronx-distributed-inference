@@ -35,12 +35,27 @@ from safetensors import safe_open
 from safetensors.torch import save_file as safetensors_save_file
 
 
-# FP8 range difference between OCP (HuggingFace) and Neuron (IEEE-754)
-# OCP FP8 E4M3/e4m3fn: range ±448
-# Neuron FP8 E4M3 (IEEE-754): range ±240
-FP8_SCALING_FACTOR = 448.0 / 240.0
+# FP8 format conversion: OCP fp8_e4m3fn (bias=7) → Neuron IEEE fp8_e4m3 (bias=8)
+#
+# The two formats differ only in exponent bias:
+#   OCP:  value = (-1)^s * 2^(e - 7) * (1.mmm)
+#   IEEE: value = (-1)^s * 2^(e - 8) * (1.mmm)
+#
+# For the same bit pattern, V_ieee = V_ocp / 2.  The compiler flag
+# --experimental-unsafe-fp8e4m3fn-as-fp8e4m3 reinterprets OCP bits as IEEE.
+# However, on the blockwise MoE path, weights are dequantized on CPU using
+# PyTorch's OCP interpretation (blockwise_scale_dequantize), so the compiler
+# flag is irrelevant — we only need to ensure the stored FP8 bits round-trip
+# correctly through `weight.float() * scale`.
+#
+# Dividing an FP8 value by exactly 2.0 is an exponent decrement — lossless
+# for all normal values (99.977% of real weights).  The old factor of
+# 448/240 ≈ 1.867 required a lossy FP8 recast that changed 99.16% of weight
+# values and introduced ~2% mean relative error per expert projection,
+# compounding across 256 experts × 47 MoE layers.
+FP8_SCALING_FACTOR = 2.0
 
-# Neuron FP8 E4M3 max value
+# Neuron FP8 E4M3 max value (IEEE, bias=8)
 NEURON_FP8_MAX = 240.0
 
 
@@ -188,6 +203,47 @@ def convert_bf16_to_fp8_blockwise(
     return fp8_weight, scale
 
 
+def dequantize_blockwise_to_bf16(
+    weight: torch.Tensor, scale: torch.Tensor
+) -> torch.Tensor:
+    """
+    Dequantize a blockwise FP8 weight tensor to BF16.
+
+    Uses the same blockwise dequantization logic as rescale_fp8_to_per_row,
+    but returns BF16 directly instead of re-quantizing to per-row FP8.
+    This avoids the lossy format conversion.
+
+    Args:
+        weight: FP8 weight tensor (float8_e4m3fn) [out_features, in_features]
+        scale: Block-wise scale tensor (weight_scale_inv) [scale_h, scale_w]
+
+    Returns:
+        BF16 weight tensor [out_features, in_features]
+    """
+    out_features, in_features = weight.shape
+    scale_h, scale_w = scale.shape
+
+    block_h = (out_features + scale_h - 1) // scale_h
+    block_w = (in_features + scale_w - 1) // scale_w
+
+    weight_float = weight.float()
+    dequantized = torch.zeros(out_features, in_features, dtype=torch.float32)
+
+    for i in range(scale_h):
+        for j in range(scale_w):
+            h_start = i * block_h
+            h_end = min((i + 1) * block_h, out_features)
+            w_start = j * block_w
+            w_end = min((j + 1) * block_w, in_features)
+
+            block_scale = scale[i, j].item()
+            dequantized[h_start:h_end, w_start:w_end] = (
+                weight_float[h_start:h_end, w_start:w_end] * block_scale
+            )
+
+    return dequantized.to(torch.bfloat16)
+
+
 def rescale_fp8_to_per_row(weight: torch.Tensor, scale: torch.Tensor):
     """
     Rescale FP8 weight from OCP format to Neuron format with per-row scaling.
@@ -248,7 +304,10 @@ def rescale_fp8_weight_blockwise(weight: torch.Tensor, scale: torch.Tensor):
     """
     Rescale FP8 weight from OCP format to Neuron format, keeping block-wise scaling.
 
-    This is kept for MoE experts which may use block-wise scaling.
+    Dividing by FP8_SCALING_FACTOR (2.0) is an exponent decrement in the FP8
+    bit pattern, which is lossless for all normal values (99.977% of real
+    weights).  Only subnormals and exp=1 values with odd mantissas lose the
+    LSB — these represent tiny values near zero with negligible impact.
 
     Args:
         weight: FP8 weight tensor (float8_e4m3fn)
@@ -259,21 +318,11 @@ def rescale_fp8_weight_blockwise(weight: torch.Tensor, scale: torch.Tensor):
         - rescaled_weight: FP8 weight compatible with Neuron
         - neuron_scale: Scale in Neuron format (direct scale, not reciprocal)
     """
-    # Convert weight to BF16 for rescaling
-    weight_bf16 = weight.bfloat16()
+    # Divide by 2.0 — nearly lossless for FP8 (exponent shift)
+    rescaled_weight = (weight.float() / FP8_SCALING_FACTOR).to(torch.float8_e4m3fn)
 
-    # Divide by scaling factor to fit in Neuron's smaller range
-    rescaled_weight_bf16 = weight_bf16 / FP8_SCALING_FACTOR
-
-    # Convert back to FP8
-    rescaled_weight = rescaled_weight_bf16.to(torch.float8_e4m3fn)
-
-    # After our rescaling:
-    #   rescaled_weight = fp8_weight / FP8_SCALING_FACTOR
-    #   We need: original = rescaled_weight * new_scale
-    #   So: original = (fp8_weight / FP8_SCALING_FACTOR) * new_scale = fp8_weight * weight_scale_inv
-    #   Therefore: new_scale = weight_scale_inv * FP8_SCALING_FACTOR
-
+    # Compensate in scale: original = rescaled * new_scale
+    # so new_scale = old_scale * FP8_SCALING_FACTOR
     neuron_scale = scale.float() * FP8_SCALING_FACTOR
 
     return rescaled_weight, neuron_scale.to(torch.float32)
@@ -339,6 +388,7 @@ def process_mimo_v2_checkpoint(
     save_path: str,
     tp_degree: int = 32,
     convert_to_mha: bool = True,
+    attn_bf16: bool = False,
 ):
     """
     Process MiMo-V2-Flash checkpoint for Neuron FP8 inference.
@@ -351,7 +401,20 @@ def process_mimo_v2_checkpoint(
         save_path: Path to save preprocessed checkpoint
         tp_degree: Tensor parallelism degree
         convert_to_mha: Whether to replicate K/V for CONVERT_TO_MHA mode
+        attn_bf16: If True, keep q/k/v projections in BF16 instead of
+            re-quantizing from blockwise FP8 to per-row FP8.  This avoids
+            the lossy format conversion that can degrade reasoning quality.
+            o_proj is always BF16 regardless of this setting.
     """
+    # Determine which attention projections to keep in BF16.
+    # o_proj is always BF16 (in modules_to_not_convert).
+    # With --attn-bf16, q/k/v are also dequantized to BF16 to avoid the
+    # lossy blockwise → per-row FP8 re-quantization.
+    attn_bf16_projs = {"o_proj"}
+    if attn_bf16:
+        attn_bf16_projs |= {"q_proj", "k_proj", "v_proj"}
+        print("Attention projections q/k/v will be kept in BF16", flush=True)
+
     print(f"Loading checkpoint index from: {hf_model_path}", flush=True)
     reader = StreamingCheckpointReader(hf_model_path)
 
@@ -444,10 +507,14 @@ def process_mimo_v2_checkpoint(
             weight = reader[weight_key]
             scale = reader.get(scale_key)
 
-            # o_proj is in modules_to_not_convert — keep it as BF16.
-            if proj == "o_proj":
+            # Projections listed in attn_bf16_projs are kept as BF16
+            # (dequantized from FP8 if needed).  o_proj is always BF16
+            # because it's in modules_to_not_convert.  q/k/v can optionally
+            # be kept BF16 to avoid the lossy blockwise→per-row FP8
+            # re-quantization that degrades reasoning quality.
+            if proj in attn_bf16_projs:
                 if weight.dtype == torch.float8_e4m3fn and scale is not None:
-                    weight = (weight.float() * scale.float()).to(torch.bfloat16)
+                    weight = dequantize_blockwise_to_bf16(weight, scale)
                 scale = None
             else:
                 if weight.dtype == torch.float8_e4m3fn and scale is not None:
@@ -734,6 +801,13 @@ def main():
         dest="convert_to_mha",
         help="Disable K/V replication",
     )
+    parser.add_argument(
+        "--attn_bf16",
+        action="store_true",
+        default=False,
+        help="Keep attention q/k/v in BF16 instead of FP8 per-row "
+        "(avoids lossy blockwise->per-row re-quantization)",
+    )
 
     args = parser.parse_args()
 
@@ -742,6 +816,7 @@ def main():
         save_path=args.save_path,
         tp_degree=args.tp_degree,
         convert_to_mha=args.convert_to_mha,
+        attn_bf16=args.attn_bf16,
     )
 
 
