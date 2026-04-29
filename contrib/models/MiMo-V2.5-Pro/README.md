@@ -35,17 +35,42 @@ Key features:
 - **Sigmoid Router + noaux_tc**: `sigmoid(logits) + e_score_correction_bias` is used to pick top-8 experts; unbiased `sigmoid(logits)` becomes the affinity weights. `n_group=1, topk_group=1` degenerates group-limited routing to plain noaux_tc.
 - **attention_value_scale = 0.612**: HF reference multiplies `value_states` by this before `softmax(QK^T) × V` (NOT applied post-attention); the NxDI port matches.
 
-## Status (work-in-progress)
+## Status
 
-**This port compiles cleanly and serves via vLLM on Trn2. The shipping recipe is BF16 attention + FP8 MoE at `seq_len=256` — verified to produce coherent output end-to-end via `smoke_generate_mimo_v2.py`.** Last updated 2026-04-29.
+**Two working recipes are available:**
 
-### Why BF16 attn + FP8 MoE
+| Recipe | SDK | seq_len | Attention | MoE | Output Quality | HBM Fit |
+|--------|-----|---------|-----------|-----|---------------|---------|
+| **Full FP8** (new) | 2.28 | 1024 | FP8 | FP8 | Coherent | Fits on trn2.48xlarge |
+| BF16-attn + FP8 MoE | 2.29 | 256 | BF16 | FP8 | Coherent | Tight (seq_len=1024 OOMs) |
 
-Pro's attention weights have `abs_mean ≈ 0.00124`, roughly 4× smaller than V2.5 (256 experts). Under an all-FP8 recipe, the NKI blockwise FP8 accumulator on attention q/k/v at this magnitude drifts the logits across 70 layers and produces prompt-dependent gibberish (`"The capital of France is\n# 1000000000000000"`, `"Once upon a time in a small village there lived\n# 0000000000..."`, etc.). Dequantizing q/k/v to BF16 before the matmul restores coherent output. MoE experts (scales `≈ 2.3e-5`, similarly small) can stay FP8.
+### Full FP8 Recipe (SDK 2.28, recommended)
 
-Verified end-to-end: `smoke_generate_mimo_v2.py` with a minimal chat template returns a well-formed reasoning trace that correctly identifies the model ("As MiMo, based on Xiaomi's self-developed large model..."). `preprocess_mimo_v2_fp8.py` emits BF16 q/k/v directly so no separate step is required.
+**Full FP8 (including attention) produces coherent output when two preprocessing fixes are applied.** The original "FP8 attention drift" was caused by incorrect preprocessing, not by accumulator precision:
 
-GPU stacks (sglang on H100/H200) run the same OCP FP8 checkpoint correctly because they always dequantize FP8 → BF16 before the matmul. The issue is specific to Neuron's direct-FP8 compute path on small-magnitude tensors. Kimi PR #131 observes similar FP8 degradation on Flash and recommends SDK 2.28.
+1. **Interleaved QKV split**: Pro's `qkv_proj.weight` uses an interleaved group layout `[Q0..Q15, K0, V0, Q16..Q31, K1, V1, ...]`, not simple `[all_Q | all_K | all_V]` concatenation. The FP8 blockwise scales follow the same layout. `preprocess_mimo_v2_pro_fp8.py` handles this correctly via `split_qkv_fused()`.
+
+2. **Router bias mean-subtraction**: `e_score_correction_bias` values have mean ~71 with std ~3e-4. At BF16 precision, the step size at magnitude 71 is ~0.5, which destroys the per-expert variation. Subtracting the mean during preprocessing preserves relative ranking while keeping values in a precision-safe range.
+
+Both fixes together restore coherent output across all prompt types (English, Chinese, code, chat template with `<think>` reasoning). Tested with 8 diverse prompts × 6 repeats at BS=48.
+
+**Why this works on SDK 2.28 but not 2.29**: On SDK 2.28, the NKI blockwise matmul kernel import fails (`No module named 'neuronxcc.nki._private.blockwise_matmul_while'`), causing NxDI to fall back to the PyTorch blockwise path. This torch fallback path has higher accumulator precision than the NKI kernel, which is sufficient for Pro's small-magnitude weights. On SDK 2.29 with `use_torch_block_wise=True`, the explicit torch path OOMs on load.
+
+**Critical: `is_continuous_batching=True` required.** Without CB, the CTE path uses `fill_prefix()` which always writes KV cache to batch slot 0. With `ctx_batch_size=1` and 48 sequential CTE calls, only the last sequence's KV survives — slots 1-47 get zeros. This produces correct output only when all prompts are identical. With CB enabled, `update_cache_const_indices` writes to the correct batch slot via `seq_ids`.
+
+Recipe config:
+- SDK: 2.28 DLAMI (`Deep Learning AMI Neuron (Ubuntu 24.04) 20260227`)
+- Venv: `/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/`
+- `seq_len=1024`, `is_continuous_batching=True`, `padding_side='left'`
+- `blockwise_matmul_config`: `use_shard_on_intermediate_dynamic_while=True`, `skip_dma_token=True`
+- Preprocessing: `preprocess_mimo_v2_pro_fp8.py` (interleaved QKV + router bias fix)
+- `modules_to_not_convert`: `embed_tokens`, `lm_head`, `norm`, `router`, `o_proj` (no q/k/v exclusion needed)
+
+### BF16-attn + FP8 MoE Recipe (SDK 2.29)
+
+Pro's attention weights have `abs_mean ≈ 0.00124`, roughly 4x smaller than V2.5 (256 experts). On SDK 2.29 with the NKI blockwise FP8 kernel active, this magnitude drifts logits across 70 layers. Dequantizing q/k/v to BF16 restores coherent output but limits `seq_len` to 256 due to HBM constraints.
+
+This recipe remains useful when SDK 2.29 features are needed (e.g., NxDI 0.9.x, vLLM 0.16.0).
 
 ### Cost and constraints
 
@@ -56,8 +81,10 @@ GPU stacks (sglang on H100/H200) run the same OCP FP8 checkpoint correctly becau
 
 ### Recipes tried that did not work
 
-- **All-FP8 attention (`modules_to_not_convert` without q/k/v).** Drifts as described above. Known broken; `preprocess_mimo_v2_fp8.py` no longer emits it.
-- **`use_torch_block_wise=True`** (PyTorch-fallback blockwise matmul for higher accumulator precision): compile+shard succeeded after ~2 h, but `model.load()` crashed with `status=4 Allocation Failure` — the fallback path raises HBM demand even when scoped to MoE.
+- **All-FP8 attention on SDK 2.29 (without preprocessing fixes).** On SDK 2.29, the NKI blockwise FP8 kernel is active and produces gibberish for Pro's small-magnitude weights. Resolved on SDK 2.28 where the NKI kernel fails to import and the torch fallback path provides sufficient precision. Also requires the interleaved QKV split and router bias mean-subtraction fixes.
+- **`use_torch_block_wise=True` on SDK 2.29**: compile+shard succeeded after ~2 h, but `model.load()` crashed with `status=4 Allocation Failure` — the explicit torch fallback path raises HBM demand even when scoped to MoE.
+- **`XLA_HANDLE_SPECIAL_SCALAR=1` + `UNSAFE_FP8FNCAST=1`**: These XLA env vars from Llama-405B FP8 recipes degrade Pro's output quality significantly when the torch blockwise fallback path is active. Most prompts produce garbage. Do not use with the full FP8 recipe.
+- **`ctx_batch_size=4`**: Reduces TTFT from 27.5s to 14.1s (12 CTE calls instead of 48), but output degrades — the KV cache `fill_prefix` path overwrites the same slots. With `is_continuous_batching=True`, the `update_cache_const_indices` path asserts `seq_ids.shape[0] == 1`, limiting CTE to `ctx_batch_size=1`.
 
 ### Next experiments queued
 
@@ -193,30 +220,28 @@ does not yet confirm that all prompts produce coherent text.
 
 ## Checkpoint Preparation
 
-The HuggingFace checkpoint ships as block-wise OCP FP8 (E4M3, ±448 range), which is not directly compatible with Neuron FP8 (IEEE-754 E4M3, ±240 range). Two preprocess scripts are provided:
+The HuggingFace checkpoint ships as block-wise OCP FP8 (E4M3, +/-448 range), which is not directly compatible with Neuron FP8 (IEEE-754 E4M3, +/-240 range). Two preprocess scripts are provided:
 
-### Recommended: FP8 → Neuron-FP8 (streaming)
+### Recommended: Full FP8 preprocessing (SDK 2.28)
 
-`src/conversion_script/preprocess_mimo_v2_fp8.py` performs a per-layer streaming rescale from OCP FP8 to Neuron FP8 (per-row scales for attention Q/K/V and layer-0 dense MLP; blockwise scales for MoE experts). `o_proj` is listed in HF's `quantization_config.ignored_layers` and is kept BF16 on the Neuron side (it binds to a plain `RowParallelLinear`, not `QuantizedRowParallel`). Output is ~1 TB across 70 per-layer safetensors shards.
+`src/conversion_script/preprocess_mimo_v2_pro_fp8.py` performs a per-layer streaming rescale from OCP FP8 to Neuron FP8 with two critical fixes for Pro:
+
+1. **Interleaved QKV split** (`split_qkv_fused()`): Pro's fused `qkv_proj.weight` uses an interleaved group layout where each of 8 KV groups contains `(16 Q heads, 1 K head, 1 V head)`. The function correctly deinterleaves into separate `q_proj`, `k_proj`, `v_proj` tensors with properly split FP8 blockwise scales.
+
+2. **Router bias mean-subtraction**: `e_score_correction_bias` values have mean ~71 with negligible per-expert variation. At BF16 precision (step size ~0.5 at magnitude 71), this destroys the ranking signal. The preprocessing subtracts the mean to keep values in a precision-safe range while preserving relative expert ranking.
 
 ```bash
-python contrib/models/MiMo-V2.5-Pro/src/conversion_script/preprocess_mimo_v2_fp8.py \
+python contrib/models/MiMo-V2.5-Pro/src/conversion_script/preprocess_mimo_v2_pro_fp8.py \
     --hf_model_path /path/to/MiMo-V2.5-Pro \
     --save_path     /path/to/MiMo-V2.5-Pro-Neuron-FP8 \
     --tp_degree 64
 ```
 
-Peak RAM during preprocessing is ~24 GB; total runtime ~20 minutes on a trn2.48xlarge instance.
+Peak RAM: ~24 GB. Runtime: ~58 minutes on trn2.48xlarge. Output: ~961 GB across 70 per-layer safetensors shards.
 
-### Why q/k/v are BF16 in the preprocessed output
+### Alternative: BF16-attn preprocessing (SDK 2.29)
 
-Pro's attention weights have `abs_mean ≈ 0.00124`, roughly 4× smaller than V2.5 (256 experts). The NKI blockwise FP8 accumulator at this magnitude drifts the logits across 70 layers and produces gibberish output — `"The capital of France is\n# 1000000000000000"`, `"Once upon a time in a small village there lived\n# 0000000000..."`, etc. Dequantizing q/k/v to BF16 while keeping MoE experts FP8 restores coherent output (verified on 2026-04-29 via `smoke_generate_mimo_v2.py`).
-
-The preprocess handles this in a single pass: `split_qkv_fused()` unfuses Pro's `qkv_proj` into per-proj BF16 tensors directly, and the Flash-style per-proj fallback path dequants via `_dequant_attn_to_bf16()`. The checkpoint emitted by preprocess has no `q_proj.scale` / `k_proj.scale` / `v_proj.scale` entries. Compile-time `modules_to_not_convert` must therefore include `q_proj`, `k_proj`, `v_proj` so NxDI routes them through a plain `ColumnParallelLinear` rather than the FP8 `QuantizedColumnParallel` path — `smoke_compile_mimo_v2.py` already does this.
-
-### Fallback: FP8 → BF16
-
-`src/conversion_script/preprocess_mimo_v2_fp8.py` dequantizes the entire checkpoint to BF16. Output is ~290 GB; BF16 is numerically equivalent to the published HF FP8 weights and is useful as a known-good reference. Throughput is ~2× worse than the FP8 path because every attention/MLP matmul operates on full BF16 weights.
+`src/conversion_script/preprocess_mimo_v2_fp8.py` (original) performs the same rescale but additionally dequantizes q/k/v to BF16. This is needed on SDK 2.29 where the NKI blockwise kernel is active and produces drift for Pro's small-magnitude attention weights. Output includes no `q_proj.scale` / `k_proj.scale` / `v_proj.scale` entries; `modules_to_not_convert` must include `q_proj`, `k_proj`, `v_proj`.
 
 ## Usage
 
@@ -368,9 +393,38 @@ The patch is applied to vllm-neuron 0.5.0 and:
 
 ## Performance
 
-> The throughput numbers below were captured on 2026-04-29 against a pre-BF16-attn checkpoint (all-FP8, `seq_len=1024`). They are historical — the shipping recipe is BF16 attn + FP8 MoE at `seq_len=256` and has not yet been re-benchmarked. The numbers are kept here for infra validation (continuous batching + bucketing + on-device sampling + vllm-neuron plugin all wire up end-to-end) and order-of-magnitude reference.
+### NxDI Direct (Full FP8, SDK 2.28, trn2.48xlarge, BS=48, TP=64, moe_tp=1/moe_ep=64, `seq_len=1024`, `is_continuous_batching=True`)
 
-### vLLM Serving (trn2.48xlarge, historical all-FP8 run, BS=48, TP=64, moe_tp=1/moe_ep=64, CB + bucketing, `seq_len=1024`)
+Measured with `bench_simple.py`, 3 timed runs per test + warmup. Greedy decoding (`do_sample=False`), uniform prompts per test.
+
+| Test | Prompt Len | Gen Tokens | Best Time | Total tok/s | Per-stream tok/s | TPOT (end-to-end) |
+|------|-----------|------------|-----------|-------------|-----------------|-------------------|
+| short_50tok | 9 | 50 | 38.21s | 62.8 | 1.3 | 764.2ms |
+| short_128tok | 9 | 128 | 54.91s | 111.9 | 2.3 | 429.0ms |
+| medium_128tok | 28 | 128 | 55.82s | 110.1 | 2.3 | 436.1ms |
+| creative_256tok | 11 | 256 | 82.96s | 148.1 | 3.1 | 324.1ms |
+| chinese_128tok | 6 | 128 | 55.13s | 111.4 | 2.3 | 430.7ms |
+| code_128tok | 15 | 128 | 55.55s | 110.6 | 2.3 | 434.0ms |
+| chat_template_128tok | 263 | 128 | 57.03s | 107.7 | 2.2 | 445.6ms |
+
+**Separated metrics** (linear regression on generation length):
+- **Pure TKG TPOT**: 215.9ms per token per stream
+- **Pure TKG throughput**: 222.3 tok/s total at BS=48 (4.63 tok/s per stream)
+- **TTFT**: ~27.5s (short prompt), ~29.2s (263-token chat template prompt)
+- **TTFT bottleneck**: `ctx_batch_size=1` requires 48 sequential CTE forward passes at ~0.57s each
+
+**Compilation timing** (first compile, SDK 2.28):
+
+| Phase | Duration |
+|-------|----------|
+| FP8 preprocessing | ~58 min |
+| TKG NEFF compile | ~16 min |
+| CTE NEFF compile | ~30s |
+| Checkpoint sharding (64 TP ranks) | ~93 min |
+| Weight loading (presharded) | ~73s |
+| Model warmup | ~7s |
+
+### vLLM Serving (historical, BF16-attn, SDK 2.29, BS=48, TP=64, moe_tp=1/moe_ep=64, CB + bucketing, `seq_len=1024`)
 
 Input/output: 900/90 tokens (`vllm bench serve --dataset-name random`), `on_device_sampling_config={do_sample:true, temperature:0.6, top_k:20, top_p:0.95}`.
 
@@ -388,11 +442,11 @@ Per-stream ITL median holds at ~220 ms across all concurrency levels; TPOT/TTFT 
 
 ## Compatibility Matrix
 
-| Instance | Neuron SDK 2.29+ (PyTorch 2.9) | 2.21 and earlier |
-|----------|--------------------------------|------------------|
-| Trn2 (trn2.48xlarge) | Tested | Not tested |
-| Trn1 | Not supported (requires 64 logical cores via logical_nc_config=2) | Not supported |
-| Inf2 | Not supported | Not supported |
+| Instance | SDK 2.28 (Full FP8) | SDK 2.29 (BF16-attn) | 2.21 and earlier |
+|----------|---------------------|---------------------|------------------|
+| Trn2 (trn2.48xlarge) | Tested, coherent output | Tested, coherent output | Not tested |
+| Trn1 | Not supported (requires 64 logical cores) | Not supported | Not supported |
+| Inf2 | Not supported | Not supported | Not supported |
 
 ## Testing
 
@@ -417,6 +471,6 @@ pytest contrib/models/MiMo-V2.5-Pro/test/integration/test_model.py -v
 
 ## Maintainer
 
-Henan Wang (whn09)
+Henan Wang (whn09), Jim Burtoft (jimburtoft)
 
 **Last Updated:** 2026-04-29

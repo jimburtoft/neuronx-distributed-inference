@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Minimal compile+load smoke test for MiMo-V2.5-Pro FP8 on Trn2.
+"""Minimal compile+load smoke test for MiMo-V2-Pro FP8 on Trn2.
 
 Bypasses vLLM entirely so we can iterate on the preprocessed Neuron-FP8
-checkpoint without paying vllm-neuron's startup cost. Compiles the model
-(TP=64, configurable MoE TP/EP, blockwise FP8 for routed experts) to a
-temp dir, then loads. For `moe_ep_degree > 1` the TKG path raises
-`NotImplementedError: Selective Loading with Expert parallelism` unless
-`batch_size * top_k / num_experts >= 1.0` → `batch_size >= 384 / 8 = 48`.
+checkpoint without paying vllm-neuron's startup cost. Builds the Pro BS=1
+recipe (TP=64, EP=1, blockwise FP8 for routed experts), compiles to a temp
+dir, then loads. EP=1 lets the TKG path enter forward_selective_loading
+legally so BS=1 compiles — with EP>1 NxDI raises NotImplementedError and
+forces BS>=num_experts/top_k = 48.
 
 STAGE controls how far we go:
   instantiate | compile | load | all   (default: all)
@@ -16,8 +16,8 @@ check for the preprocessed checkpoint. SKIP_WARMUP=1 on load() skips the
 forward pass that allocates the shared scratchpad — useful when HBM is
 tight.
 
-Run under /opt/aws_neuronx_venv_pytorch_inference_vllm_0_16 (same venv
-as vllm serving; both NxDI direct and vllm-neuron are installed there).
+Run under /opt/aws_neuronx_venv_pytorch_inference_vllm_0_16 (same venv used
+by the bench script).
 """
 
 import os
@@ -25,40 +25,25 @@ import sys
 import time
 import traceback
 
-# NOTE: AWS Llama-3.1-405B FP8 tutorial recommends XLA_HANDLE_SPECIAL_SCALAR=1
-# and UNSAFE_FP8FNCAST=1 for OCP-derived FP8 checkpoints. Setting them at
-# compile time, however, appears to change the HLO that gets emitted (likely
-# because XLA lowering of fp8_e4m3fn special scalars switches paths), which
-# busts the neuronx-cc cache and forces a full recompile (~90 min). If you
-# need these flags, set them ONLY at generate time and rely on the compiled
-# NEFF's built-in `--experimental-unsafe-fp8e4m3fn-as-fp8e4m3` handling.
-
 MODEL_PATH = os.environ.get(
-    "MIMO_V25_PRO_MODEL_PATH",
-    "/opt/dlami/nvme/models/MiMo-V2.5-Pro-Neuron-FP8",
+    "MIMO_V2_PRO_MODEL_PATH",
+    "/mnt/models/MiMo-V2.5-Pro-Neuron-FP8",
 )
 COMPILED_PATH = os.environ.get(
-    "MIMO_V25_PRO_COMPILED_PATH",
-    "/opt/dlami/nvme/compiled/mimo_v2_5_pro_bs48_moetp1_ep64_fp8moe_bf16attn_seq256/",
+    "MIMO_V2_PRO_COMPILED_PATH",
+    "/mnt/models/compiled/mimo_v2_pro_tp64_moetp1_ep64_fp8/",
 )
 
 TP_DEGREE = int(os.environ.get("TP_DEGREE", "64"))
-# Drop seq_len to 256 to free ~200 MB of full-attention softmax scratch per
-# rank. The previous BF16-attn attempt at seq_len=1024 OOM'd by 40 MB on load
-# (failed to allocate 41943040 bytes for rdh/alltoall); seq_len=256 reclaims
-# enough HBM to fit the extra BF16 q/k/v weights.
-SEQ_LEN = int(os.environ.get("SEQ_LEN", "256"))
-# BS=48 is the minimum that avoids forward_selective_loading on decode:
-# `BS * top_k / num_experts >= 1.0` → BS >= 384/8 = 48. At BS=1 the TKG
-# path raises `NotImplementedError: Selective Loading with Expert parallelism`.
-BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "48"))
+SEQ_LEN = int(os.environ.get("SEQ_LEN", "1024"))
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "1"))
 CTX_BATCH_SIZE = int(os.environ.get("CTX_BATCH_SIZE", "1"))
-# moe_tp=1 / moe_ep=64: first recipe to try on V2.5-Pro. Lowest compile time
-# (no intra-expert TP split) and output quality should be comparable to
-# Flash, which uses the same recipe. On V2-Pro this produced garbage
-# prefill ("0.0.0.0:8080"), but we're re-testing on V2.5-Pro because the
-# V2-Pro root cause ended up being FP8 expert-MLP precision loss, which
-# V2.5 may or may not inherit.
+# Default to moe_tp=1 / moe_ep=64. Under FP8 + moe_tp=64 each rank's MoE
+# expert intermediate slice is too small (below 128-row blockwise block),
+# collapsing NxDI's `_setup_for_scale` to a singleton — losing per-channel
+# FP8 scale granularity. moe_tp=1/moe_ep=64 keeps every expert on a single
+# rank (6 full experts per rank for Pro's 384 experts), preserving the
+# blockwise scale intact.
 MOE_TP = int(os.environ.get("MOE_TP", "1"))
 MOE_EP = int(os.environ.get("MOE_EP", "64"))
 
@@ -66,12 +51,8 @@ STAGE = os.environ.get("STAGE", "all").lower()
 
 os.makedirs(COMPILED_PATH, exist_ok=True)
 
-# NxDI's model builder uses a per-process temp workdir for HLO/NEFF staging
-# (BASE_COMPILE_WORK_DIR, default "/tmp/nxd_model/"). If two compiles run in
-# parallel with the same default, they silently overwrite each other's
-# .hlo_module.pb files and one or both compilations crash with
-# "neuronx-cc returned non-zero exit status 70". Pin the workdir to a
-# unique per-COMPILED_PATH subdir to stay safe under any parallel invocation.
+# NxDI's model builder uses a per-process temp workdir for HLO/NEFF staging.
+# Pin the workdir to avoid collisions between parallel compiles.
 os.environ.setdefault(
     "BASE_COMPILE_WORK_DIR",
     os.path.join("/tmp/nxd_model", os.path.basename(COMPILED_PATH.rstrip("/"))),
@@ -101,15 +82,9 @@ def main():
     print(f"[smoke] MOE_TP={MOE_TP}, MOE_EP={MOE_EP}")
     print(f"[smoke] STAGE={STAGE}")
 
-    print("[smoke] Building MoENeuronConfig (quantized FP8 MoE, blockwise_symmetric)...")
-    # NOTE: ep_degree at the top level controls the OUTER (full model)
-    # expert-parallel factor, which multiplies world_size to
-    # tp_degree * ep_degree and duplicates non-MoE weights per replica.
-    # At world_size > 64 on a 64-NC Trn2, sharded weights grow accordingly
-    # (e.g. tp=64 + ep=4 -> 256 ranks -> 4x the sharded checkpoint size,
-    # and at runtime the model doesn't fit on the device). For MoE-only
-    # EP we want ep_degree=1 at the outer level and the per-MoE split
-    # controlled solely by moe_ep_degree. Keep ep_degree=1 unconditionally.
+    print(
+        "[smoke] Building MoENeuronConfig (quantized FP8 MoE, blockwise_symmetric)..."
+    )
     neuron_config = MoENeuronConfig(
         tp_degree=TP_DEGREE,
         ep_degree=1,
@@ -123,48 +98,34 @@ def main():
         torch_dtype="bfloat16",
         capacity_factor=1.0,
         glu_mlp=True,
+        is_continuous_batching=True,
         moe_ep_degree=MOE_EP,
         moe_tp_degree=MOE_TP,
         context_encoding_buckets=[SEQ_LEN],
         router_config={"act_fn": "sigmoid", "dtype": "float32"},
-        # SDK 2.29 ships only bwmm_shard_on_block / bwmm_shard_on_intermediate;
-        # default routes to _call_shard_hidden_kernel which is missing, so we
-        # take the shard-on-block path via this flag. Matches Flash + Kimi.
         blockwise_matmul_config={
-            "use_shard_on_block_dynamic_while": True,
-            "block_sharding_strategy": "PING_PONG",
+            "use_shard_on_intermediate_dynamic_while": True,
+            "skip_dma_token": True,
         },
-        # Persist sharded FP8 weights to disk so subsequent load()s skip the
-        # ~10-minute shard_checkpoint step (writes weights/tp{0..63}_*.safetensors
-        # on NVMe; NxDI load() reads these directly when present).
         save_sharded_checkpoint=True,
-        # FP8 blockwise for routed experts (Kimi-K2 recipe).
         quantized=True,
         quantized_checkpoints_path=MODEL_PATH,
         quantization_dtype="f8e4m3",
         quantization_type="blockwise_symmetric",
         quantization_block_axis=[1, 2],
         quantization_block_size=[128, 128],
-        # BF16 attention: keep q/k/v_proj in BF16 (not FP8). Pro's q/k/v
-        # abs_mean ~0.00124 is 4x smaller than V2.5 and the NKI blockwise
-        # FP8 accumulator drifts across 70 layers. Preprocess already
-        # emits BF16 for q/k/v (see preprocess_mimo_v2_fp8.py docstring);
-        # this list just tells NxDI to skip FP8 quantization and route
-        # through ColumnParallelLinear instead of QuantizedColumnParallel.
         modules_to_not_convert=[
             "embed_tokens",
             "lm_head",
             "norm",
             "router",
             "o_proj",
-            "q_proj",
-            "k_proj",
-            "v_proj",
         ],
     )
 
     print("[smoke] Building MiMoV2InferenceConfig...")
     from transformers import AutoConfig
+
     hf_config = AutoConfig.from_pretrained(MODEL_PATH, trust_remote_code=True)
     config = MiMoV2InferenceConfig(
         neuron_config, load_config=load_pretrained_config(hf_config=hf_config)
@@ -174,7 +135,9 @@ def main():
     print(f"[smoke] config.n_routed_experts={config.n_routed_experts}")
     print(f"[smoke] config.num_experts_per_tok={config.num_experts_per_tok}")
     print(f"[smoke] config.layer_uses_moe[:5]={config.layer_uses_moe[:5]}")
-    print(f"[smoke] config.layer_attention_types[:5]={config.layer_attention_types[:5]}")
+    print(
+        f"[smoke] config.layer_attention_types[:5]={config.layer_attention_types[:5]}"
+    )
 
     print("[smoke] Instantiating NeuronMiMoV2ForCausalLM (build model-on-cpu)...")
     t0 = time.time()
@@ -200,7 +163,9 @@ def main():
 
     if STAGE in ("load", "all") and not DRY_RUN:
         SKIP_WARMUP = os.environ.get("SKIP_WARMUP", "1") == "1"
-        print(f"[smoke] Loading compiled model from {COMPILED_PATH} (skip_warmup={SKIP_WARMUP})")
+        print(
+            f"[smoke] Loading compiled model from {COMPILED_PATH} (skip_warmup={SKIP_WARMUP})"
+        )
         t0 = time.time()
         model.load(COMPILED_PATH, skip_warmup=SKIP_WARMUP)
         print(f"[smoke] Loaded in {time.time() - t0:.1f}s")
