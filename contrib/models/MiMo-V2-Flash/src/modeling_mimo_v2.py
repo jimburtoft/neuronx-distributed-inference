@@ -81,6 +81,15 @@ from torch_neuronx.xla_impl.ops import nki_jit
 
 _flash_fwd_call = nki_jit()(attention_isa_kernel)
 
+# Import MiMo-specific NKI flash attention for asymmetric head dims (d_qk != d_v)
+try:
+    from nki_flash_attn_mimo import flash_attn_mimo_wrapper
+
+    _MIMO_FLASH_ATTN_AVAILABLE = True
+except ImportError:
+    _MIMO_FLASH_ATTN_AVAILABLE = False
+    logger.info("nki_flash_attn_mimo not available; using PyTorch attention for CTE")
+
 
 def get_rmsnorm_cls():
     """Get appropriate RMSNorm class based on execution environment."""
@@ -266,6 +275,11 @@ class MiMoV2InferenceConfig(InferenceConfig):
         # For moe_tp=64 (BF16 TP mode), the intermediate_per_rank is too small
         # and this path will pad, which is costly but functional.
         # Must be set BEFORE maybe_pad_intermediate() so padding applies.
+        # SDK 2.29: shard_on_intermediate and shard_on_block are mutually
+        # exclusive.  Disable shard_on_block before enabling shard_on_intermediate.
+        self.neuron_config.blockwise_matmul_config.use_shard_on_block_dynamic_while = (
+            False
+        )
         self.neuron_config.blockwise_matmul_config.use_shard_on_intermediate_dynamic_while = True
 
         # Check and pad intermediate size if needed
@@ -662,6 +676,12 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
         else:
             self.attention_sink_bias = None
 
+        # NKI flash attention for CTE: use the MiMo-specific kernel that handles
+        # asymmetric head dims (d_qk=192, d_v=128) with d-tiling. This replaces
+        # the explicit matmul -> softmax -> matmul path and avoids materializing
+        # the full S x S attention matrix in HBM.
+        self.use_nki_flash_attn = _MIMO_FLASH_ATTN_AVAILABLE and not cpu_mode()
+
     def preshard_hook(self, model_state_dict: dict, prefix: str) -> bool:
         """Pre-shard hook to replicate K/V weights for CONVERT_TO_MHA.
 
@@ -954,83 +974,118 @@ class NeuronMiMoV2Attention(NeuronAttentionBase):
             attn_active = torch.matmul(active_weights, value_states)
             attn_output = attn_prior + attn_active
         else:
-            # Context encoding: standard attention
+            # Context encoding: flash attention or standard attention
             # With CP: Q is local [B, H, S/CP, D], K/V are full [B, H, S, D]
             # Without CP: Q/K/V all have same seq_len
-            attn_weights = (
-                torch.matmul(query_states, key_states.transpose(-2, -1)) * self.scaling
+
+            # Decide whether to use NKI flash attention for this layer.
+            # Falls back to PyTorch when:
+            #   - Context parallelism is active (kernel assumes Q/K same seq_len)
+            #   - Layer has attention sink bias (not yet supported in kernel)
+            #   - NKI kernel is not available
+            use_sink = self._use_sink_bias and self.attention_sink_bias is not None
+            can_use_nki = (
+                self.use_nki_flash_attn and not is_context_parallel and not use_sink
             )
 
-            # Apply attention mask (additive mask: 0 = attend, -inf = mask out)
-            # The framework creates boolean masks, so we need to convert them
-            # With CP: attention_mask is already split to [B, 1, S/CP, S] (local Q rows, full K cols)
-            if attention_mask is not None:
-                # Convert boolean mask to additive mask if needed
-                if attention_mask.dtype == torch.bool:
-                    # True = attend (0), False = mask (-inf)
-                    additive_mask = torch.zeros_like(attn_weights)
-                    additive_mask = additive_mask.masked_fill(
-                        ~attention_mask, float("-inf")
-                    )
-                    attn_weights = attn_weights + additive_mask
-                else:
-                    # Already additive mask
-                    attn_weights = attn_weights + attention_mask
+            if can_use_nki:
+                # NKI flash attention: fused QK + softmax + PV in a single kernel.
+                # Handles d_qk > 128 via d-tiling (128 + 64 for d_qk=192).
+                # Avoids materializing the full S x S attention matrix in HBM.
+                attn_output = flash_attn_mimo_wrapper(
+                    query_states,
+                    key_states,
+                    value_states,
+                    scale=self.scaling,
+                    use_causal_mask=True,
+                    sliding_window=self.sliding_window_size or 0,
+                )
 
-            # Apply sliding window mask for SWA layers
-            if self.is_sliding_window and self.sliding_window_size is not None:
-                kv_seq_len = attn_weights.size(-1)
-                if is_context_parallel:
-                    # With CP: Q has local seq len, K has full seq len.
-                    # Use local_position_ids for correct global Q positions.
-                    row_idx = local_position_ids[0].unsqueeze(1).to(attn_weights.device)
-                else:
-                    row_idx = torch.arange(
+            else:
+                # Standard PyTorch attention (used for CP or when NKI kernel unavailable)
+                attn_weights = (
+                    torch.matmul(query_states, key_states.transpose(-2, -1))
+                    * self.scaling
+                )
+
+                # Apply attention mask (additive mask: 0 = attend, -inf = mask out)
+                # The framework creates boolean masks, so we need to convert them
+                # With CP: attention_mask is already split to [B, 1, S/CP, S] (local Q rows, full K cols)
+                if attention_mask is not None:
+                    # Convert boolean mask to additive mask if needed
+                    if attention_mask.dtype == torch.bool:
+                        # True = attend (0), False = mask (-inf)
+                        additive_mask = torch.zeros_like(attn_weights)
+                        additive_mask = additive_mask.masked_fill(
+                            ~attention_mask, float("-inf")
+                        )
+                        attn_weights = attn_weights + additive_mask
+                    else:
+                        # Already additive mask
+                        attn_weights = attn_weights + attention_mask
+
+                # Apply sliding window mask for SWA layers
+                if self.is_sliding_window and self.sliding_window_size is not None:
+                    kv_seq_len = attn_weights.size(-1)
+                    if is_context_parallel:
+                        # With CP: Q has local seq len, K has full seq len.
+                        # Use local_position_ids for correct global Q positions.
+                        row_idx = (
+                            local_position_ids[0].unsqueeze(1).to(attn_weights.device)
+                        )
+                    else:
+                        row_idx = torch.arange(
+                            kv_seq_len, device=attn_weights.device
+                        ).unsqueeze(1)
+                    col_idx = torch.arange(
                         kv_seq_len, device=attn_weights.device
-                    ).unsqueeze(1)
-                col_idx = torch.arange(
-                    kv_seq_len, device=attn_weights.device
-                ).unsqueeze(0)
-                # Causal: col <= row, and within window: col >= row - window_size + 1
-                sliding_mask = (col_idx <= row_idx) & (
-                    col_idx >= row_idx - self.sliding_window_size + 1
+                    ).unsqueeze(0)
+                    # Causal: col <= row, and within window: col >= row - window_size + 1
+                    sliding_mask = (col_idx <= row_idx) & (
+                        col_idx >= row_idx - self.sliding_window_size + 1
+                    )
+                    sliding_mask = sliding_mask[None, None, :, :]
+                    # Convert to additive mask
+                    attn_weights = attn_weights.masked_fill(
+                        ~sliding_mask, float("-inf")
+                    )
+
+                # Add attention sink bias (following HF implementation)
+                # This adds an extra "sink" column to attention weights
+                use_sink = self._use_sink_bias and self.attention_sink_bias is not None
+                if use_sink:
+                    # Get local portion of sink bias for this TP rank
+                    tp_rank = (
+                        parallel_state.get_tensor_model_parallel_rank()
+                        if parallel_state.model_parallel_is_initialized()
+                        else 0
+                    )
+                    local_sink = self.attention_sink_bias[
+                        tp_rank * self.local_num_heads : (tp_rank + 1)
+                        * self.local_num_heads
+                    ]
+                    # Reshape and expand: [local_num_heads] -> [bsz, local_num_heads, q_len, 1]
+                    sink_bias = local_sink.reshape(1, -1, 1, 1).expand(
+                        bsz, -1, q_len, 1
+                    )
+                    attn_weights = torch.cat([attn_weights, sink_bias], dim=-1)
+
+                # Numerical stability: subtract max before softmax (like HF implementation)
+                attn_weights = (
+                    attn_weights - attn_weights.max(dim=-1, keepdim=True).values
                 )
-                sliding_mask = sliding_mask[None, None, :, :]
-                # Convert to additive mask
-                attn_weights = attn_weights.masked_fill(~sliding_mask, float("-inf"))
 
-            # Add attention sink bias (following HF implementation)
-            # This adds an extra "sink" column to attention weights
-            use_sink = self._use_sink_bias and self.attention_sink_bias is not None
-            if use_sink:
-                # Get local portion of sink bias for this TP rank
-                tp_rank = (
-                    parallel_state.get_tensor_model_parallel_rank()
-                    if parallel_state.model_parallel_is_initialized()
-                    else 0
-                )
-                local_sink = self.attention_sink_bias[
-                    tp_rank * self.local_num_heads : (tp_rank + 1)
-                    * self.local_num_heads
-                ]
-                # Reshape and expand: [local_num_heads] -> [bsz, local_num_heads, q_len, 1]
-                sink_bias = local_sink.reshape(1, -1, 1, 1).expand(bsz, -1, q_len, 1)
-                attn_weights = torch.cat([attn_weights, sink_bias], dim=-1)
+                # Softmax
+                attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32)
 
-            # Numerical stability: subtract max before softmax (like HF implementation)
-            attn_weights = attn_weights - attn_weights.max(dim=-1, keepdim=True).values
+                # Drop the sink column after softmax
+                if use_sink:
+                    attn_weights = attn_weights[..., :-1]
 
-            # Softmax
-            attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32)
+                attn_weights = attn_weights.to(value_states.dtype)
 
-            # Drop the sink column after softmax
-            if use_sink:
-                attn_weights = attn_weights[..., :-1]
-
-            attn_weights = attn_weights.to(value_states.dtype)
-
-            # Apply attention to values
-            attn_output = torch.matmul(attn_weights, value_states)
+                # Apply attention to values
+                attn_output = torch.matmul(attn_weights, value_states)
 
         # Reshape and project output
         attn_output = attn_output.transpose(1, 2).contiguous()
