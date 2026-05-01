@@ -54,6 +54,7 @@ from neuronx_distributed.utils import cpu_mode
 
 from neuronx_distributed_inference.models.config import (
     InferenceConfig,
+    MoENeuronConfig,
     NeuronConfig,
 )
 from neuronx_distributed_inference.models.model_base import (
@@ -71,6 +72,8 @@ from neuronx_distributed_inference.modules.attention.gqa import (
     get_shardable_head_counts,
 )
 from neuronx_distributed_inference.modules.custom_calls import CustomRMSNorm
+from neuronx_distributed_inference.modules.moe_v2 import initialize_moe_module
+from neuronx_distributed.modules.moe.routing import RouterTopK
 
 logger = logging.getLogger(__name__)
 
@@ -135,7 +138,9 @@ class LagunaInferenceConfig(InferenceConfig):
         self.rms_norm_eps = kwargs.pop("rms_norm_eps", 1e-6)
         self.tie_word_embeddings = kwargs.pop("tie_word_embeddings", False)
         self.attention_bias = kwargs.pop("attention_bias", False)
-        self.hidden_act = kwargs.pop("hidden_act", "silu")
+        self.hidden_act = (
+            kwargs.pop("hidden_act", "silu") or "silu"
+        )  # HF config has None
         self.sliding_window = kwargs.pop("sliding_window", 512)
 
         # Per-layer attention heads
@@ -165,6 +170,10 @@ class LagunaInferenceConfig(InferenceConfig):
             "moe_apply_router_weight_on_input", False
         )
         self.router_aux_loss_coef = kwargs.pop("router_aux_loss_coef", 0.0)
+
+        # Aliases required by initialize_moe_module()
+        self.num_local_experts = self.num_experts
+        self.n_shared_experts = 1  # Laguna always has 1 shared expert
 
         # RoPE
         self.rope_parameters = kwargs.pop("rope_parameters", None)
@@ -197,6 +206,35 @@ class LagunaInferenceConfig(InferenceConfig):
     def add_derived_config(self):
         self.num_cores_per_group = 1
 
+        # MoE process group config (read by initialize_moe_process_group)
+        tp = (
+            self.neuron_config.tp_degree
+            if hasattr(self, "neuron_config") and self.neuron_config
+            else 4
+        )
+        self.moe_cte_ep_degree = 1
+        self.moe_cte_tp_degree = tp
+        self.moe_tkg_ep_degree = 1
+        self.moe_tkg_tp_degree = tp
+
+        if hasattr(self, "neuron_config") and self.neuron_config is not None:
+            nc = self.neuron_config
+
+            # Laguna uses sigmoid routing (not softmax) with L1 normalization
+            if hasattr(nc, "router_config") and nc.router_config is not None:
+                nc.router_config.act_fn = "sigmoid"
+
+            # GLU MLP for MoE experts (SiLU gating)
+            # MoENeuronConfig sets glu_mlp=True by default, but ensure glu_type
+            nc.glu_type = "glu"
+
+            # MoE TP degree should match overall TP
+            nc.moe_tp_degree = tp
+
+            # Use torch blockwise matmul (NKI shard-hidden kernel not available in SDK 2.29)
+            if hasattr(nc, "blockwise_matmul_config"):
+                nc.blockwise_matmul_config.use_torch_block_wise = True
+
     def get_required_attributes(self) -> List[str]:
         return [
             "hidden_size",
@@ -212,7 +250,7 @@ class LagunaInferenceConfig(InferenceConfig):
 
     @classmethod
     def get_neuron_config_cls(cls) -> Type[NeuronConfig]:
-        return NeuronConfig
+        return MoENeuronConfig
 
     @classmethod
     def from_pretrained(cls, model_path: str, **kwargs) -> "LagunaInferenceConfig":
@@ -355,6 +393,131 @@ class NeuronLagunaMLP(nn.Module):
 
 
 # ====================================================================================
+# MoE (008e + 008f)
+# ====================================================================================
+
+
+class RouterTopKWithBias(RouterTopK):
+    """RouterTopK with expert_bias for Laguna's sigmoid routing.
+
+    Laguna routing: sigmoid(logits) + expert_bias for top-k selection,
+    then L1-normalized sigmoid scores (no bias) as routing weights.
+    Based on Trinity's RouterTopKWithBias.
+    """
+
+    def __init__(self, expert_bias_size, **kwargs):
+        super().__init__(**kwargs)
+        self.register_buffer(
+            "expert_bias",
+            torch.zeros(expert_bias_size, dtype=torch.float32),
+        )
+
+    def forward(self, hidden_states):
+        router_logits = self.get_router_logits(hidden_states)
+        expert_affinities = self.apply_activation_fn(router_logits)
+        expert_affinities = expert_affinities.to(dtype=hidden_states.dtype)
+
+        # Top-k selection with expert_bias added to scores
+        scores_for_selection = expert_affinities.float() + self.expert_bias.float()
+        _, expert_index = torch.topk(scores_for_selection, self.top_k)
+        expert_index = expert_index.detach().to(dtype=torch.long)
+
+        return router_logits, expert_affinities, expert_index
+
+
+def _patch_fused_tkg_for_sigmoid():
+    """Patch MoEFusedTKG kernel to use ISA router fallback for sigmoid routing.
+
+    The fused MoE TKG NKI kernel's router only supports softmax. Laguna uses
+    sigmoid routing. This patch forces use_router_topk_nki_kernel=False to use
+    the ISA router fallback which supports both sigmoid and softmax.
+
+    Must be called before model.compile().
+    """
+    try:
+        import neuronx_distributed.modules.moe.moe_fused_tkg as fused_tkg_mod
+
+        original_kernel = fused_tkg_mod._moe_token_gen_selective_load_kernel_nki_call
+        if original_kernel is None:
+            logger.warning(
+                "Fused TKG selective load kernel not available, skipping patch"
+            )
+            return
+
+        class _PatchedKernelCall:
+            def __init__(self, original):
+                self._original = original
+
+            def __getitem__(self, grid):
+                original_grid_call = self._original[grid]
+
+                def patched_call(*args, **kwargs):
+                    kwargs["use_router_topk_nki_kernel"] = False
+                    return original_grid_call(*args, **kwargs)
+
+                return patched_call
+
+        fused_tkg_mod._moe_token_gen_selective_load_kernel_nki_call = (
+            _PatchedKernelCall(original_kernel)
+        )
+
+        original_all = fused_tkg_mod._moe_tkg_forward_all_experts_nki_call
+        if original_all is not None:
+            fused_tkg_mod._moe_tkg_forward_all_experts_nki_call = _PatchedKernelCall(
+                original_all
+            )
+
+        logger.warning("Patched MoEFusedTKG for sigmoid routing (ISA fallback).")
+    except ImportError:
+        logger.info("moe_fused_tkg module not available, skipping patch")
+    except Exception as e:
+        logger.warning("Failed to patch MoEFusedTKG for sigmoid: %s", e)
+
+
+def initialize_laguna_moe(config: "LagunaInferenceConfig", rmsnorm=None):
+    """Initialize MoE module for Laguna with sigmoid routing and expert bias.
+
+    Creates an MoE module via NxDI's initialize_moe_module, then replaces the
+    default RouterTopK with RouterTopKWithBias for expert_bias support.
+
+    Args:
+        config: LagunaInferenceConfig with MoE fields set for the layer.
+            Must have intermediate_size=moe_intermediate_size (512) before calling.
+        rmsnorm: Optional RMSNorm for fused TKG path.
+    """
+    try:
+        moe = initialize_moe_module(
+            config=config, init_tkg_module=True, rmsnorm=rmsnorm
+        )
+    except (TypeError, Exception) as e:
+        logger.warning("Fused MoE TKG init failed: %s. Falling back.", e)
+        moe = initialize_moe_module(config=config)
+
+    # Replace router with bias-aware version (Trinity pattern)
+    old_router = moe.router
+    new_router = RouterTopKWithBias(
+        expert_bias_size=config.num_local_experts,
+        num_experts=old_router.num_experts,
+        top_k=old_router.top_k,
+        hidden_size=old_router.hidden_size,
+        dtype=old_router.dtype,
+        device=old_router.device,
+        act_fn=old_router.act_fn,
+        sequence_parallel_enabled=old_router.sequence_parallel_enabled,
+        sequence_dimension=old_router.sequence_dimension,
+        bias=old_router.bias,
+        apply_act_fn_over_topk=old_router.apply_act_fn_over_topk,
+        store_transposed_weights=old_router.store_transposed_weights,
+    )
+    new_router.linear_router = old_router.linear_router
+    if hasattr(old_router, "weight_T"):
+        new_router.weight_T = old_router.weight_T
+    moe.router = new_router
+    moe.eval()
+    return moe
+
+
+# ====================================================================================
 # Decoder Layer
 # ====================================================================================
 
@@ -365,8 +528,8 @@ class NeuronLagunaDecoderLayer(nn.Module):
     Laguna uses 2 norms per block (input_layernorm + post_attention_layernorm).
     Structure: LN -> Attn -> LN -> residual -> MLP -> residual
 
-    SCAFFOLD: All dense MLP, no MoE, no gating.
-    Task 008e: Mixed MLP types (dense layer 0, MoE layers 1-39)
+    Layer 0: Dense MLP (intermediate=8192)
+    Layers 1-39: MoE (256 experts, intermediate=512, + shared expert)
     Task 008c: Softplus gating on attention output
     """
 
@@ -374,18 +537,44 @@ class NeuronLagunaDecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
+        self.is_moe_layer = (
+            hasattr(config, "mlp_layer_types")
+            and config.mlp_layer_types[layer_idx] == "sparse"
+        )
 
         self.self_attn = NeuronLagunaAttention(config)
-
-        # SCAFFOLD: All layers use dense MLP.
-        # 008e will add MoE dispatch for layers 1-39.
-        self.mlp = NeuronLagunaMLP(config)
 
         rmsnorm_cls = get_rmsnorm_cls()
         self.input_layernorm = rmsnorm_cls(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = rmsnorm_cls(
             config.hidden_size, eps=config.rms_norm_eps
         )
+
+        if self.is_moe_layer:
+            # MoE layers (1-39): Create config copy with intermediate_size=512
+            moe_config = copy.deepcopy(config)
+            moe_config.intermediate_size = config.moe_intermediate_size  # 512
+            # Disable internal shared expert in MoE module — we handle shared expert
+            # separately so we can apply 2.5x scaling to routed output in 008g:
+            # result = routed_output * 2.5 + shared_output
+            moe_config.n_shared_experts = 0
+            self.mlp = initialize_laguna_moe(moe_config)
+            # For fused TKG: provide a separate RMSNorm for the kernel's internal
+            # normalization. We pass rmsnorm=None to MoE init so CTE doesn't
+            # double-apply the norm (following Trinity pattern).
+            if (
+                hasattr(self.mlp, "moe_fused_tkg")
+                and self.mlp.moe_fused_tkg is not None
+            ):
+                moe_rmsnorm = rmsnorm_cls(config.hidden_size, eps=config.rms_norm_eps)
+                self.mlp.moe_fused_tkg.post_attention_layernorm = moe_rmsnorm
+            # Shared expert (standalone dense MLP with intermediate=512)
+            self.shared_expert = NeuronLagunaMLP(
+                config, intermediate_size=config.shared_expert_intermediate_size
+            )
+        else:
+            # Dense layer (layer 0): standard SwiGLU MLP with intermediate=8192
+            self.mlp = NeuronLagunaMLP(config)
 
     def forward(
         self,
@@ -417,12 +606,24 @@ class NeuronLagunaDecoderLayer(nn.Module):
             **kwargs,
         )
 
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        # Residual connection after attention (matches HF: residual + attn_output)
         hidden_states = residual + hidden_states
 
         # MLP block
         residual = hidden_states
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        if self.is_moe_layer:
+            # MoE: routed experts (no internal shared expert) + separate shared expert.
+            # Laguna formula: result = routed_output * 2.5 + shared_output (008g scaling).
+            # For now (008e/f), use simple sum: routed_output + shared_output.
+            # The MoE rmsnorm was set to post_attention_layernorm, but since we already
+            # applied it above, pass hidden_states directly (MoE norm is a no-op when
+            # hidden_states is already normed; but the fused TKG path expects it).
+            routed_output = self.mlp(hidden_states)[0]  # MoE returns (output, ...)
+            shared_output = self.shared_expert(hidden_states)
+            hidden_states = routed_output + shared_output
+        else:
+            hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
         return (hidden_states, present_key_value, cos_cache, sin_cache, None)
@@ -521,6 +722,11 @@ class NeuronLagunaForCausalLM(NeuronBaseForCausalLM):
 
     _model_cls = NeuronLagunaModel
 
+    def __init__(self, *args, **kwargs):
+        # Patch fused TKG for sigmoid routing before any compilation
+        _patch_fused_tkg_for_sigmoid()
+        super().__init__(*args, **kwargs)
+
     @classmethod
     def get_config_cls(cls):
         return LagunaInferenceConfig
@@ -554,38 +760,48 @@ class NeuronLagunaForCausalLM(NeuronBaseForCausalLM):
         Key transformations:
         1. Strip 'model.' prefix from HF keys
         2. Remap q_norm/k_norm -> q_layernorm/k_layernorm
-        3. Add rank_util tensors for TP
-
-        SCAFFOLD: Basic weight mapping for dense-only model.
-        Task 008a: Handle per-layer variable head counts
-        Task 008c: Map g_proj weights (attention gating)
-        Task 008e: Map dense MLP for layer 0
-        Task 008f: Stack expert weights for MoE layers
+        3. Stack expert weights [256, H, 2*I] for gate_up, [256, I, H] for down
+        4. Remap router and expert_bias keys
+        5. Map shared expert weights
+        6. Add rank_util tensors for TP
         """
         neuron_config = config.neuron_config
         tp_degree = neuron_config.tp_degree
         new_state_dict = {}
         target_dtype = torch.bfloat16
 
-        # SCAFFOLD: Identify layers where the scaffold head count differs from actual.
-        # The scaffold uses num_attention_heads (48) for ALL layers, but layers with
-        # 64 heads (SWA layers) have differently-shaped QKVO weights. Skip those
-        # attention weights to avoid shape mismatches during weight loading.
-        # Task 008a will add per-layer variable heads and load all weights correctly.
+        # Detect whether keys still have 'model.' prefix.
+        # The framework's application_base.get_state_dict() strips 'model.' BEFORE
+        # calling convert_hf_to_neuron_state_dict, so normally keys arrive without it.
+        # But handle both cases for robustness (matches Trinity pattern).
+        has_model_prefix = any(k.startswith("model.") for k in state_dict.keys())
+
+        def strip_prefix(key):
+            if has_model_prefix and key.startswith("model."):
+                return key[6:]
+            return key
+
+        def hf_key(layer_idx, suffix):
+            """Build HF state_dict key for a layer, respecting prefix state."""
+            if has_model_prefix:
+                return f"model.layers.{layer_idx}.{suffix}"
+            return f"layers.{layer_idx}.{suffix}"
+
+        # Identify MoE layers
+        moe_layers = set()
+        if hasattr(config, "mlp_layer_types"):
+            for i, t in enumerate(config.mlp_layer_types):
+                if t == "sparse":
+                    moe_layers.add(i)
+
+        # SCAFFOLD: Identify layers where head count differs from scaffold default.
+        # Task 008a will add per-layer variable heads and remove this.
         scaffold_heads = config.num_attention_heads  # 48
         mismatched_layers = set()
         if hasattr(config, "num_attention_heads_per_layer"):
             for i, h in enumerate(config.num_attention_heads_per_layer):
                 if h != scaffold_heads:
                     mismatched_layers.add(i)
-
-        # Also identify MoE layers: scaffold uses dense MLP for all layers,
-        # so MoE layers' dense MLP weights don't exist in HF checkpoint.
-        moe_layers = set()
-        if hasattr(config, "mlp_layer_types"):
-            for i, t in enumerate(config.mlp_layer_types):
-                if t == "sparse":
-                    moe_layers.add(i)
 
         attn_weight_suffixes = [
             "self_attn.q_proj.weight",
@@ -596,33 +812,22 @@ class NeuronLagunaForCausalLM(NeuronBaseForCausalLM):
             "self_attn.k_norm.weight",
         ]
 
+        # --- Pass 1: Map non-MoE keys ---
         for key, weight in state_dict.items():
-            new_key = key
+            new_key = strip_prefix(key)
 
-            # Strip 'model.' prefix
-            if new_key.startswith("model."):
-                new_key = new_key[6:]
-
-            # SCAFFOLD: Skip MoE keys (experts, router, shared_expert)
-            # 008f will handle expert weight stacking
+            # Skip all MoE-related keys (handled in Pass 2)
             if any(
                 x in new_key
-                for x in [
-                    "mlp.experts.",
-                    "mlp.gate.",
-                    "mlp.shared_expert.",
-                ]
+                for x in ["mlp.experts.", "mlp.gate.", "mlp.shared_expert."]
             ):
                 continue
 
-            # SCAFFOLD: Skip g_proj (attention gating)
-            # 008c will handle g_proj mapping
+            # SCAFFOLD: Skip g_proj (attention gating) — 008c will add
             if "g_proj" in new_key:
                 continue
 
-            # SCAFFOLD: Skip attention weights for layers with mismatched head counts.
-            # These layers have 64 heads in HF but the scaffold uses 48 for all layers.
-            # 008a will load all attention weights correctly with per-layer head counts.
+            # SCAFFOLD: Skip attention weights for mismatched-head layers — 008a will fix
             skip = False
             for i in mismatched_layers:
                 prefix = f"layers.{i}."
@@ -636,27 +841,133 @@ class NeuronLagunaForCausalLM(NeuronBaseForCausalLM):
             if skip:
                 continue
 
-            # SCAFFOLD: Skip dense MLP weights for MoE layers (they don't exist in HF).
-            # The scaffold creates dense MLP modules for all layers but MoE layers
-            # only have expert/shared_expert/router weights in the HF checkpoint.
-            # 008e will add MoE modules and load these correctly.
+            # Skip dense MLP keys for MoE layers (they don't exist in HF)
             for i in moe_layers:
                 prefix = f"layers.{i}.mlp."
-                if new_key.startswith(prefix) and not any(
-                    x in new_key for x in ["experts.", "gate.", "shared_expert."]
-                ):
+                if new_key.startswith(prefix):
                     skip = True
                     break
             if skip:
                 continue
 
-            # Remap QK norm keys: q_norm -> q_layernorm, k_norm -> k_layernorm
+            # Remap QK norm keys
             new_key = new_key.replace(".self_attn.q_norm.", ".self_attn.q_layernorm.")
             new_key = new_key.replace(".self_attn.k_norm.", ".self_attn.k_layernorm.")
 
             new_state_dict[new_key] = weight.detach().clone().to(target_dtype)
 
-        # Add rank_util tensors
+        # --- Pass 2: Stack MoE expert weights per layer ---
+        num_experts = config.num_experts  # 256
+        hidden_size = config.hidden_size  # 2048
+        moe_intermediate = config.moe_intermediate_size  # 512
+
+        for layer_idx in moe_layers:
+            neuron_prefix = f"layers.{layer_idx}"
+
+            # Router: mlp.gate.weight -> mlp.router.linear_router.weight
+            router_key = hf_key(layer_idx, "mlp.gate.weight")
+            if router_key in state_dict:
+                new_state_dict[f"{neuron_prefix}.mlp.router.linear_router.weight"] = (
+                    state_dict[router_key].to(target_dtype)
+                )
+
+            # Expert bias: mlp.experts.e_score_correction_bias -> mlp.router.expert_bias
+            bias_key = hf_key(layer_idx, "mlp.experts.e_score_correction_bias")
+            if bias_key in state_dict:
+                new_state_dict[f"{neuron_prefix}.mlp.router.expert_bias"] = state_dict[
+                    bias_key
+                ].to(torch.float32)
+
+            # Stack expert weights: gate+up -> [num_experts, H, 2*I], down -> [num_experts, I, H]
+            gate_up_proj = torch.empty(
+                num_experts, hidden_size, 2 * moe_intermediate, dtype=target_dtype
+            )
+            down_proj = torch.empty(
+                num_experts, moe_intermediate, hidden_size, dtype=target_dtype
+            )
+
+            all_found = True
+            for e in range(num_experts):
+                gate_k = hf_key(layer_idx, f"mlp.experts.{e}.gate_proj.weight")
+                up_k = hf_key(layer_idx, f"mlp.experts.{e}.up_proj.weight")
+                down_k = hf_key(layer_idx, f"mlp.experts.{e}.down_proj.weight")
+
+                if gate_k in state_dict and up_k in state_dict and down_k in state_dict:
+                    gate_w = state_dict[gate_k].to(target_dtype)  # [I, H]
+                    up_w = state_dict[up_k].to(target_dtype)  # [I, H]
+                    down_w = state_dict[down_k].to(target_dtype)  # [H, I]
+
+                    # Concat gate+up -> [2*I, H], transpose -> [H, 2*I]
+                    gate_up_proj[e] = torch.cat([gate_w, up_w], dim=0).T
+                    # Transpose down -> [I, H]
+                    down_proj[e] = down_w.T
+                else:
+                    all_found = False
+                    logger.warning(
+                        "Missing expert weights for layer %d expert %d", layer_idx, e
+                    )
+                    break
+
+            if all_found:
+                new_state_dict[
+                    f"{neuron_prefix}.mlp.expert_mlps.mlp_op.gate_up_proj.weight"
+                ] = gate_up_proj
+                new_state_dict[
+                    f"{neuron_prefix}.mlp.expert_mlps.mlp_op.down_proj.weight"
+                ] = down_proj
+
+            # Shared expert: mlp.shared_expert.* -> shared_expert.*
+            for proj_name in ["gate_proj", "up_proj", "down_proj"]:
+                se_key = hf_key(layer_idx, f"mlp.shared_expert.{proj_name}.weight")
+                if se_key in state_dict:
+                    new_state_dict[
+                        f"{neuron_prefix}.shared_expert.{proj_name}.weight"
+                    ] = state_dict[se_key].to(target_dtype)
+
+            # Fused MoE TKG aliased weights (Trinity pattern).
+            # The MoEFusedTKG module has a separate RMSNorm that needs the same
+            # weights as the layer's post_attention_layernorm.
+            post_attn_key = f"{neuron_prefix}.post_attention_layernorm.weight"
+            if post_attn_key in new_state_dict:
+                new_state_dict[
+                    f"{neuron_prefix}.mlp.moe_fused_tkg.post_attention_layernorm.weight"
+                ] = new_state_dict[post_attn_key].clone()
+
+            # Router transposed weight for fused TKG kernel.
+            router_w_key = f"{neuron_prefix}.mlp.router.linear_router.weight"
+            if router_w_key in new_state_dict:
+                new_state_dict[f"{neuron_prefix}.mlp.router.weight_T"] = (
+                    new_state_dict[router_w_key].detach().T.clone()
+                )
+
+        # --- Dummy attention weights for mismatched-head layers (scaffold) ---
+        # Task 008a will remove this section.
+        head_dim = config.head_dim  # 128
+        kv_heads = config.num_key_value_heads  # 8
+        q_size = scaffold_heads * head_dim  # 48 * 128 = 6144
+        kv_size = kv_heads * head_dim  # 8 * 128 = 1024
+        for i in mismatched_layers:
+            pfx = f"layers.{i}.self_attn"
+            new_state_dict[f"{pfx}.q_proj.weight"] = torch.zeros(
+                q_size, hidden_size, dtype=target_dtype
+            )
+            new_state_dict[f"{pfx}.k_proj.weight"] = torch.zeros(
+                kv_size, hidden_size, dtype=target_dtype
+            )
+            new_state_dict[f"{pfx}.v_proj.weight"] = torch.zeros(
+                kv_size, hidden_size, dtype=target_dtype
+            )
+            new_state_dict[f"{pfx}.o_proj.weight"] = torch.zeros(
+                hidden_size, q_size, dtype=target_dtype
+            )
+            new_state_dict[f"{pfx}.q_layernorm.weight"] = torch.ones(
+                head_dim, dtype=target_dtype
+            )
+            new_state_dict[f"{pfx}.k_layernorm.weight"] = torch.ones(
+                head_dim, dtype=target_dtype
+            )
+
+        # --- rank_util tensors ---
         new_state_dict["rank_util.rank"] = torch.arange(0, tp_degree, dtype=torch.int32)
         for i in range(config.num_hidden_layers):
             new_state_dict[f"layers.{i}.self_attn.rank_util.rank"] = torch.arange(

@@ -45,9 +45,9 @@ BATCH_SIZE = 1
 
 def load_config():
     """Load Laguna config from model path."""
-    from neuronx_distributed_inference.models.config import NeuronConfig
+    from neuronx_distributed_inference.models.config import MoENeuronConfig
 
-    neuron_config = NeuronConfig(
+    neuron_config = MoENeuronConfig(
         tp_degree=TP_DEGREE,
         batch_size=BATCH_SIZE,
         max_batch_size=BATCH_SIZE,
