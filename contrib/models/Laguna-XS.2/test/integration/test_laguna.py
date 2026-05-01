@@ -150,7 +150,15 @@ def test_generation(model, config):
             position_ids=position_ids,
         )
 
-    token_id = outputs.tokens[0].item()
+    # Without on-device sampling, outputs.logits contains full logits.
+    # CTE returns shape [batch, 1, vocab] (last position only). Extract via argmax.
+    logits = outputs.logits if hasattr(outputs, "logits") else outputs.tokens
+    if logits.dim() == 3:
+        token_id = logits[0, -1, :].argmax().item()
+    elif logits.dim() == 2:
+        token_id = logits[0].argmax().item()
+    else:
+        token_id = logits.argmax().item()
     generated = [token_id]
     cur_pos = prompt_len
 
@@ -171,13 +179,18 @@ def test_generation(model, config):
             position_ids=torch.tensor([[cur_pos]], dtype=torch.long),
         )
         cur_pos += 1
-        token_id = out.tokens[0].item()
+        out_logits = out.logits if hasattr(out, "logits") else out.tokens
+        if out_logits.dim() == 3:
+            token_id = out_logits[0, -1, :].argmax().item()
+        elif out_logits.dim() == 2:
+            token_id = out_logits[0].argmax().item()
+        else:
+            token_id = out_logits.argmax().item()
         generated.append(token_id)
-        if token_id in (
-            tokenizer.eos_token_id
-            if isinstance(tokenizer.eos_token_id, int)
-            else tokenizer.eos_token_id
-        ):
+        eos_ids = tokenizer.eos_token_id
+        if isinstance(eos_ids, int):
+            eos_ids = [eos_ids]
+        if token_id in eos_ids:
             break
 
     text = tokenizer.decode(generated, skip_special_tokens=True)

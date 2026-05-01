@@ -567,6 +567,35 @@ class NeuronLagunaForCausalLM(NeuronBaseForCausalLM):
         new_state_dict = {}
         target_dtype = torch.bfloat16
 
+        # SCAFFOLD: Identify layers where the scaffold head count differs from actual.
+        # The scaffold uses num_attention_heads (48) for ALL layers, but layers with
+        # 64 heads (SWA layers) have differently-shaped QKVO weights. Skip those
+        # attention weights to avoid shape mismatches during weight loading.
+        # Task 008a will add per-layer variable heads and load all weights correctly.
+        scaffold_heads = config.num_attention_heads  # 48
+        mismatched_layers = set()
+        if hasattr(config, "num_attention_heads_per_layer"):
+            for i, h in enumerate(config.num_attention_heads_per_layer):
+                if h != scaffold_heads:
+                    mismatched_layers.add(i)
+
+        # Also identify MoE layers: scaffold uses dense MLP for all layers,
+        # so MoE layers' dense MLP weights don't exist in HF checkpoint.
+        moe_layers = set()
+        if hasattr(config, "mlp_layer_types"):
+            for i, t in enumerate(config.mlp_layer_types):
+                if t == "sparse":
+                    moe_layers.add(i)
+
+        attn_weight_suffixes = [
+            "self_attn.q_proj.weight",
+            "self_attn.k_proj.weight",
+            "self_attn.v_proj.weight",
+            "self_attn.o_proj.weight",
+            "self_attn.q_norm.weight",
+            "self_attn.k_norm.weight",
+        ]
+
         for key, weight in state_dict.items():
             new_key = key
 
@@ -589,6 +618,36 @@ class NeuronLagunaForCausalLM(NeuronBaseForCausalLM):
             # SCAFFOLD: Skip g_proj (attention gating)
             # 008c will handle g_proj mapping
             if "g_proj" in new_key:
+                continue
+
+            # SCAFFOLD: Skip attention weights for layers with mismatched head counts.
+            # These layers have 64 heads in HF but the scaffold uses 48 for all layers.
+            # 008a will load all attention weights correctly with per-layer head counts.
+            skip = False
+            for i in mismatched_layers:
+                prefix = f"layers.{i}."
+                if new_key.startswith(prefix):
+                    for suffix in attn_weight_suffixes:
+                        if new_key.endswith(suffix):
+                            skip = True
+                            break
+                if skip:
+                    break
+            if skip:
+                continue
+
+            # SCAFFOLD: Skip dense MLP weights for MoE layers (they don't exist in HF).
+            # The scaffold creates dense MLP modules for all layers but MoE layers
+            # only have expert/shared_expert/router weights in the HF checkpoint.
+            # 008e will add MoE modules and load these correctly.
+            for i in moe_layers:
+                prefix = f"layers.{i}.mlp."
+                if new_key.startswith(prefix) and not any(
+                    x in new_key for x in ["experts.", "gate.", "shared_expert."]
+                ):
+                    skip = True
+                    break
+            if skip:
                 continue
 
             # Remap QK norm keys: q_norm -> q_layernorm, k_norm -> k_layernorm
