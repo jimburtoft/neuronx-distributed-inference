@@ -268,31 +268,42 @@ class LagunaInferenceConfig(InferenceConfig):
 def get_updated_configs(config: LagunaInferenceConfig):
     """Generate per-layer configs for heterogeneous attention.
 
-    SCAFFOLD: All layers use num_attention_heads (48) for now.
-    Task 008a will add per-layer variable heads (48 vs 64).
-    Task 008b will add mixed SWA/full attention dispatch.
-    Task 008d will add dual RoPE configs per layer.
+    Per-layer variables:
+    - _layer_num_attention_heads: 48 (full_attention) or 64 (sliding_attention)
+    - _layer_is_sliding: True for SWA layers, False for full attention layers
+    - _layer_rope_theta: 500000 (full_attention/YaRN) or 10000 (SWA/default)
+    - _layer_partial_rotary_factor: 0.5 (full_attention) or 1.0 (SWA)
     """
     updated_configs = []
 
     for i in range(config.num_hidden_layers):
         layer_config = copy.deepcopy(config)
 
-        # SCAFFOLD: Use default head count for all layers.
-        # 008a will replace with: config.num_attention_heads_per_layer[i]
-        layer_config._layer_num_attention_heads = config.num_attention_heads
+        # 008a: Per-layer variable attention heads
+        layer_config._layer_num_attention_heads = config.num_attention_heads_per_layer[
+            i
+        ]
 
-        # SCAFFOLD: No SWA distinction yet.
-        # 008b will add: layer_config._layer_is_sliding based on layer_types
-        layer_config._layer_is_sliding = False
+        # 008b: Mixed SWA/full attention dispatch
+        layer_type = config.layer_types[i]
+        layer_config._layer_is_sliding = layer_type == "sliding_attention"
 
-        # SCAFFOLD: Single RoPE config.
-        # 008d will add: per-layer rope_theta, partial_rotary_factor, rope_type
-        rope_params = {}
-        if config.rope_parameters:
-            rope_params = config.rope_parameters.get("sliding_attention", {})
-        layer_config._layer_rope_theta = rope_params.get("rope_theta", 10000.0)
-        layer_config._layer_partial_rotary_factor = 1.0
+        # 008d: Dual RoPE per layer type
+        if layer_type == "sliding_attention":
+            rope_params = {}
+            if config.rope_parameters:
+                rope_params = config.rope_parameters.get("sliding_attention", {})
+            layer_config._layer_rope_theta = rope_params.get("rope_theta", 10000.0)
+            layer_config._layer_partial_rotary_factor = 1.0
+        else:
+            # full_attention: YaRN with partial rotation
+            rope_params = {}
+            if config.rope_parameters:
+                rope_params = config.rope_parameters.get("full_attention", {})
+            layer_config._layer_rope_theta = rope_params.get("rope_theta", 500000.0)
+            layer_config._layer_partial_rotary_factor = rope_params.get(
+                "partial_rotary_factor", config.partial_rotary_factor
+            )
 
         updated_configs.append(layer_config)
 
@@ -305,32 +316,42 @@ def get_updated_configs(config: LagunaInferenceConfig):
 
 
 class NeuronLagunaAttention(NeuronAttentionBase):
-    """Laguna attention with QK norms.
+    """Laguna attention with QK norms, per-layer variable heads, and dual RoPE.
 
-    SCAFFOLD: Basic attention without gating or variable heads.
-    Task 008a: Variable num_attention_heads per layer
-    Task 008c: Softplus gating (g_proj + F.softplus)
-    Task 008d: Partial rotary embedding for full_attention layers
+    Features:
+    - Per-layer variable Q heads (48 for full_attn, 64 for SWA)
+    - QK norms (RMSNorm on head_dim)
+    - Dual RoPE: YaRN (full_attn, theta=500K, partial_rotary=0.5)
+                 Default (SWA, theta=10K, partial_rotary=1.0)
+    - Softplus gating (008c): g_proj + F.softplus on pre-attn hidden_states
     """
 
     def __init__(self, config: LagunaInferenceConfig):
         num_heads = config._layer_num_attention_heads
         rope_theta = config._layer_rope_theta
+        partial_rotary_factor = config._layer_partial_rotary_factor
+
+        # 008d: Compute rotary dimension from partial_rotary_factor
+        rotary_dim = int(config.head_dim * partial_rotary_factor)
+        rotary_dim = rotary_dim - (rotary_dim % 2)  # Ensure even
 
         rotary_emb = RotaryEmbedding(
-            dim=config.head_dim,  # SCAFFOLD: full rotation for all layers
+            dim=rotary_dim,
             max_position_embeddings=config.max_position_embeddings,
             base=rope_theta,
         )
+
+        # Store for partial rotary in apply_rotary_embedding
+        self._rotary_dim = rotary_dim
+        self._head_dim = config.head_dim
 
         # QK norms
         rmsnorm_cls = get_rmsnorm_cls()
         q_norm = rmsnorm_cls(config.head_dim, eps=config.rms_norm_eps)
         k_norm = rmsnorm_cls(config.head_dim, eps=config.rms_norm_eps)
 
-        # SCAFFOLD: Pass sliding_window=None for ALL layers.
-        # This routes all layers through standard_causal_attention_forward.
-        # 008b will add mixed attention dispatch via local_mask.
+        # Pass sliding_window=None for ALL layers (Gemma4 Discovery #27).
+        # SWA behavior is enforced via local_mask at the decoder layer level.
         super().__init__(
             config=config,
             hidden_size=config.hidden_size,
@@ -344,6 +365,310 @@ class NeuronLagunaAttention(NeuronAttentionBase):
             k_layernorm=k_norm,
             sliding_window=None,
         )
+
+        # 008c: Softplus attention gating.
+        # g_proj produces one gate scalar per head (not per dim like Trinity).
+        # ColumnParallelLinear shards output across TP ranks.
+        tp_degree = config.neuron_config.tp_degree
+        heads_per_rank = math.ceil(num_heads / tp_degree)
+        padded_total_heads = heads_per_rank * tp_degree
+        # Output size matches num_heads (padded for TP), each element gates one head
+        self.attn_gate_proj = ColumnParallelLinear(
+            config.hidden_size,
+            padded_total_heads,
+            bias=False,
+            gather_output=False,
+            dtype=config.neuron_config.torch_dtype,
+        )
+
+    def _apply_gated_o_proj(self, attn_output, gate_hidden_states, adapter_ids=None):
+        """Apply softplus per-head gating then o_proj.
+
+        Laguna gating: F.softplus(g_proj(input)) per head, applied before o_proj.
+        Unlike Trinity (sigmoid, per-dim), Laguna's gate is per-HEAD (one scalar per head).
+        """
+        # gate_values: [B, S, num_heads_per_rank]
+        gate_values = F.softplus(self.attn_gate_proj(gate_hidden_states).float())
+        gate_values = gate_values.to(attn_output.dtype)
+
+        # Expand per-head gate to per-dim: [B, S, num_heads_per_rank * head_dim]
+        bsz, q_len, _ = attn_output.shape
+        heads_per_rank = gate_values.shape[-1]
+        # Reshape gate: [B, S, H] -> [B, S, H, 1] -> expand to [B, S, H, D] -> flatten
+        gate_values = gate_values.unsqueeze(-1).expand(
+            bsz, q_len, heads_per_rank, self._head_dim
+        )
+        gate_values = gate_values.reshape(bsz, q_len, heads_per_rank * self._head_dim)
+
+        attn_output = attn_output * gate_values
+        return self.get_o_proj()(attn_output, adapter_ids=adapter_ids)
+
+    def standard_causal_attention_forward(
+        self,
+        hidden_states,
+        attention_mask=None,
+        position_ids=None,
+        past_key_value=None,
+        active_mask=None,
+        adapter_ids=None,
+        cos_cache=None,
+        sin_cache=None,
+        rmsnorm=None,
+        rotary_position_ids=None,
+        kv_mgr=None,
+        get_kv_per_layer=False,
+        update_kv_per_layer=False,
+        residual=None,
+        windowed_context_encoding_window_idx=-1,
+        **kwargs,
+    ):
+        """Override base class to insert softplus gating before o_proj.
+
+        Based on Trinity's override pattern. The only change from base class
+        is replacing `self.get_o_proj()(attn_output)` with
+        `self._apply_gated_o_proj(attn_output, gate_hidden_states)`.
+        """
+        from neuronx_distributed_inference.modules.attention.attention_base import (
+            NeuronAttentionBaseOutput,
+        )
+
+        use_polar_compatible_rope = kwargs.get("use_polar_compatible_rope", False)
+
+        # Save original hidden_states for gate computation BEFORE dtype conversion
+        gate_hidden_states = hidden_states
+
+        original_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(self.torch_dtype)
+        seq_ids = kwargs.get("seq_ids")
+        is_context_parallel = past_key_value is None and self.cp_degree > 1
+        is_data_parallel = past_key_value is not None and self.dp_degree > 1
+
+        if is_context_parallel:
+            attention_mask, hidden_states, position_ids, cos_cache, sin_cache = (
+                self._split_inputs_for_context_parallel(
+                    attention_mask, hidden_states, position_ids, cos_cache, sin_cache
+                )
+            )
+
+        if is_data_parallel:
+            from neuronx_distributed_inference.modules.attention.attention_base import (
+                get_dp_rank,
+                split_along_dim,
+                get_data_parallel_attention_dp_group,
+                gather_from_tensor_model_parallel_region_with_dim,
+            )
+
+            dp_rank = get_dp_rank(
+                self.rank_util.get_rank(),
+                self.tp_degree,
+                self.dp_degree,
+                self.neuron_config.switch_cc,
+            )
+            hidden_states = split_along_dim(
+                hidden_states, dim=0, rank=dp_rank, num_partitions=self.dp_degree
+            )
+            attention_mask = split_along_dim(
+                attention_mask, dim=0, rank=dp_rank, num_partitions=self.dp_degree
+            )
+            position_ids = split_along_dim(
+                position_ids, dim=0, rank=dp_rank, num_partitions=self.dp_degree
+            )
+
+        bsz, q_len, _ = hidden_states.size()
+        if self.sequence_parallel_enabled:
+            q_len *= self.tensor_model_parallel_group.size()
+
+        if rotary_position_ids is None:
+            rotary_position_ids = position_ids
+
+        if get_kv_per_layer:
+            assert kv_mgr is not None
+            past_key_value = kv_mgr.get_kv_by_layer_id(**kwargs)
+
+        is_token_gen = past_key_value is not None
+        if windowed_context_encoding_window_idx >= 0:
+            is_token_gen = False
+        if self.neuron_config.is_prefix_caching:
+            is_token_gen = is_token_gen and q_len < 128
+
+        # NKI kernel paths -- delegate to base (gating not fused in NKI kernels)
+        if self.attn_block_tkg_nki_kernel_enabled and is_token_gen:
+            return super().standard_causal_attention_forward(
+                gate_hidden_states.to(self.torch_dtype)
+                if is_context_parallel or is_data_parallel
+                else gate_hidden_states,
+                attention_mask,
+                position_ids,
+                past_key_value,
+                active_mask,
+                adapter_ids,
+                cos_cache,
+                sin_cache,
+                rmsnorm,
+                rotary_position_ids,
+                kv_mgr,
+                get_kv_per_layer,
+                update_kv_per_layer,
+                residual,
+                windowed_context_encoding_window_idx,
+                **kwargs,
+            )
+
+        if (
+            getattr(self.neuron_config, "attn_block_cte_nki_kernel_enabled", False)
+            and not is_token_gen
+            and not self.neuron_config.is_prefix_caching
+        ):
+            return super().standard_causal_attention_forward(
+                gate_hidden_states.to(self.torch_dtype)
+                if is_context_parallel or is_data_parallel
+                else gate_hidden_states,
+                attention_mask,
+                position_ids,
+                past_key_value,
+                active_mask,
+                adapter_ids,
+                cos_cache,
+                sin_cache,
+                rmsnorm,
+                rotary_position_ids,
+                kv_mgr,
+                get_kv_per_layer,
+                update_kv_per_layer,
+                residual,
+                windowed_context_encoding_window_idx,
+                **kwargs,
+            )
+
+        tkg_attn_kernel_fused_rope = is_token_gen and getattr(
+            self.neuron_config, "attn_tkg_builtin_kernel_enabled", False
+        )
+
+        Q, K, V, cos_cache, sin_cache, residual = self.prep_qkv_tensors(
+            rotary_position_ids,
+            hidden_states,
+            past_key_value,
+            adapter_ids=adapter_ids,
+            cos_cache=cos_cache,
+            sin_cache=sin_cache,
+            rmsnorm=rmsnorm,
+            skip_rope=tkg_attn_kernel_fused_rope,
+            residual=residual,
+            use_polar_compatible_rope=use_polar_compatible_rope,
+        )
+
+        if is_token_gen:
+            if tkg_attn_kernel_fused_rope:
+                attn_output, K = self.attention_tokengen_kernel_builtin(
+                    Q,
+                    K,
+                    V,
+                    position_ids,
+                    past_key_value,
+                    attention_mask,
+                    active_mask,
+                    rotary_position_ids,
+                )
+            else:
+                attn_output = self.attention_tokengen(
+                    Q,
+                    K,
+                    V,
+                    attention_mask,
+                    position_ids,
+                    past_key_value,
+                    active_mask,
+                    **kwargs,
+                )
+            attn_output = attn_output.transpose(1, 2).contiguous()
+        else:
+            attn_output, K, V = self.attention_context_encode(
+                Q, K, V, q_len, bsz, attention_mask, past_key_value, active_mask
+            )
+
+        # merge multi head hidden
+        attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim)
+
+        # *** GATED ATTENTION: apply softplus gate BEFORE o_proj ***
+        attn_output = self._apply_gated_o_proj(
+            attn_output, gate_hidden_states, adapter_ids=adapter_ids
+        )
+
+        if self.k_cache_transposed:
+            K = K.permute(0, 1, 3, 2)
+
+        kv = (K, V)
+        if update_kv_per_layer:
+            assert kv_mgr is not None
+            kv = kv_mgr.update_kv_by_layer_id(
+                kv_per_layer=kv,
+                position_ids=position_ids,
+                **kwargs,
+            )
+
+        if is_context_parallel and not self.sequence_parallel_enabled:
+            from neuronx_distributed_inference.modules.attention.attention_base import (
+                gather_from_tensor_model_parallel_region_with_dim,
+                get_context_parallel_attention_cp_group,
+            )
+
+            attn_output = gather_from_tensor_model_parallel_region_with_dim(
+                attn_output,
+                gather_dim=1,
+                process_group=get_context_parallel_attention_cp_group(),
+            )
+
+        if is_data_parallel:
+            from neuronx_distributed_inference.modules.attention.attention_base import (
+                gather_from_tensor_model_parallel_region_with_dim,
+                get_data_parallel_attention_dp_group,
+            )
+
+            attn_output = gather_from_tensor_model_parallel_region_with_dim(
+                attn_output,
+                gather_dim=0,
+                process_group=get_data_parallel_attention_dp_group(),
+            )
+
+        attn_output = attn_output.to(original_dtype)
+        return NeuronAttentionBaseOutput(
+            attn_output, kv, cos_cache, sin_cache, residual
+        )
+
+    def apply_rotary_embedding(
+        self, Q, K, V, position_ids, cos_cache, sin_cache, use_polar_compatible_rope
+    ):
+        """Apply rotary embedding with support for partial rotation.
+
+        Full rotation (SWA, partial_rotary_factor=1.0): standard path.
+        Partial rotation (full_attn, partial_rotary_factor=0.5):
+          split Q/K at rotary_dim, rotate first part, concat.
+        """
+        from neuronx_distributed_inference.modules.attention.utils import (
+            apply_rotary_pos_emb,
+        )
+
+        if self.rotary_emb is not None:
+            if cos_cache is None or sin_cache is None:
+                cos_cache, sin_cache = self.rotary_emb(V, position_ids)
+
+            if self._rotary_dim == self._head_dim:
+                # Full rotation (SWA layers)
+                Q, K = apply_rotary_pos_emb(Q, K, cos_cache, sin_cache)
+            else:
+                # Partial rotation (full_attention layers)
+                # Q, K are [batch, num_heads, seq, head_dim]
+                q_rot = Q[..., : self._rotary_dim]
+                q_pass = Q[..., self._rotary_dim :]
+                k_rot = K[..., : self._rotary_dim]
+                k_pass = K[..., self._rotary_dim :]
+
+                q_rot, k_rot = apply_rotary_pos_emb(q_rot, k_rot, cos_cache, sin_cache)
+
+                Q = torch.cat([q_rot, q_pass], dim=-1)
+                K = torch.cat([k_rot, k_pass], dim=-1)
+
+        return Q, K, cos_cache, sin_cache
 
 
 # ====================================================================================
@@ -526,11 +851,10 @@ class NeuronLagunaDecoderLayer(nn.Module):
     """Laguna decoder layer with pre/post norms for attention and MLP.
 
     Laguna uses 2 norms per block (input_layernorm + post_attention_layernorm).
-    Structure: LN -> Attn -> LN -> residual -> MLP -> residual
+    Structure: LN -> Attn -> residual -> LN -> MLP -> residual
 
     Layer 0: Dense MLP (intermediate=8192)
-    Layers 1-39: MoE (256 experts, intermediate=512, + shared expert)
-    Task 008c: Softplus gating on attention output
+    Layers 1-39: MoE (256 experts, intermediate=512, + shared expert with 2.5x scaling)
     """
 
     def __init__(self, config: LagunaInferenceConfig, layer_idx: int):
@@ -540,6 +864,12 @@ class NeuronLagunaDecoderLayer(nn.Module):
         self.is_moe_layer = (
             hasattr(config, "mlp_layer_types")
             and config.mlp_layer_types[layer_idx] == "sparse"
+        )
+        # 008b: Mixed SWA/full attention dispatch
+        self.is_sliding_window_attention = getattr(config, "_layer_is_sliding", False)
+        # 008g: MoE routed output scaling factor
+        self.moe_routed_scaling_factor = getattr(
+            config, "moe_routed_scaling_factor", 2.5
         )
 
         self.self_attn = NeuronLagunaAttention(config)
@@ -584,23 +914,27 @@ class NeuronLagunaDecoderLayer(nn.Module):
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         **kwargs,
     ) -> Tuple[torch.FloatTensor, ...]:
-        # SCAFFOLD: Force recomputation of cos/sin per layer.
-        # Required when dual RoPE is added (008d).
+        # 008d: Force recomputation of cos/sin per layer (heterogeneous RoPE).
         kwargs.pop("cos_cache", None)
         kwargs.pop("sin_cache", None)
 
-        # SCAFFOLD: No mask selection yet.
-        # 008b will add: local_mask for SWA layers, attention_mask for full layers.
-        kwargs.pop("local_mask", None)
+        # 008b: Select mask — SWA layers use local_mask, full layers use attention_mask.
+        local_mask = kwargs.pop("local_mask", None)
+        mask = (
+            local_mask
+            if (self.is_sliding_window_attention and local_mask is not None)
+            else attention_mask
+        )
 
         # Attention block
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
-        # SCAFFOLD: No gating. 008c will add softplus gating here.
+        # 008c: Softplus gating is applied inside NeuronLagunaAttention.standard_causal_attention_forward
+        # (gate_hidden_states = hidden_states before dtype conversion, gating before o_proj)
         hidden_states, present_key_value, cos_cache, sin_cache = self.self_attn(
             hidden_states=hidden_states,
-            attention_mask=attention_mask,
+            attention_mask=mask,
             position_ids=position_ids,
             past_key_value=past_key_value,
             **kwargs,
@@ -613,15 +947,13 @@ class NeuronLagunaDecoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         if self.is_moe_layer:
-            # MoE: routed experts (no internal shared expert) + separate shared expert.
-            # Laguna formula: result = routed_output * 2.5 + shared_output (008g scaling).
-            # For now (008e/f), use simple sum: routed_output + shared_output.
-            # The MoE rmsnorm was set to post_attention_layernorm, but since we already
-            # applied it above, pass hidden_states directly (MoE norm is a no-op when
-            # hidden_states is already normed; but the fused TKG path expects it).
+            # MoE: routed experts + separate shared expert.
+            # 008g: Laguna formula: result = routed_output * 2.5 + shared_output
             routed_output = self.mlp(hidden_states)[0]  # MoE returns (output, ...)
             shared_output = self.shared_expert(hidden_states)
-            hidden_states = routed_output + shared_output
+            hidden_states = (
+                routed_output * self.moe_routed_scaling_factor + shared_output
+            )
         else:
             hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
@@ -683,6 +1015,23 @@ class NeuronLagunaModel(NeuronBaseModel):
             dtype=config.neuron_config.torch_dtype,
         )
 
+        # 008b: Mixed SWA/full attention — set flags for base model dual-mask flow.
+        # has_mixed_attn=True tells base model to create both global and local masks.
+        # sliding_window enables local windowed mask creation.
+        self.has_mixed_attn = True
+        self.sliding_window = config.sliding_window
+
+        # Per-layer cache size mapping: all layers get the same cache sequence length
+        # (max of sliding_window and max_length) because the KV cache sequence
+        # dimension must match the attention mask dimension. SWA behavior is enforced
+        # purely through the local_mask, not through smaller cache allocations.
+        max_length = config.neuron_config.max_length
+        sw = config.sliding_window or max_length
+        uniform_cache_len = max(sw, max_length)
+        self.layer_to_cache_size_mapping = [
+            uniform_cache_len
+        ] * config.num_hidden_layers
+
     def init_inference_optimization(self, config: LagunaInferenceConfig):
         """Initialize KV cache and optional on-device sampling."""
         if self.on_device_sampling:
@@ -696,16 +1045,18 @@ class NeuronLagunaModel(NeuronBaseModel):
                 )
             self.sampler = Sampler(config.neuron_config)
 
-        # SCAFFOLD: Standard KV cache (uniform shape for all layers).
-        # 008b will add per-layer cache sizing (SWA=512, full=max_length).
         from neuronx_distributed_inference.modules.kvcache.kv_cache_manager import (
             KVCacheManager,
         )
 
+        # 008b: Use layer_to_cache_size_mapping for mixed attention.
+        # Laguna KV heads (8) and head_dim (128) are constant across all layers,
+        # so standard KVCacheManager suffices (no custom per-layer shapes needed).
         self.kv_mgr = KVCacheManager(
             config,
             num_kv_head=self.num_key_value_heads,
             global_rank=self.rank_util,
+            layer_to_cache_size_mapping=self.layer_to_cache_size_mapping,
         )
 
 
@@ -794,24 +1145,6 @@ class NeuronLagunaForCausalLM(NeuronBaseForCausalLM):
                 if t == "sparse":
                     moe_layers.add(i)
 
-        # SCAFFOLD: Identify layers where head count differs from scaffold default.
-        # Task 008a will add per-layer variable heads and remove this.
-        scaffold_heads = config.num_attention_heads  # 48
-        mismatched_layers = set()
-        if hasattr(config, "num_attention_heads_per_layer"):
-            for i, h in enumerate(config.num_attention_heads_per_layer):
-                if h != scaffold_heads:
-                    mismatched_layers.add(i)
-
-        attn_weight_suffixes = [
-            "self_attn.q_proj.weight",
-            "self_attn.k_proj.weight",
-            "self_attn.v_proj.weight",
-            "self_attn.o_proj.weight",
-            "self_attn.q_norm.weight",
-            "self_attn.k_norm.weight",
-        ]
-
         # --- Pass 1: Map non-MoE keys ---
         for key, weight in state_dict.items():
             new_key = strip_prefix(key)
@@ -823,25 +1156,8 @@ class NeuronLagunaForCausalLM(NeuronBaseForCausalLM):
             ):
                 continue
 
-            # SCAFFOLD: Skip g_proj (attention gating) — 008c will add
-            if "g_proj" in new_key:
-                continue
-
-            # SCAFFOLD: Skip attention weights for mismatched-head layers — 008a will fix
-            skip = False
-            for i in mismatched_layers:
-                prefix = f"layers.{i}."
-                if new_key.startswith(prefix):
-                    for suffix in attn_weight_suffixes:
-                        if new_key.endswith(suffix):
-                            skip = True
-                            break
-                if skip:
-                    break
-            if skip:
-                continue
-
             # Skip dense MLP keys for MoE layers (they don't exist in HF)
+            skip = False
             for i in moe_layers:
                 prefix = f"layers.{i}.mlp."
                 if new_key.startswith(prefix):
@@ -853,6 +1169,11 @@ class NeuronLagunaForCausalLM(NeuronBaseForCausalLM):
             # Remap QK norm keys
             new_key = new_key.replace(".self_attn.q_norm.", ".self_attn.q_layernorm.")
             new_key = new_key.replace(".self_attn.k_norm.", ".self_attn.k_layernorm.")
+
+            # 008c: Remap g_proj -> attn_gate_proj (attention gating)
+            new_key = new_key.replace(
+                ".self_attn.g_proj.", ".self_attn.attn_gate_proj."
+            )
 
             new_state_dict[new_key] = weight.detach().clone().to(target_dtype)
 
@@ -939,33 +1260,6 @@ class NeuronLagunaForCausalLM(NeuronBaseForCausalLM):
                 new_state_dict[f"{neuron_prefix}.mlp.router.weight_T"] = (
                     new_state_dict[router_w_key].detach().T.clone()
                 )
-
-        # --- Dummy attention weights for mismatched-head layers (scaffold) ---
-        # Task 008a will remove this section.
-        head_dim = config.head_dim  # 128
-        kv_heads = config.num_key_value_heads  # 8
-        q_size = scaffold_heads * head_dim  # 48 * 128 = 6144
-        kv_size = kv_heads * head_dim  # 8 * 128 = 1024
-        for i in mismatched_layers:
-            pfx = f"layers.{i}.self_attn"
-            new_state_dict[f"{pfx}.q_proj.weight"] = torch.zeros(
-                q_size, hidden_size, dtype=target_dtype
-            )
-            new_state_dict[f"{pfx}.k_proj.weight"] = torch.zeros(
-                kv_size, hidden_size, dtype=target_dtype
-            )
-            new_state_dict[f"{pfx}.v_proj.weight"] = torch.zeros(
-                kv_size, hidden_size, dtype=target_dtype
-            )
-            new_state_dict[f"{pfx}.o_proj.weight"] = torch.zeros(
-                hidden_size, q_size, dtype=target_dtype
-            )
-            new_state_dict[f"{pfx}.q_layernorm.weight"] = torch.ones(
-                head_dim, dtype=target_dtype
-            )
-            new_state_dict[f"{pfx}.k_layernorm.weight"] = torch.ones(
-                head_dim, dtype=target_dtype
-            )
 
         # --- rank_util tensors ---
         new_state_dict["rank_util.rank"] = torch.arange(0, tp_degree, dtype=torch.int32)
