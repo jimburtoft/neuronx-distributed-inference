@@ -892,10 +892,12 @@ class NeuronLagunaDecoderLayer(nn.Module):
             # For fused TKG: provide a separate RMSNorm for the kernel's internal
             # normalization. We pass rmsnorm=None to MoE init so CTE doesn't
             # double-apply the norm (following Trinity pattern).
-            if (
-                hasattr(self.mlp, "moe_fused_tkg")
-                and self.mlp.moe_fused_tkg is not None
-            ):
+            # Store as a plain attribute (not nn.Module) to avoid duplicating
+            # the module in state_dict. The actual module lives under self.mlp.
+            self._has_moe_fused_tkg = (
+                getattr(self.mlp, "moe_fused_tkg", None) is not None
+            )
+            if self._has_moe_fused_tkg:
                 moe_rmsnorm = rmsnorm_cls(config.hidden_size, eps=config.rms_norm_eps)
                 self.mlp.moe_fused_tkg.post_attention_layernorm = moe_rmsnorm
             # Shared expert (standalone dense MLP with intermediate=512)
@@ -905,6 +907,7 @@ class NeuronLagunaDecoderLayer(nn.Module):
         else:
             # Dense layer (layer 0): standard SwiGLU MLP with intermediate=8192
             self.mlp = NeuronLagunaMLP(config)
+            self._has_moe_fused_tkg = False
 
     def forward(
         self,
@@ -945,12 +948,30 @@ class NeuronLagunaDecoderLayer(nn.Module):
 
         # MLP block
         residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+
+        # Normalization strategy for fused MoE TKG (Trinity pattern):
+        # - CTE (seq_len > 1): Decoder applies post_attention_layernorm.
+        #   MoE's _forward_compute_bound skips norm (rmsnorm=None at init).
+        # - TKG (seq_len == 1): Decoder skips post_attention_layernorm.
+        #   MoEFusedTKG applies norm internally using its own RMSNorm.
+        # For dense layers (layer 0) or when fused TKG is not enabled,
+        # decoder always applies norm.
+        is_tkg = self._has_moe_fused_tkg and hidden_states.shape[1] == 1
+        if not is_tkg:
+            hidden_states = self.post_attention_layernorm(hidden_states)
+
         if self.is_moe_layer:
             # MoE: routed experts + separate shared expert.
             # 008g: Laguna formula: result = routed_output * 2.5 + shared_output
             routed_output = self.mlp(hidden_states)[0]  # MoE returns (output, ...)
-            shared_output = self.shared_expert(hidden_states)
+            # In TKG mode, hidden_states is un-normed (fused kernel handles norm
+            # internally). Shared expert needs normed input.
+            shared_input = (
+                self.post_attention_layernorm(hidden_states)
+                if is_tkg
+                else hidden_states
+            )
+            shared_output = self.shared_expert(shared_input)
             hidden_states = (
                 routed_output * self.moe_routed_scaling_factor + shared_output
             )
