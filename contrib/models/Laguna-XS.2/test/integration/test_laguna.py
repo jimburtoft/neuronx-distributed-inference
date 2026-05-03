@@ -55,7 +55,6 @@ def load_config():
         on_device_sampling_config=None,
         torch_dtype=torch.bfloat16,
         fused_qkv=False,
-        attn_kernel_enabled=False,
     )
 
     config = LagunaInferenceConfig.from_pretrained(

@@ -235,6 +235,18 @@ class LagunaInferenceConfig(InferenceConfig):
             if hasattr(nc, "blockwise_matmul_config"):
                 nc.blockwise_matmul_config.use_torch_block_wise = True
 
+            # Enable MoE fused TKG NKI kernel for token generation speedup.
+            # Constraints verified (Task 012): intermediate/TP=128 (%128==0),
+            # GLU+SiLU supported, sigmoid routing natively supported in SDK 2.29.
+            nc.moe_fused_nki_kernel_enabled = True
+
+            # CTE attention NKI kernel (flash attention) - disabled for now.
+            # head_dim=128 within kernel limits, but TKG fails with mask size
+            # mismatch (512 vs 4096) in SWA layers when enabled. Needs further
+            # investigation of base class compute_for_token_gen interaction
+            # with mixed SWA/full attention.
+            # nc.attn_kernel_enabled = True  # TODO: investigate TKG mask issue
+
     def get_required_attributes(self) -> List[str]:
         return [
             "hidden_size",
@@ -750,55 +762,6 @@ class RouterTopKWithBias(RouterTopK):
         return router_logits, expert_affinities, expert_index
 
 
-def _patch_fused_tkg_for_sigmoid():
-    """Patch MoEFusedTKG kernel to use ISA router fallback for sigmoid routing.
-
-    The fused MoE TKG NKI kernel's router only supports softmax. Laguna uses
-    sigmoid routing. This patch forces use_router_topk_nki_kernel=False to use
-    the ISA router fallback which supports both sigmoid and softmax.
-
-    Must be called before model.compile().
-    """
-    try:
-        import neuronx_distributed.modules.moe.moe_fused_tkg as fused_tkg_mod
-
-        original_kernel = fused_tkg_mod._moe_token_gen_selective_load_kernel_nki_call
-        if original_kernel is None:
-            logger.warning(
-                "Fused TKG selective load kernel not available, skipping patch"
-            )
-            return
-
-        class _PatchedKernelCall:
-            def __init__(self, original):
-                self._original = original
-
-            def __getitem__(self, grid):
-                original_grid_call = self._original[grid]
-
-                def patched_call(*args, **kwargs):
-                    kwargs["use_router_topk_nki_kernel"] = False
-                    return original_grid_call(*args, **kwargs)
-
-                return patched_call
-
-        fused_tkg_mod._moe_token_gen_selective_load_kernel_nki_call = (
-            _PatchedKernelCall(original_kernel)
-        )
-
-        original_all = fused_tkg_mod._moe_tkg_forward_all_experts_nki_call
-        if original_all is not None:
-            fused_tkg_mod._moe_tkg_forward_all_experts_nki_call = _PatchedKernelCall(
-                original_all
-            )
-
-        logger.warning("Patched MoEFusedTKG for sigmoid routing (ISA fallback).")
-    except ImportError:
-        logger.info("moe_fused_tkg module not available, skipping patch")
-    except Exception as e:
-        logger.warning("Failed to patch MoEFusedTKG for sigmoid: %s", e)
-
-
 def initialize_laguna_moe(config: "LagunaInferenceConfig", rmsnorm=None):
     """Initialize MoE module for Laguna with sigmoid routing and expert bias.
 
@@ -1095,8 +1058,8 @@ class NeuronLagunaForCausalLM(NeuronBaseForCausalLM):
     _model_cls = NeuronLagunaModel
 
     def __init__(self, *args, **kwargs):
-        # Patch fused TKG for sigmoid routing before any compilation
-        _patch_fused_tkg_for_sigmoid()
+        # SDK 2.29: sigmoid routing is natively supported by the fused MoE TKG
+        # NKI kernel (RouterActFnType.SIGMOID). No monkey-patching needed.
         super().__init__(*args, **kwargs)
 
     @classmethod
