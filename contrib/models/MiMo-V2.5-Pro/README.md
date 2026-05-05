@@ -41,7 +41,7 @@ Key features:
 
 | Recipe | SDK | seq_len | Attention | MoE | Output Quality | HBM Fit |
 |--------|-----|---------|-----------|-----|---------------|---------|
-| **Full FP8** (new) | 2.28 | 1024 | FP8 | FP8 | Coherent | Fits on trn2.48xlarge |
+| **Full FP8** (new) | 2.28 | 1024 | FP8 | FP8 | Coherent (tested 9-960 tok prompts) | Fits on trn2.48xlarge |
 | BF16-attn + FP8 MoE | 2.29 | 256 | BF16 | FP8 | Coherent | Tight (seq_len=1024 OOMs) |
 
 ### Full FP8 Recipe (SDK 2.28, recommended)
@@ -85,6 +85,7 @@ This recipe remains useful when SDK 2.29 features are needed (e.g., NxDI 0.9.x, 
 - **`use_torch_block_wise=True` on SDK 2.29**: compile+shard succeeded after ~2 h, but `model.load()` crashed with `status=4 Allocation Failure` — the explicit torch fallback path raises HBM demand even when scoped to MoE.
 - **`XLA_HANDLE_SPECIAL_SCALAR=1` + `UNSAFE_FP8FNCAST=1`**: These XLA env vars from Llama-405B FP8 recipes degrade Pro's output quality significantly when the torch blockwise fallback path is active. Most prompts produce garbage. Do not use with the full FP8 recipe.
 - **`ctx_batch_size=4`**: Reduces TTFT from 27.5s to 14.1s (12 CTE calls instead of 48), but output degrades — the KV cache `fill_prefix` path overwrites the same slots. With `is_continuous_batching=True`, the `update_cache_const_indices` path asserts `seq_ids.shape[0] == 1`, limiting CTE to `ctx_batch_size=1`.
+- **`seq_len=2048`**: Compile-time OOM. TKG NEFF needs 25 GB vs 24 GB available per core (LNC=2). The KV cache doubles from 4.4 GB to 8.8 GB at BS=48, exceeding the per-core budget. BS=48 is mandatory (`384 experts / top_k=8 = 48` EP constraint), so no single-instance configuration can reach seq_len=2048.
 
 ### Next experiments queued
 
@@ -424,6 +425,47 @@ Measured with `bench_simple.py`, 3 timed runs per test + warmup. Greedy decoding
 | Weight loading (presharded) | ~73s |
 | Model warmup | ~7s |
 
+### Long Prompt Testing (Full FP8, SDK 2.28, seq_len=1024)
+
+Tested prompt lengths from 128 to 960 tokens with BS=48, 50 generation tokens, greedy decoding. Both uniform prompts and diverse prompts (verifying per-sequence KV cache correctness via CB).
+
+| Prompt Length | Total Time | Est. TTFT | Output Quality | Diverse KV Correct |
+|--------------|-----------|-----------|----------------|-------------------|
+| 128 tokens | 39.93s | 29.1s | Coherent | — |
+| 256 tokens | 39.96s | 29.2s | Coherent | — |
+| 512 tokens | 39.86s | 29.1s | Coherent | Yes |
+| 768 tokens | 39.67s | 28.9s | Coherent | — |
+| 900 tokens | 39.75s | 29.0s | Coherent | Yes |
+| 960 tokens | 39.73s | 28.9s | Coherent | — |
+
+Key findings:
+- **Output quality is coherent at all prompt lengths** up to 960 tokens (14 tokens before the seq_len=1024 limit).
+- **TTFT is constant (~29s) regardless of prompt length** because CTE always processes the full 1024-token bucket (`context_encoding_buckets=[1024]` pads all prompts to 1024).
+- **Diverse prompts produce correct per-topic output** at 512 and 900 token lengths, confirming the CB KV cache fix works correctly at long context.
+
+### Maximum Sequence Length: 1024 (Hard Limit)
+
+`seq_len=2048` fails at compile time with OOM:
+
+> Needed 27,282,735,864 bytes (25 GB) vs. available 25,769,803,776 bytes (24 GB)
+
+**HBM breakdown per rank** (TP=64, MOE_EP=64, LNC=2 → 24 GB/core):
+
+| Component | seq_len=1024 | seq_len=2048 |
+|-----------|-------------|-------------|
+| Model weights (6 experts/rank + attention + embeddings) | ~17.2 GB | ~17.2 GB |
+| FP8 scales | ~1.4 GB | ~1.4 GB |
+| KV cache (BS=48) | ~4.4 GB | ~8.8 GB |
+| Scratch/activations | ~1.5 GB | ~1.5 GB |
+| **Total** | **~24.5 GB** | **~28.9 GB** |
+
+The bottleneck is the **mandatory BS=48** from the EP constraint (`384 experts / top_k=8 = 48`). No configuration within the current NxDI architecture can reduce BS below 48 while maintaining FP8 with EP, making `seq_len=1024` the practical ceiling on a single trn2.48xlarge.
+
+**Potential paths to longer context** (untested):
+- Context parallelism (`cp_degree`) to split KV cache across ranks
+- LNC=1 (128 cores, 12 GB each) with different TP/EP split — but halving HBM per core likely does not help
+- Multi-instance pipeline parallelism across 2× trn2.48xlarge
+
 ### vLLM Serving (historical, BF16-attn, SDK 2.29, BS=48, TP=64, moe_tp=1/moe_ep=64, CB + bucketing, `seq_len=1024`)
 
 Input/output: 900/90 tokens (`vllm bench serve --dataset-name random`), `on_device_sampling_config={do_sample:true, temperature:0.6, top_k:20, top_p:0.95}`.
@@ -473,4 +515,4 @@ pytest contrib/models/MiMo-V2.5-Pro/test/integration/test_model.py -v
 
 Henan Wang (whn09), Jim Burtoft (jimburtoft)
 
-**Last Updated:** 2026-04-29
+**Last Updated:** 2026-05-05
