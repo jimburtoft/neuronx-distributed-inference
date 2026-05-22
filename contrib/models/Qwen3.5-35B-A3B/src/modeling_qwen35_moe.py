@@ -3044,6 +3044,58 @@ class NeuronQwen35MoeForCausalLM(NeuronBaseForCausalLM):
             self.kv_cache_populated = True
             is_run_on_neuron = self.context_encoding_model.is_neuron()
         else:
+            # -----------------------------------------------------------
+            # TKG batch padding: ensure batch == compiled batch_size so
+            # ModelWrapper.forward() takes the fast path (_forward(*args))
+            # instead of _forward_with_pad() which drops custom args.
+            # -----------------------------------------------------------
+            tkg_bs = self.token_generation_model.neuron_config.batch_size
+            actual_bs = input_ids.shape[0]
+
+            if actual_bs < tkg_bs:
+                pad_n = tkg_bs - actual_bs
+
+                # Pad 2D tensors along dim 0
+                input_ids = torch.cat(
+                    [input_ids, input_ids[:1].expand(pad_n, -1)], dim=0
+                )
+                attention_mask = torch.cat(
+                    [attention_mask, attention_mask[:1].expand(pad_n, -1)], dim=0
+                )
+                position_ids = torch.cat(
+                    [position_ids, position_ids[:1].expand(pad_n, -1)], dim=0
+                )
+                # Pad seq_ids with valid in-range IDs (repeat last valid seq_id)
+                # Using out-of-range IDs causes OOB memory access in KV cache
+                pad_seq = seq_ids[-1:].expand(pad_n)
+                seq_ids = torch.cat([seq_ids, pad_seq], dim=0)
+                sampling_params = torch.cat(
+                    [sampling_params, sampling_params[:1].expand(pad_n, -1)], dim=0
+                )
+                # Pad prev_hidden if it has batch dimension
+                if (
+                    prev_hidden is not None
+                    and hasattr(prev_hidden, "ndim")
+                    and prev_hidden.ndim > 0
+                    and prev_hidden.shape[0] > 0
+                ):
+                    prev_hidden = torch.cat(
+                        [prev_hidden, prev_hidden[:1].expand(pad_n, -1)], dim=0
+                    )
+                # Pad adapter_ids if it has batch dimension
+                if (
+                    adapter_ids is not None
+                    and hasattr(adapter_ids, "ndim")
+                    and adapter_ids.ndim > 0
+                    and adapter_ids.shape[0] > 0
+                ):
+                    adapter_ids = torch.cat(
+                        [adapter_ids, adapter_ids[:1].expand(pad_n, -1)], dim=0
+                    )
+                # mrope_position_ids for TKG is torch.zeros((0,)) -- no padding needed
+                # vision_embeddings for TKG is torch.zeros((0,)) -- no padding needed
+                # vision_mask for TKG is torch.zeros((0,)) -- no padding needed
+
             outputs = self.token_generation_model(
                 input_ids,  # 0
                 attention_mask,  # 1
@@ -3057,6 +3109,11 @@ class NeuronQwen35MoeForCausalLM(NeuronBaseForCausalLM):
                 vision_embeddings,  # 22
                 vision_mask,  # 23
             )
+
+            # Slice off padding from output
+            if actual_bs < tkg_bs:
+                outputs = outputs[:actual_bs]
+
             is_run_on_neuron = self.token_generation_model.is_neuron()
 
         return outputs, is_run_on_neuron
