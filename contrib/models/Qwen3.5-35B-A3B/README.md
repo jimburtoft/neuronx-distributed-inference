@@ -132,9 +132,13 @@ with open(os.path.join(model_path, "config.json")) as f:
     full_config = json.load(f)
 text_config = full_config.get("text_config", full_config)
 
-# Configure with multi-bucket CTE for optimal TTFT
+# Configure with multi-bucket CTE for optimal TTFT (SDK 2.29.1)
 # - context_encoding_buckets=[512, 1024] avoids padding short inputs to a single large bucket
-# - block_size=256 enables the blockwise MoE NKI kernel (faster than forward_all_experts)
+# - block_size=256 uses the fast shard_hidden NKI kernel (1139ms TTFT)
+#
+# SDK 2.30 NOTE: The shard_hidden kernel is broken in NKI 0.4.0. Use instead:
+#   blockwise_matmul_config={"block_size": 128, "use_shard_on_block_dynamic_while": True, "block_sharding_strategy": "PING_PONG"}
+#   This gives 1698ms TTFT (49% slower than 2.29.1).
 neuron_config = MoENeuronConfig(
     tp_degree=4,
     max_batch_size=1,

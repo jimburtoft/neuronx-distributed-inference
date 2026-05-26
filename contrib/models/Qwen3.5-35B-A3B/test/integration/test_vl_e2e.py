@@ -69,6 +69,8 @@ def create_text_config():
         fused_qkv=True,
         moe_tp_degree=4,
         moe_ep_degree=1,
+        # SDK 2.29.1: block_size=2048 for fast shard_hidden kernel.
+        # SDK 2.30: use {"block_size": 128, "use_shard_on_block_dynamic_while": True, "block_sharding_strategy": "PING_PONG"}
         blockwise_matmul_config={"block_size": 2048},
     )
 
@@ -123,7 +125,6 @@ def stage_compile(config):
     logger.info("=" * 60)
 
     os.makedirs(COMPILED_TEXT_PATH, exist_ok=True)
-
 
     model = NeuronQwen35MoeForCausalLM(model_path=MODEL_PATH, config=config)
 

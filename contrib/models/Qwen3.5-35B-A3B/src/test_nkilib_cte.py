@@ -111,6 +111,8 @@ neuron_config = MoENeuronConfig(
     fused_qkv=True,
     moe_tp_degree=4,
     moe_ep_degree=1,
+    # SDK 2.29.1: block_size=2048 for fast shard_hidden kernel (1139ms TTFT).
+    # SDK 2.30: use {"block_size": 128, "use_shard_on_block_dynamic_while": True, "block_sharding_strategy": "PING_PONG"} (1698ms)
     blockwise_matmul_config={"block_size": 2048},
 )
 

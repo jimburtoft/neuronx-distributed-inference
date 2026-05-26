@@ -72,7 +72,14 @@ def create_config(model_path: str):
         full_config = json.load(f)
     text_config = full_config.get("text_config", full_config)
 
-    # IMPORTANT: block_size=2048 works around a blockwise MoE issue in SDK 2.28.
+    # block_size=2048 uses the fast shard_hidden kernel (1139ms TTFT on SDK 2.29.1).
+    # On SDK 2.30, this path is broken. If upgrading to 2.30, use instead:
+    #   blockwise_matmul_config={
+    #       "block_size": 128,
+    #       "use_shard_on_block_dynamic_while": True,
+    #       "block_sharding_strategy": "PING_PONG",
+    #   }
+    # (gives 1698ms TTFT — 49% regression vs 2.29.1 due to loss of mode='trace')
     neuron_config = MoENeuronConfig(
         tp_degree=4,
         max_batch_size=1,
