@@ -1,0 +1,32 @@
+# Qwen3-Coder-Next NeuronX Port (text-only)
+# Forked from Qwen3.5-35B-A3B contrib (identical core architecture)
+# Export main classes
+
+from .modeling_qwen35_moe import (
+    Qwen35MoeInferenceConfig,
+    NeuronQwen35MoeForCausalLM,
+    NeuronQwen35MoeModel,
+    NeuronGatedDeltaNet,
+    NeuronQwen35Attention,
+    NeuronQwen35DecoderLayer,
+    SigmoidGatedSharedExperts,
+    Qwen35DecoderModelInstance,
+    Qwen35ModelWrapper,
+)
+from .nki_flash_attn_d256 import flash_attn_d256
+from .nkilib_kernel_patch import get_nkilib_flash_attention_kernel, is_available
+
+__all__ = [
+    "Qwen35MoeInferenceConfig",
+    "NeuronQwen35MoeForCausalLM",
+    "NeuronQwen35MoeModel",
+    "NeuronGatedDeltaNet",
+    "NeuronQwen35Attention",
+    "NeuronQwen35DecoderLayer",
+    "SigmoidGatedSharedExperts",
+    "Qwen35DecoderModelInstance",
+    "Qwen35ModelWrapper",
+    "flash_attn_d256",
+    "get_nkilib_flash_attention_kernel",
+    "is_available",
+]
