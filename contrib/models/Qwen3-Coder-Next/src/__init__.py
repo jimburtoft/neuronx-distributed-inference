@@ -1,6 +1,5 @@
-# Qwen3-Coder-Next NeuronX Port (text-only)
-# Forked from Qwen3.5-35B-A3B contrib (identical core architecture)
-# Export main classes
+# Qwen3-Coder-Next NxDI contrib model
+# Hybrid DeltaNet + GQA + Sparse MoE (80B total / 3B active per token)
 
 from .modeling_qwen35_moe import (
     Qwen35MoeInferenceConfig,
@@ -13,8 +12,6 @@ from .modeling_qwen35_moe import (
     Qwen35DecoderModelInstance,
     Qwen35ModelWrapper,
 )
-from .nki_flash_attn_d256 import flash_attn_d256
-from .nkilib_kernel_patch import get_nkilib_flash_attention_kernel, is_available
 
 __all__ = [
     "Qwen35MoeInferenceConfig",
@@ -26,7 +23,4 @@ __all__ = [
     "SigmoidGatedSharedExperts",
     "Qwen35DecoderModelInstance",
     "Qwen35ModelWrapper",
-    "flash_attn_d256",
-    "get_nkilib_flash_attention_kernel",
-    "is_available",
 ]

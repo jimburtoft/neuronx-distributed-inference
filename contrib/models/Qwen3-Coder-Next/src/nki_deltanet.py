@@ -1,6 +1,6 @@
 """NKI kernels for DeltaNet gated delta rule recurrent forward.
 
-NKI v2 (SDK 2.28). Processes a SINGLE (batch, head) pair per kernel call.
+NKI v3 (SDK 2.30, NKI 0.4.0). Processes a SINGLE (batch, head) pair per kernel call.
 The caller loops over (B, H) in PyTorch and calls this kernel for each pair.
 
 Input layout: All inputs are 2D contiguous tensors (S, 128).
@@ -12,6 +12,10 @@ g and beta are scalars per token, expanded to (S, 128) by the caller.
 Two kernel variants:
   deltanet_recurrent_fwd        -- returns output only (original)
   deltanet_recurrent_fwd_state  -- returns (output, final_state) for CTE->TKG carry-over
+
+Changes for NKI 0.4.0:
+  - tensor_copy no longer supports implicit partition broadcast (P=1 -> P=128)
+  - Use .broadcast_to() instead (PSUM -> SBUF(1,F), then broadcast_to((P,F)))
 """
 
 import nki
@@ -128,18 +132,37 @@ def deltanet_recurrent_fwd(
         # ---- Step 4: state += outer(k_t, delta) ----
         # Broadcast multiply: outer[i,j] = k_t[i] * delta[j]
         # 1) Transpose delta (128,1) -> (1,128) in PSUM
-        # 2) Copy PSUM (1,128) -> SBUF (128,128) -- partition broadcast
+        # 2) Use nc_matmul with ones to partition-broadcast (1,128) -> (128,128)
         # 3) Multiply by k_t (128,1) which broadcasts across free dim
-        # This avoids the nc_matmul P=1 outer product (wastes 127/128 TE lanes).
 
         # Transpose delta to get values along free dimension
         delta_row_psum = nl.ndarray((1, P_MAX), dtype=nl.float32, buffer=nl.psum)
         nisa.nc_transpose(dst=delta_row_psum, data=delta)
 
-        # Broadcast (1, 128) PSUM -> (128, 128) SBUF
-        # Each partition row gets the same delta values
+        # NKI 0.4.0: tensor_copy requires matching partition dims.
+        # Copy (1,128) PSUM -> (1,128) SBUF first
+        delta_row_sbuf = nl.ndarray((1, dim), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=delta_row_sbuf, src=delta_row_psum)
+
+        # Partition broadcast via nc_matmul: ones(P_MAX, 1)^T @ delta_row(1, dim)
+        # = (1, P_MAX) @ (1, dim) -- but P must match...
+        # Actually: nc_matmul(stationary=(P,K), moving=(P,F)) -> (K,F) in PSUM
+        # We want (P_MAX, dim) result. So K=P_MAX, F=dim.
+        # stationary needs shape (P, P_MAX) and moving needs shape (P, dim).
+        # With P=1: stationary (1, P_MAX)=ones, moving (1, dim)=delta_row_sbuf
+        # Result: ones^T @ delta_row = (P_MAX, 1) @ (1, dim) = (P_MAX, dim) ✓
+        ones_col = nl.ndarray((1, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.memset(dst=ones_col, value=1.0)
+
+        delta_broadcast_psum = nl.ndarray(
+            (P_MAX, dim), dtype=nl.float32, buffer=nl.psum
+        )
+        nisa.nc_matmul(
+            dst=delta_broadcast_psum, stationary=ones_col, moving=delta_row_sbuf
+        )
+
         delta_broadcast = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=delta_broadcast, src=delta_row_psum)
+        nisa.tensor_copy(dst=delta_broadcast, src=delta_broadcast_psum)
 
         # Element-wise multiply: outer[i,j] = delta_broadcast[i,j] * k_t[i,0]
         # tensor_scalar broadcasts (P,1) k_t across all F columns
@@ -276,8 +299,22 @@ def deltanet_recurrent_fwd_state(
         delta_row_psum = nl.ndarray((1, P_MAX), dtype=nl.float32, buffer=nl.psum)
         nisa.nc_transpose(dst=delta_row_psum, data=delta)
 
+        # NKI 0.4.0: Use nc_matmul with ones for partition broadcast
+        delta_row_sbuf = nl.ndarray((1, dim), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=delta_row_sbuf, src=delta_row_psum)
+
+        ones_col = nl.ndarray((1, P_MAX), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.memset(dst=ones_col, value=1.0)
+
+        delta_broadcast_psum = nl.ndarray(
+            (P_MAX, dim), dtype=nl.float32, buffer=nl.psum
+        )
+        nisa.nc_matmul(
+            dst=delta_broadcast_psum, stationary=ones_col, moving=delta_row_sbuf
+        )
+
         delta_broadcast = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=delta_broadcast, src=delta_row_psum)
+        nisa.tensor_copy(dst=delta_broadcast, src=delta_broadcast_psum)
 
         outer_prod = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_scalar(

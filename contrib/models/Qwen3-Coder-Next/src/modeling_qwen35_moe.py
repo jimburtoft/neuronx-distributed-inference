@@ -1,14 +1,12 @@
 """
-NxDI contrib: Qwen3-Coder-Next (qwen3_next, 80B total / 3B active)
+NxDI contrib: Qwen3.5-35B-A3B (qwen3_5_moe / qwen3_next)
 
 Hybrid DeltaNet + Standard Attention + MoE architecture.
 Based on NxDI Qwen3-MoE with custom DeltaNet layers.
-Forked from Qwen3.5-35B-A3B contrib (identical core architecture).
 
-48 layers total (configurable via full_attention_interval):
-  36 of 48 layers use Gated DeltaNet (linear recurrent attention)
-  12 of 48 layers use standard GQA with KV cache + output gate
-  All 48 layers use sparse MoE (512 experts, top-10 + shared expert with sigmoid gate)
+30 of 40 layers use Gated DeltaNet (linear recurrent attention)
+10 of 40 layers use standard GQA with KV cache + output gate
+All 40 layers use sparse MoE (256 experts, top-8 + shared expert with sigmoid gate)
 
 Architecture details:
 - DeltaNet layers: separate in_proj_{qkv, z, a, b}, causal conv1d on QKV, gated delta rule
@@ -448,7 +446,9 @@ class NeuronGatedDeltaNet(nn.Module):
             output: (B, H, S, v_dim)
             last_recurrent_state: (B, H, k_dim, v_dim) or None
         """
-        chunk_size = 64
+        chunk_size = (
+            32  # V49: chunk_size=32 compiles; testing WITHOUT --auto-cast matmult
+        )
 
         query = l2norm(query, dim=-1)
         key = l2norm(key, dim=-1)
@@ -597,30 +597,47 @@ class NeuronGatedDeltaNet(nn.Module):
         seq_ids = kwargs.get("seq_ids", None)
 
         # --- Mask padding tokens for DeltaNet ---
-        # NxDI passes attention_mask as BOOLEAN (B, 1, S, S) where True=valid, False=pad.
-        # DeltaNet has no attention mask in its recurrence -- padding tokens contaminate
-        # the recurrent state. We zero out padding positions before projection.
+        # CRITICAL V42: Use padding_mask passed directly from get_model_output.
+        # This is the raw 2D attention_mask (B, S) cast to bf16, derived DIRECTLY
+        # from the traced input attention_mask[position 1] WITHOUT any comparison
+        # or reduction operation. XLA CANNOT constant-fold this because:
+        # 1. attention_mask is a traced input (parameter, not constant)
+        # 2. The only operation is a dtype cast (int32 -> bf16), which is preserved
+        # 3. There's no comparison (like >= arange) that XLA could evaluate at trace time
         #
-        # CRITICAL (V38b): We also need to save valid_mask_1d for later use to:
-        #   1. Zero out g (decay) for padding positions -- otherwise padding tokens
-        #      decay the recurrent state towards zero (exp(-1.3) ≈ 0.27 per token)
-        #   2. Save conv_state from the last 3 VALID positions, not last 3 absolute
-        #      positions (which may be padding with right-padding)
-        valid_mask_1d = None  # (B, S) float, 1.0 for valid, 0.0 for padding
-        if attention_mask is not None and not is_decode:
-            if attention_mask.dim() == 4:
-                # Boolean 4D causal mask: (B, 1, S, S)
-                # Use the LAST ROW to get per-position validity.
-                pad_mask_1d = attention_mask[:, 0, -1, :]  # (B, S) bool
-            elif attention_mask.dim() == 2:
-                pad_mask_1d = attention_mask  # (B, S) bool or int
-            else:
-                pad_mask_1d = None
+        # The position_ids >= arange approach was proven to be folded by XLA despite
+        # being derived from a traced input, because XLA evaluates the comparison at
+        # trace time and determines the result is a constant pattern.
+        padding_mask_input = kwargs.get("padding_mask", None)
 
-            if pad_mask_1d is not None:
-                valid_mask = pad_mask_1d.to(hidden_states.dtype)  # (B, S) in bf16
-                valid_mask_1d = valid_mask  # Save for later g masking and conv_state
-                hidden_states = hidden_states * valid_mask.unsqueeze(-1)  # (B, S, D)
+        valid_mask_1d = None  # (B, S) float, 1.0 for valid, 0.0 for padding
+        if not is_decode:
+            if padding_mask_input is not None and padding_mask_input.dim() == 2:
+                # PREFERRED PATH V42: Use pre-computed padding mask from attention_mask.
+                # This is already (B, S) with 1.0=valid, 0.0=padding in bf16.
+                valid_mask_1d = padding_mask_input.to(hidden_states.dtype)
+            elif position_ids is not None and position_ids.dim() == 2:
+                # FALLBACK: Derive from position_ids (may be folded by XLA).
+                seq_len = hidden_states.shape[1]
+                indices = torch.arange(
+                    seq_len, device=position_ids.device, dtype=position_ids.dtype
+                ).unsqueeze(0)  # (1, S)
+                valid_mask_1d = (position_ids >= indices).to(
+                    hidden_states.dtype
+                )  # (B, S) bf16
+            elif attention_mask is not None:
+                # Fallback only if position_ids unavailable
+                if attention_mask.dim() == 4:
+                    pad_mask_1d = torch.diagonal(attention_mask[:, 0], dim1=-2, dim2=-1)
+                elif attention_mask.dim() == 2:
+                    pad_mask_1d = attention_mask
+                else:
+                    pad_mask_1d = None
+                if pad_mask_1d is not None:
+                    valid_mask_1d = pad_mask_1d.to(hidden_states.dtype)
+
+            if valid_mask_1d is not None:
+                hidden_states = hidden_states * valid_mask_1d.unsqueeze(-1)  # (B, S, D)
 
         # Project inputs
         deltanet_fp32 = os.environ.get("DELTANET_FP32") == "1"
@@ -703,7 +720,12 @@ class NeuronGatedDeltaNet(nn.Module):
             # self.conv1d has padding=kernel_size-1=3, which pads both sides symmetrically.
             # Truncating to [:, :, :seq_len] gives correct causal conv1d output.
             # This is IDENTICAL to V36 which produced correct "Paris" output.
-            mixed_post_conv = F.silu(self.conv1d(mixed)[:, :, :seq_len])
+            skip_conv = os.environ.get("SKIP_CONV1D") == "1"
+            if skip_conv:
+                # DEBUG: Skip conv1d entirely — just apply silu to raw mixed
+                mixed_post_conv = F.silu(mixed[:, :, :seq_len])
+            else:
+                mixed_post_conv = F.silu(self.conv1d(mixed)[:, :, :seq_len])
 
             # CRITICAL (V38b): Save last 3 VALID tokens' mixed values for conv_state.
             # With right-padding, valid tokens are at positions 0..n-1, padding at n..S-1.
@@ -770,6 +792,21 @@ class NeuronGatedDeltaNet(nn.Module):
         key = key.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
         value = value.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
 
+        # CRITICAL (V39): Zero out post-conv1d outputs at padding positions.
+        # The conv1d (kernel_size=4) introduces cross-position mixing, so even though
+        # we zeroed hidden_states at pad positions BEFORE projection, the conv1d output
+        # at pad position i can be nonzero due to leakage from valid positions (i-1, i-2, i-3).
+        # Without this mask, the recurrence accumulates garbage:
+        #   state[t] = exp(0)*state[t-1] + 0.5 * nonzero_key * nonzero_value
+        # because beta=sigmoid(0)=0.5 and key/value are nonzero from conv leakage.
+        if valid_mask_1d is not None and not is_decode:
+            # valid_mask_1d: (B, S) float, 1=valid, 0=padding
+            # After reshape, tensors are (B, S, H, D) so we need (B, S, 1, 1) mask
+            post_conv_mask = valid_mask_1d.unsqueeze(-1).unsqueeze(-1)  # (B, S, 1, 1)
+            query = query * post_conv_mask
+            key = key * post_conv_mask
+            value = value * post_conv_mask
+
         # Compute gating
         beta = b.sigmoid()  # (B, S, num_v_heads)
         g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
@@ -782,6 +819,9 @@ class NeuronGatedDeltaNet(nn.Module):
         if valid_mask_1d is not None:
             # valid_mask_1d: (B, S) float bf16, g: (B, S, num_v_heads) float32
             g = g * valid_mask_1d.float().unsqueeze(-1)  # Zero g for padding positions
+            # Also zero beta at pad positions so recurrence doesn't write:
+            # state[t] = state[t-1] + 0 * key * value (no-op at pad positions)
+            beta = beta * valid_mask_1d.unsqueeze(-1)  # (B, S, num_v_heads)
 
         # Expand K heads to match V heads (16 -> 32) using expand+reshape
         if self.num_v_heads // self.num_k_heads > 1:
@@ -836,11 +876,13 @@ class NeuronGatedDeltaNet(nn.Module):
                     new_recurrent_state + self.recurrent_state_buffer.float() * 0
                 )
         else:
-            # Context encoding with chunked forward -- returns (output, final_state)
-            # chunk_forward(64) is 6.4x faster than NKI recurrent at seq_len=2048
-            # (2.2s vs 14.4s TTFT). See Task 12 benchmark results.
-            output, new_recurrent_state = self._chunk_forward(
-                query, key, value, g, beta, output_final_state=True
+            # Context encoding: Use NKI recurrent forward for ACCURACY VALIDATION.
+            # NKI kernel does recurrence at hardware level, bypassing XLA loop issues.
+            # Slower than chunk_forward (14.4s vs 2.2s TTFT) but should be correct.
+            # TODO: Switch back to _chunk_forward once accuracy is validated or
+            # the XLA variable-width-slice loop miscompilation is fixed.
+            output, new_recurrent_state = self._nki_recurrent_forward(
+                query, key, value, g, beta
             )
             # IMPORTANT: Touch recurrent_state_buffer during CTE so XLA can find it
             # in the lowering context (it's aliased via input_output_aliases).
@@ -929,18 +971,24 @@ class Qwen35MoeInferenceConfig(InferenceConfig):
     """Config for Qwen3.5-35B-A3B with hybrid DeltaNet + Attention."""
 
     def __init__(self, *args, **kwargs):
-        # Generate layer_types before super().__init__() since validate_config()
-        # checks for it as a required attribute. It's not in HF config.json so
-        # we must compute it from full_attention_interval and num_hidden_layers.
+        # Generate layer_types before super().__init__() which calls validate_config()
         if "layer_types" not in kwargs:
-            full_attn_interval = kwargs.get("full_attention_interval", 4)
-            num_layers = kwargs.get("num_hidden_layers", 48)
-            num_groups = num_layers // full_attn_interval
             layer_types = []
-            for _ in range(num_groups):
+            num_layers = kwargs.get("num_hidden_layers", 48)
+            for _ in range(num_layers // 4):
                 layer_types.extend(
-                    ["linear_attention"] * (full_attn_interval - 1) + ["full_attention"]
+                    [
+                        "linear_attention",
+                        "linear_attention",
+                        "linear_attention",
+                        "full_attention",
+                    ]
                 )
+            # Handle remainder if num_layers not divisible by 4
+            remainder = num_layers % 4
+            layer_types.extend(["linear_attention"] * min(remainder, 3))
+            if remainder == 4:
+                layer_types.append("full_attention")
             kwargs["layer_types"] = layer_types
 
         super().__init__(*args, **kwargs)
@@ -970,6 +1018,19 @@ class Qwen35MoeInferenceConfig(InferenceConfig):
         rope_params = getattr(self, "rope_parameters", {}) or {}
         self.mrope_section = rope_params.get("mrope_section", [11, 11, 10])
         self.mrope_interleaved = rope_params.get("mrope_interleaved", True)
+
+        # Layer types for hybrid dispatch
+        if not hasattr(self, "layer_types"):
+            self.layer_types = []
+            for _ in range(10):
+                self.layer_types.extend(
+                    [
+                        "linear_attention",
+                        "linear_attention",
+                        "linear_attention",
+                        "full_attention",
+                    ]
+                )
 
         # Standard HF config attributes expected by NxDI base class
         if not hasattr(self, "output_attentions"):
@@ -1261,10 +1322,12 @@ class NeuronQwen35Attention(NeuronAttentionBase):
         Q shape: (B, H, S, head_dim) where head_dim=256
         cos/sin shape: (B, S, rope_dim) where rope_dim=64 (from RotaryEmbedding(dim=64))
 
-        During CTE (prefill): skip RoPE here — the NKI flash attention kernel
-        applies partial RoPE internally using fused cos/sin caches. This avoids
-        the Beta 2 NKI tracer bug (V2169383883) where element-wise ops with
-        model buffers cause tensor args to resolve as None in KLIR.
+        During CTE (prefill) with seq_len >= 512: skip RoPE here — the NKI flash
+        attention kernel applies partial RoPE internally using fused cos/sin caches.
+        This avoids the Beta 2 NKI tracer bug (V2169383883).
+
+        During CTE with seq_len < 512: apply RoPE normally — the softmax fallback
+        path does NOT apply RoPE internally, so it must be done here.
 
         During TKG (decode): apply RoPE normally (kernel not used for decode).
         """
@@ -1276,8 +1339,17 @@ class NeuronQwen35Attention(NeuronAttentionBase):
             if cos_cache is None or sin_cache is None:
                 cos_cache, sin_cache = self.rotary_emb(V, position_ids)
 
-        # During CTE with d256 kernel: skip RoPE, kernel will fuse it internally
-        if self.neuron_config.is_prefill_stage and self.head_dim > 128:
+        # During CTE with d256 kernel: skip RoPE ONLY when the NKI flash attention
+        # kernel will be used (seq_len >= 512 and divisible by 512), since that
+        # kernel applies partial RoPE internally. For shorter sequences that fall
+        # back to the softmax path, we MUST apply RoPE here.
+        seq_len = Q.shape[2]
+        if (
+            self.neuron_config.is_prefill_stage
+            and self.head_dim > 128
+            and seq_len >= 512
+            and seq_len % 512 == 0
+        ):
             # Return pre-RoPE Q, K — kernel applies partial RoPE with cos/sin
             return Q, K, cos_cache, sin_cache
 
@@ -1713,6 +1785,7 @@ class NeuronQwen35DecoderLayer(nn.Module):
                     attention_mask=attention_mask,
                     position_ids=position_ids,
                     past_key_value=past_key_value,
+                    padding_mask=padding_mask,
                     **kwargs,
                 )
                 hidden_states = residual + attn_out
@@ -1993,6 +2066,21 @@ class NeuronQwen35MoeModel(NeuronBaseModel):
         cos_cache = None
         sin_cache = None
 
+        # CRITICAL V42: Save the 2D attention_mask BEFORE converting to 4D.
+        # This is the raw traced input [1,1,...,1,0,0,...,0] (valid=1, pad=0).
+        # We pass this directly to DeltaNet layers as padding_mask.
+        # Because it's a direct function of a traced input (no comparison/reduction),
+        # XLA CANNOT constant-fold it away. This is the correct way to pass
+        # padding information to DeltaNet layers.
+        padding_mask_2d = None
+        if (
+            attention_mask is not None
+            and attention_mask.ndim == 2
+            and is_for_context_encoding
+        ):
+            # Cast to float (bf16) for multiplication with hidden_states later
+            padding_mask_2d = attention_mask.to(torch.bfloat16)  # (B, S) float
+
         # Convert 2D attention_mask (B, S) to 4D causal mask (B, 1, S, S) for
         # the softmax attention fallback path (perform_prefill with head_dim>128).
         # With BS=1, the 2D mask broadcasts accidentally. With BS>1, it doesn't.
@@ -2048,7 +2136,9 @@ class NeuronQwen35MoeModel(NeuronBaseModel):
                 residual=None,
                 local_mask=local_attn_mask,
                 windowed_context_encoding_window_idx=windowed_context_encoding_window_idx,
-                padding_mask=padding_mask,
+                padding_mask=padding_mask_2d
+                if padding_mask_2d is not None
+                else padding_mask,
                 **kwargs,
             )
 
@@ -2233,10 +2323,9 @@ def convert_qwen35_hf_to_neuron_state_dict(neuron_state_dict, config):
     Weight mappings per layer type:
 
     DeltaNet layers (linear_attention):
-      HF: layers.X.linear_attn.{in_proj_qkvz, in_proj_ba, conv1d, A_log, dt_bias, norm, out_proj}
-      NxDI: layers.X.linear_attn.{in_proj_qkv, in_proj_z, in_proj_a, in_proj_b, conv1d, ...}
-      Requires splitting: in_proj_qkvz -> in_proj_qkv + in_proj_z
-                          in_proj_ba -> in_proj_b + in_proj_a
+      HF: layers.X.linear_attn.{in_proj_qkv, in_proj_z, in_proj_a, in_proj_b,
+          conv1d, A_log, dt_bias, norm, out_proj}
+      NxDI: same names (no remapping needed)
 
     Full attention layers:
       HF: layers.X.self_attn.q_proj.weight: (8192, 2048) -- doubled for gate
@@ -2258,6 +2347,25 @@ def convert_qwen35_hf_to_neuron_state_dict(neuron_state_dict, config):
         config.neuron_config.tp_degree,
         dtype=torch.int32,
     )
+
+    # CRITICAL V42: Zero out the pad token embedding.
+    # NxDI right-pads CTE inputs to bucket size with pad_token_id. DeltaNet has no
+    # causal attention mask, so it processes ALL positions including padding.
+    # XLA constant-folds any masking operation we put inside the traced model.
+    # The only solution is to make pad token embeddings ZERO at the weight level,
+    # so that padding positions contribute nothing to the DeltaNet recurrence
+    # (zero input → zero projection → zero key/value/query → no state update).
+    pad_token_id = config.pad_token_id
+    embed_key = "embed_tokens.weight"
+    if embed_key in neuron_state_dict and pad_token_id is not None:
+        emb_weight = neuron_state_dict[embed_key]
+        old_norm = emb_weight[pad_token_id].float().norm().item()
+        emb_weight[pad_token_id] = 0.0
+        print(
+            f"  [PAD EMBED] Zeroed embedding for pad_token_id={pad_token_id} "
+            f"(was norm={old_norm:.4f})"
+        )
+        neuron_state_dict[embed_key] = emb_weight
 
     # CRITICAL: Convert (1+weight) RMSNorm weights to standard RMSNorm weights.
     # Qwen3.5-MoE uses RMSNorm with `output = norm(x) * (1 + weight)` where weight
@@ -2291,54 +2399,6 @@ def convert_qwen35_hf_to_neuron_state_dict(neuron_state_dict, config):
 
     for l in range(config.num_hidden_layers):
         layer_type = config.layer_types[l]
-
-        # === DeltaNet weight unfusion ===
-        # Qwen3-Coder-Next fuses projections differently from Qwen3.5-35B:
-        #   HF checkpoint: in_proj_qkvz (QKV+Z fused) and in_proj_ba (B+A fused)
-        #   NxDI model: in_proj_qkv, in_proj_z, in_proj_b, in_proj_a (separate)
-        if layer_type == "linear_attention":
-            # Split in_proj_qkvz -> in_proj_qkv + in_proj_z
-            qkvz_key = f"layers.{l}.linear_attn.in_proj_qkvz.weight"
-            if qkvz_key in neuron_state_dict:
-                qkvz_w = neuron_state_dict.pop(qkvz_key)
-                # key_dim*2 + value_dim = QKV dim, value_dim = Z dim
-                key_dim = (
-                    config.linear_num_key_heads * config.linear_key_head_dim
-                )  # 16*128=2048
-                value_dim = (
-                    config.linear_num_value_heads * config.linear_value_head_dim
-                )  # 32*128=4096
-                qkv_dim = key_dim * 2 + value_dim  # 2048+2048+4096 = 8192
-                neuron_state_dict[f"layers.{l}.linear_attn.in_proj_qkv.weight"] = (
-                    qkvz_w[:qkv_dim, :].detach().clone()
-                )
-                neuron_state_dict[f"layers.{l}.linear_attn.in_proj_z.weight"] = (
-                    qkvz_w[qkv_dim:, :].detach().clone()
-                )
-                if l == 0:
-                    print(
-                        f"  [DELTANET] Split in_proj_qkvz ({list(qkvz_w.shape)}) -> "
-                        f"in_proj_qkv ({qkv_dim}, {qkvz_w.shape[1]}), "
-                        f"in_proj_z ({value_dim}, {qkvz_w.shape[1]})"
-                    )
-
-            # Split in_proj_ba -> in_proj_b + in_proj_a
-            ba_key = f"layers.{l}.linear_attn.in_proj_ba.weight"
-            if ba_key in neuron_state_dict:
-                ba_w = neuron_state_dict.pop(ba_key)
-                num_v_heads = config.linear_num_value_heads  # 32
-                neuron_state_dict[f"layers.{l}.linear_attn.in_proj_b.weight"] = (
-                    ba_w[:num_v_heads, :].detach().clone()
-                )
-                neuron_state_dict[f"layers.{l}.linear_attn.in_proj_a.weight"] = (
-                    ba_w[num_v_heads:, :].detach().clone()
-                )
-                if l == 0:
-                    print(
-                        f"  [DELTANET] Split in_proj_ba ({list(ba_w.shape)}) -> "
-                        f"in_proj_b ({num_v_heads}, {ba_w.shape[1]}), "
-                        f"in_proj_a ({num_v_heads}, {ba_w.shape[1]})"
-                    )
 
         # === Attention layers ===
         if layer_type == "full_attention":
@@ -2406,6 +2466,111 @@ def convert_qwen35_hf_to_neuron_state_dict(neuron_state_dict, config):
                     del neuron_state_dict[k_key]
                     del neuron_state_dict[v_key]
 
+        # === DeltaNet layers: deinterleave in_proj_qkvz and in_proj_ba ===
+        elif layer_type == "linear_attention":
+            # HF stores `in_proj_qkvz` as (12288, 2048) in GROUPED/INTERLEAVED format:
+            #   (num_k_heads=16, per_group=768, hidden) where each group = [q(128), k(128), v(256), z(256)]
+            # We need: in_proj_qkv (8192, 2048) = flat [all_Q | all_K | all_V]
+            #          in_proj_z   (4096, 2048) = flat [all_Z]
+            qkvz_key = f"layers.{l}.linear_attn.in_proj_qkvz.weight"
+            if qkvz_key in neuron_state_dict:
+                w = neuron_state_dict.pop(qkvz_key)
+                num_k_heads = config.linear_num_key_heads  # 16
+                head_k_dim = config.linear_key_head_dim  # 128
+                head_v_dim = config.linear_value_head_dim  # 128
+                num_v_heads = config.linear_num_value_heads  # 32
+                # Each group: q(head_k_dim=128) + k(head_k_dim=128) + v(head_v_dim*2=256) + z(head_v_dim*2=256) = 768
+                v_per_group = head_v_dim * (num_v_heads // num_k_heads)  # 128 * 2 = 256
+                z_per_group = v_per_group  # 256
+                group_size = head_k_dim + head_k_dim + v_per_group + z_per_group  # 768
+                w = w.reshape(num_k_heads, group_size, config.hidden_size)
+                q_parts = w[:, :head_k_dim, :]  # (16, 128, 2048)
+                k_parts = w[:, head_k_dim : head_k_dim * 2, :]  # (16, 128, 2048)
+                v_parts = w[
+                    :, head_k_dim * 2 : head_k_dim * 2 + v_per_group, :
+                ]  # (16, 256, 2048)
+                z_parts = w[:, head_k_dim * 2 + v_per_group :, :]  # (16, 256, 2048)
+                # Flatten: (16, dim, 2048) -> (16*dim, 2048)
+                qkv_w = torch.cat(
+                    [
+                        q_parts.reshape(-1, config.hidden_size),  # (2048, 2048)
+                        k_parts.reshape(-1, config.hidden_size),  # (2048, 2048)
+                        v_parts.reshape(-1, config.hidden_size),  # (4096, 2048)
+                    ],
+                    dim=0,
+                )  # (8192, 2048)
+                z_w = z_parts.reshape(-1, config.hidden_size)  # (4096, 2048)
+                neuron_state_dict[f"layers.{l}.linear_attn.in_proj_qkv.weight"] = qkv_w
+                neuron_state_dict[f"layers.{l}.linear_attn.in_proj_z.weight"] = z_w
+                if l == 0:
+                    print(
+                        f"  [DELTANET] Deinterleaved in_proj_qkvz ({list(neuron_state_dict.get(qkvz_key, w).shape)}) -> in_proj_qkv {tuple(qkv_w.shape)}, in_proj_z {tuple(z_w.shape)}"
+                    )
+
+            # HF stores `in_proj_ba` as (64, 2048) in grouped format:
+            #   (num_k_heads=16, 4, hidden) where each group = [b(2), a(2)]
+            # We need: in_proj_b (32, 2048) and in_proj_a (32, 2048)
+            ba_key = f"layers.{l}.linear_attn.in_proj_ba.weight"
+            if ba_key in neuron_state_dict:
+                w = neuron_state_dict.pop(ba_key)
+                num_k_heads = config.linear_num_key_heads  # 16
+                num_v_heads = config.linear_num_value_heads  # 32
+                heads_per_group = num_v_heads // num_k_heads  # 2
+                # Each group: b(heads_per_group=2) + a(heads_per_group=2) = 4
+                w = w.reshape(num_k_heads, 2 * heads_per_group, config.hidden_size)
+                b_parts = w[:, :heads_per_group, :]  # (16, 2, 2048)
+                a_parts = w[:, heads_per_group:, :]  # (16, 2, 2048)
+                b_w = b_parts.reshape(-1, config.hidden_size)  # (32, 2048)
+                a_w = a_parts.reshape(-1, config.hidden_size)  # (32, 2048)
+                neuron_state_dict[f"layers.{l}.linear_attn.in_proj_b.weight"] = b_w
+                neuron_state_dict[f"layers.{l}.linear_attn.in_proj_a.weight"] = a_w
+                if l == 0:
+                    print(
+                        f"  [DELTANET] Deinterleaved in_proj_ba ({list(w.shape)}) -> in_proj_b {tuple(b_w.shape)}, in_proj_a {tuple(a_w.shape)}"
+                    )
+
+        # === MoE weights (ALL layers have MoE MLPs) ===
+        # Fuse individual experts if stored separately (per-expert weights)
+        # Some HF checkpoints store experts individually as layers.X.mlp.experts.N.{gate,up,down}_proj
+        # Check if we need to fuse them
+        expert0_gate_key = f"layers.{l}.mlp.experts.0.gate_proj.weight"
+        if expert0_gate_key in neuron_state_dict:
+            num_experts = config.num_experts  # 512
+            gate_projs = []
+            up_projs = []
+            down_projs = []
+            for e in range(num_experts):
+                gate_projs.append(
+                    neuron_state_dict.pop(
+                        f"layers.{l}.mlp.experts.{e}.gate_proj.weight"
+                    )
+                )
+                up_projs.append(
+                    neuron_state_dict.pop(f"layers.{l}.mlp.experts.{e}.up_proj.weight")
+                )
+                down_projs.append(
+                    neuron_state_dict.pop(
+                        f"layers.{l}.mlp.experts.{e}.down_proj.weight"
+                    )
+                )
+            # Stack: (E, intermediate, hidden) for gate/up, (E, hidden, intermediate) for down
+            gate_up = torch.cat([torch.stack(gate_projs), torch.stack(up_projs)], dim=1)
+            # gate_up: (E, 2*I, H), need (E, H, 2*I) for NxDI
+            gate_up = gate_up.permute(0, 2, 1).contiguous()
+            down = torch.stack(down_projs)
+            # down: (E, H, I), need (E, I, H) for NxDI
+            down = down.permute(0, 2, 1).contiguous()
+            neuron_state_dict[
+                f"layers.{l}.mlp.expert_mlps.mlp_op.gate_up_proj.weight"
+            ] = gate_up
+            neuron_state_dict[f"layers.{l}.mlp.expert_mlps.mlp_op.down_proj.weight"] = (
+                down
+            )
+            if l == 0:
+                print(
+                    f"  [MOE] Fused {num_experts} individual experts -> gate_up_proj {list(gate_up.shape)}, down_proj {list(down.shape)}"
+                )
+
         # === MoE weights ===
         # Router
         gate_key = f"layers.{l}.mlp.gate.weight"
@@ -2414,53 +2579,11 @@ def convert_qwen35_hf_to_neuron_state_dict(neuron_state_dict, config):
                 neuron_state_dict.pop(gate_key).detach().clone()
             )
 
-        # Fuse per-expert weights into single tensors if needed.
-        # Qwen3-Coder-Next stores experts individually:
-        #   layers.X.mlp.experts.{i}.gate_proj.weight  (I, H)
-        #   layers.X.mlp.experts.{i}.up_proj.weight    (I, H)
-        #   layers.X.mlp.experts.{i}.down_proj.weight  (H, I)
-        # We need to fuse them into:
-        #   layers.X.mlp.experts.gate_up_proj  (E, 2*I, H)
-        #   layers.X.mlp.experts.down_proj     (E, H, I)
+        # Fused expert weights
+        # HF pre-fused: experts.gate_up_proj (E, 2*I, H) -- need transpose to NxDI (E, H, 2*I)
+        # HF pre-fused: experts.down_proj (E, H, I) -- need transpose to NxDI (E, I, H)
         gate_up_key = f"layers.{l}.mlp.experts.gate_up_proj"
         down_key = f"layers.{l}.mlp.experts.down_proj"
-
-        # Check if per-expert format (individual expert keys present)
-        first_expert_key = f"layers.{l}.mlp.experts.0.gate_proj.weight"
-        if (
-            first_expert_key in neuron_state_dict
-            and gate_up_key not in neuron_state_dict
-        ):
-            num_experts = config.num_experts
-            # Stack gate and up projections: (E, 2*I, H)
-            gate_list = []
-            up_list = []
-            down_list = []
-            for e in range(num_experts):
-                gk = f"layers.{l}.mlp.experts.{e}.gate_proj.weight"
-                uk = f"layers.{l}.mlp.experts.{e}.up_proj.weight"
-                dk = f"layers.{l}.mlp.experts.{e}.down_proj.weight"
-                gate_list.append(neuron_state_dict.pop(gk))
-                up_list.append(neuron_state_dict.pop(uk))
-                down_list.append(neuron_state_dict.pop(dk))
-
-            # gate: (E, I, H), up: (E, I, H) -> gate_up: (E, 2*I, H)
-            gate_stacked = torch.stack(gate_list, dim=0)  # (E, I, H)
-            up_stacked = torch.stack(up_list, dim=0)  # (E, I, H)
-            gate_up = torch.cat([gate_stacked, up_stacked], dim=1)  # (E, 2*I, H)
-            neuron_state_dict[gate_up_key] = gate_up
-
-            # down: (E, H, I)
-            down_stacked = torch.stack(down_list, dim=0)  # (E, H, I)
-            neuron_state_dict[down_key] = down_stacked
-
-            if l == 0:
-                print(
-                    f"  [MOE] Fused {num_experts} individual experts -> "
-                    f"gate_up_proj {list(gate_up.shape)}, down_proj {list(down_stacked.shape)}"
-                )
-
-            del gate_list, up_list, down_list, gate_stacked, up_stacked, down_stacked
 
         if gate_up_key in neuron_state_dict:
             w = neuron_state_dict.pop(gate_up_key).detach().clone()
@@ -2585,15 +2708,30 @@ class Qwen35ModelWrapper(ModelWrapper):
     def input_generator(self):
         """Generate inputs including mrope_position_ids, vision_embeddings, and vision_mask.
 
-        Extends the base input_generator output:
+        Layout depends on whether prefix caching is enabled:
+
+        WITHOUT prefix caching (24 args):
+        - Positions 0-6: standard NxDI (input_ids, attn_mask, pos_ids, seq_ids, sampling, prev_hidden, adapter)
         - Positions 7-20: empty tensors (unused NxDI slots)
-        - Position 21: rotary_position_id = mrope_position_ids (3, BS, seq_len) for CTE,
-                        empty (0,) for TKG
-        - Position 22: vision_embeddings (BS, seq_len, hidden_size) for CTE,
-                        empty (0,) for TKG
-        - Position 23: vision_mask (BS, seq_len, 1) for CTE,
-                        empty (0,) for TKG
+        - Position 21: rotary_position_id = mrope_position_ids (3, BS, seq_len) for CTE, empty for TKG
+        - Position 22: vision_embeddings (BS, seq_len, hidden_size) for CTE, empty for TKG
+        - Position 23: vision_mask (BS, seq_len, 1) for CTE, empty for TKG
+
+        WITH prefix caching (24 args, different layout):
+        - Positions 0-6: standard (input_ids, attn_mask, pos_ids, seq_ids, sampling, prev_hidden, adapter)
+        - Positions 7-10: empty (medusa slots)
+        - Position 11: slot_mapping (BS, n_active_tokens)
+        - Position 12: active_block_table (BS, num_blocks) or (1,) if no prefix
+        - Position 13: num_queries (BS, 1)
+        - Position 14: computed_context_lens (BS, 1)
+        - Positions 15-20: empty
+        - Position 21: rotary_position_id = mrope_position_ids
+        - Position 22: vision_embeddings
+        - Position 23: vision_mask
         """
+        if self.is_prefix_caching:
+            return self._input_generator_prefix_caching()
+
         base_inputs = super().input_generator()
         extended_inputs = []
 
@@ -2605,6 +2743,50 @@ class Qwen35ModelWrapper(ModelWrapper):
             is_cte = n_active_tokens > 1
 
             if is_cte:
+                # CRITICAL V42: Override position_ids to simulate padding during CTE tracing.
+                # The DeltaNet padding mask uses `position_ids >= arange(S)` to detect
+                # valid vs padding positions. If we trace with position_ids=[0,1,...,S-1]
+                # (all valid), XLA constant-folds the mask to all-True and eliminates the
+                # masking code from the NEFF. By tracing with simulated padding
+                # (position_ids has zeros in padding positions), XLA keeps the masking
+                # operations because it can't prove the mask is always True.
+                #
+                # Use half-valid: [0, 1, ..., S/2-1, 0, 0, ..., 0]
+                # Padding value is 0 (NOT 1!) so that:
+                # - mask = pos_ids >= arange gives [T,T,...,T,F,F,...,F] (correct)
+                # - torch.max(pos_ids) gives index of last valid position (correct)
+                half = n_active_tokens // 2
+                # Must match base class dtypes: attention_mask=int32, position_ids=int64
+                base_pos_dtype = bucket_inputs[2].dtype  # match whatever base uses
+                base_mask_dtype = bucket_inputs[1].dtype  # match whatever base uses
+                trace_pos_ids = (
+                    torch.cat(
+                        [
+                            torch.arange(half, dtype=base_pos_dtype),
+                            torch.zeros(n_active_tokens - half, dtype=base_pos_dtype),
+                        ]
+                    )
+                    .unsqueeze(0)
+                    .expand(batch_size, -1)
+                    .contiguous()
+                )
+                # Also override attention_mask to match (1s for valid, 0s for padding)
+                trace_attn_mask = (
+                    torch.cat(
+                        [
+                            torch.ones(half, dtype=base_mask_dtype),
+                            torch.zeros(n_active_tokens - half, dtype=base_mask_dtype),
+                        ]
+                    )
+                    .unsqueeze(0)
+                    .expand(batch_size, -1)
+                    .contiguous()
+                )
+                # Replace in bucket_inputs (index 1=attn_mask, index 2=pos_ids)
+                bucket_inputs = list(bucket_inputs)
+                bucket_inputs[1] = trace_attn_mask
+                bucket_inputs[2] = trace_pos_ids
+                bucket_inputs = tuple(bucket_inputs)
                 # Context encoding: properly-shaped inputs
                 # mRoPE position IDs: (3, BS, seq_len) -- T/H/W all sequential for trace
                 mrope_position_ids = (
@@ -2645,6 +2827,71 @@ class Qwen35ModelWrapper(ModelWrapper):
 
         return extended_inputs
 
+    def _input_generator_prefix_caching(self):
+        """Generate trace inputs for prefix caching mode.
+
+        Uses the base class prefix caching layout (positions 0-14) which aligns
+        with the model's forward() signature for block KV parameters, then adds
+        mRoPE and vision args at positions 21-23.
+
+        Layout:
+        0: input_ids, 1: attention_mask, 2: position_ids, 3: seq_ids,
+        4: sampling_params, 5: prev_hidden (empty), 6: adapter_ids,
+        7-10: empties (medusa slots),
+        11: slot_mapping, 12: active_block_table, 13: num_queries,
+        14: computed_context_lens, 15-20: empties,
+        21: mrope_position_ids, 22: vision_embeddings, 23: vision_mask
+        """
+        # Get base prefix caching inputs (positions 0-14)
+        base_inputs = super().input_generator()
+        extended_inputs = []
+
+        for bucket_inputs in base_inputs:
+            # base_inputs already has the prefix caching layout from
+            # _get_input_shape_for_prefix_caching: 15 args (0-14)
+            input_ids = bucket_inputs[0]
+            batch_size = input_ids.shape[0]
+            n_active_tokens = input_ids.shape[1]
+            is_cte = n_active_tokens > 1
+
+            if is_cte:
+                mrope_position_ids = (
+                    torch.arange(0, n_active_tokens, dtype=torch.int32)
+                    .unsqueeze(0)
+                    .unsqueeze(0)
+                    .expand(3, batch_size, -1)
+                    .contiguous()
+                )
+                vision_embeddings = torch.zeros(
+                    (batch_size, n_active_tokens, self.config.hidden_size),
+                    dtype=self.config.neuron_config.torch_dtype,
+                )
+                vision_mask = torch.full(
+                    (batch_size, n_active_tokens, 1),
+                    fill_value=n_active_tokens - 1,
+                    dtype=torch.int32,
+                )
+            else:
+                mrope_position_ids = torch.zeros((0,), dtype=torch.int32)
+                vision_embeddings = torch.zeros(
+                    (0,), dtype=self.config.neuron_config.torch_dtype
+                )
+                vision_mask = torch.zeros((0,), dtype=torch.int32)
+
+            # Start from base prefix caching inputs (already has 15 args: 0-14)
+            padded = list(bucket_inputs)
+            # Pad positions 15-20 with empties
+            while len(padded) < 21:
+                padded.append(torch.zeros((0,), dtype=torch.int32))
+            # Add Qwen3.5-specific args at positions 21-23
+            padded.append(mrope_position_ids)  # position 21: rotary_position_id
+            padded.append(vision_embeddings)  # position 22
+            padded.append(vision_mask)  # position 23
+
+            extended_inputs.append(tuple(padded))
+
+        return extended_inputs
+
     def pad_inputs(self, *args, pad_type="first_fit"):
         """Override to pad mrope_position_ids and vision inputs to bucket size.
 
@@ -2656,6 +2903,16 @@ class Qwen35ModelWrapper(ModelWrapper):
         Solution: Save the ORIGINAL vision args (positions 21-23) BEFORE
         calling super().pad_inputs(), then use those originals for
         zero-extension padding afterward.
+
+        V43 FIX: The base class pads position_ids with value=1. This is CORRECT:
+        - For 1-token: pos_ids=[0,1,1,...,1], max=1 → gather position 1.
+          Position 1 has DeltaNet state from position 0 and produces non-zero output.
+        - For N-token: pos_ids=[0,...,N-1,1,1,...], max=N-1 → gather last valid.
+
+        V42 incorrectly re-padded position_ids with 0. With pad_value=0:
+        pos_ids=[0,0,...,0], max=0 → always gathers position 0 which produces
+        all-zero logits (position 0's hidden state is destroyed by the model
+        processing when there are many zero-embedding padding positions).
         """
         # Save original vision args BEFORE the base class destroys them
         orig_mrope = args[21] if len(args) >= 22 else None
@@ -2664,6 +2921,14 @@ class Qwen35ModelWrapper(ModelWrapper):
 
         # Let base class pad positions 0-2 (input_ids, attention_mask, position_ids)
         # NOTE: base class will zero out positions 22-23, but we saved originals above
+        # NOTE: base class pads position_ids with value=1. This is CORRECT:
+        #   - For 1-token: pos_ids=[0,1,1,...,1], max=1 → gather position 1.
+        #     Position 0 always produces zeros (unknown reason, possibly related to
+        #     how the NEFF initializes the first position). Position 1 receives DeltaNet
+        #     state propagated from position 0 and produces meaningful output.
+        #   - For N-token: pos_ids=[0,1,...,N-1,1,1,...], max=N-1 → gather last valid.
+        # V42 incorrectly re-padded with 0, causing torch.max to always return index 0
+        # which gives all-zero logits for single-token inputs.
         padded_args = super().pad_inputs(*args, pad_type=pad_type)
 
         # Check if padding is needed (CTE only, when we have 24 args)
@@ -2731,20 +2996,49 @@ class Qwen35ModelWrapper(ModelWrapper):
                     )
 
                 # Pad vision_mask: (BS, orig_len, 1) -> (BS, padded_len, 1)
-                # Extend with padded_seq_len-1 (safe scatter target for padding)
+                # CRITICAL FIX (V52g): For text-only prompts, the vision_mask is
+                # initially created with fill_value=orig_seq_len-1. After padding,
+                # this points to a VALID content position, causing
+                # encode_vision_to_input to scatter zeros over real embeddings.
+                # Fix: detect if vision_embeddings are all zeros (text-only case)
+                # and replace ALL vision_mask values with padded_seq_len-1 so the
+                # scatter targets only padding positions (which are already zeros).
+                is_text_only = (
+                    current_vis_emb is not None
+                    and current_vis_emb.ndim == 3
+                    and current_vis_emb.abs().sum().item() == 0
+                )
+
                 if (
                     current_vis_mask is not None
                     and current_vis_mask.ndim == 3
                     and current_vis_mask.shape[1] < padded_seq_len
                 ):
-                    pad_mask = torch.full(
-                        (batch_size, padded_seq_len - current_vis_mask.shape[1], 1),
-                        fill_value=padded_seq_len - 1,
-                        dtype=torch.int32,
-                    )
-                    vision_mask = torch.cat([current_vis_mask, pad_mask], dim=1)
+                    if is_text_only:
+                        # Text-only: ALL positions should scatter to last padding slot
+                        vision_mask = torch.full(
+                            (batch_size, padded_seq_len, 1),
+                            fill_value=padded_seq_len - 1,
+                            dtype=torch.int32,
+                        )
+                    else:
+                        # Real vision: keep original positions, extend with safe target
+                        pad_mask = torch.full(
+                            (batch_size, padded_seq_len - current_vis_mask.shape[1], 1),
+                            fill_value=padded_seq_len - 1,
+                            dtype=torch.int32,
+                        )
+                        vision_mask = torch.cat([current_vis_mask, pad_mask], dim=1)
                 elif current_vis_mask is not None and current_vis_mask.ndim == 3:
-                    vision_mask = current_vis_mask[:, :padded_seq_len]
+                    if is_text_only:
+                        # Already at padded size but values may be wrong
+                        vision_mask = torch.full(
+                            (batch_size, padded_seq_len, 1),
+                            fill_value=padded_seq_len - 1,
+                            dtype=torch.int32,
+                        )
+                    else:
+                        vision_mask = current_vis_mask[:, :padded_seq_len]
                 else:
                     vision_mask = torch.full(
                         (batch_size, padded_seq_len, 1),
@@ -2765,6 +3059,108 @@ class Qwen35ModelWrapper(ModelWrapper):
                 padded_args = list(padded_args)
                 padded_args[23] = padded_args[23].clamp(max=padded_seq_len - 1)
                 padded_args = tuple(padded_args)
+
+        return padded_args
+
+    def _forward_with_pad(self, *args):
+        """Override to include Qwen3.5-specific args (positions 15-23) for TKG.
+
+        The base class _forward_with_pad only builds padded_args for positions
+        0-14 when is_prefix_caching=True, then calls self._forward(*padded_args).
+        Our model has 24 traced args: 15-20 are empties, 21 is mrope_position_ids,
+        22 is vision_embeddings, 23 is vision_mask.
+
+        For TKG decode, these are all empty/zero tensors that don't need batch
+        padding. We intercept _forward to append them.
+        """
+        if not self.is_prefix_caching or len(args) <= 15:
+            return super()._forward_with_pad(*args)
+
+        # Save extra args (positions 15-23) that base class will ignore
+        extra_args = list(args[15:])
+
+        # Temporarily wrap _forward to append extra args
+        orig_forward = self._forward
+
+        def _forward_with_extra(*padded_args):
+            full_args = list(padded_args) + extra_args
+            return orig_forward(*full_args)
+
+        self._forward = _forward_with_extra
+        try:
+            result = super()._forward_with_pad(*args)
+        finally:
+            self._forward = orig_forward
+
+        return result
+
+    def _pad_prefix_caching_inputs(self, *args, pad_type="first_fit"):
+        """Override to additionally pad mRoPE and vision args for prefix caching.
+
+        The base class handles positions 0-14 (input_ids, attn_mask, pos_ids,
+        slot_mapping, block_table padding). We additionally pad:
+        - Position 21: mrope_position_ids (3, BS, seq_len) → pad seq_len dim
+        - Position 22: vision_embeddings (BS, seq_len, H) → pad seq_len dim
+        - Position 23: vision_mask (BS, seq_len, 1) → pad seq_len dim
+        """
+        # Let base class handle standard prefix caching padding (positions 0-14)
+        padded_args = super()._pad_prefix_caching_inputs(*args, pad_type=pad_type)
+
+        # If this is CTE and we have 24 args, pad the Qwen3.5-specific args
+        if (
+            len(padded_args) >= 24
+            and self.tag == CONTEXT_ENCODING_MODEL_TAG
+            and padded_args[0].shape[1] > 1  # is CTE
+        ):
+            padded_seq_len = padded_args[0].shape[1]
+            batch_size = padded_args[0].shape[0]
+
+            # Pad mrope_position_ids at position 21: (3, BS, orig_len) → (3, BS, padded_len)
+            mrope = padded_args[21]
+            if mrope.ndim == 3 and mrope.shape[-1] != padded_seq_len:
+                orig_len = mrope.shape[-1]
+                if orig_len < padded_seq_len:
+                    pad_size = padded_seq_len - orig_len
+                    last_pos = mrope[:, :, -1:]
+                    pad_offsets = torch.arange(1, pad_size + 1, dtype=mrope.dtype)
+                    pad_offsets = (
+                        pad_offsets.unsqueeze(0).unsqueeze(0).expand(3, batch_size, -1)
+                    )
+                    mrope_pad = last_pos + pad_offsets
+                    mrope = torch.cat([mrope, mrope_pad], dim=-1)
+                else:
+                    mrope = mrope[:, :, :padded_seq_len]
+
+            # Pad vision_embeddings at position 22: (BS, orig_len, H) → (BS, padded_len, H)
+            vis_emb = padded_args[22]
+            if vis_emb.ndim == 3 and vis_emb.shape[1] != padded_seq_len:
+                if vis_emb.shape[1] < padded_seq_len:
+                    pad_emb = torch.zeros(
+                        (
+                            batch_size,
+                            padded_seq_len - vis_emb.shape[1],
+                            vis_emb.shape[2],
+                        ),
+                        dtype=vis_emb.dtype,
+                    )
+                    vis_emb = torch.cat([vis_emb, pad_emb], dim=1)
+                else:
+                    vis_emb = vis_emb[:, :padded_seq_len]
+
+            # Pad vision_mask at position 23: (BS, orig_len, 1) → (BS, padded_len, 1)
+            vis_mask = padded_args[23]
+            if vis_mask.ndim == 3 and vis_mask.shape[1] != padded_seq_len:
+                if vis_mask.shape[1] < padded_seq_len:
+                    pad_mask = torch.full(
+                        (batch_size, padded_seq_len - vis_mask.shape[1], 1),
+                        fill_value=padded_seq_len - 1,
+                        dtype=torch.int32,
+                    )
+                    vis_mask = torch.cat([vis_mask, pad_mask], dim=1)
+                else:
+                    vis_mask = vis_mask[:, :padded_seq_len]
+
+            padded_args = (*padded_args[:21], mrope, vis_emb, vis_mask)
 
         return padded_args
 
@@ -2924,6 +3320,25 @@ class NeuronQwen35MoeForCausalLM(NeuronBaseForCausalLM):
                  If not in llava_args, generate sequential IDs with T=H=W (text-only).
         For TKG: slot 21 = torch.zeros((0,)) → set_none_if_empty → None → uses 2D position_ids.
         """
+        # --- PREFIX CACHING PATH ---
+        # When prefix caching is enabled, use the base class arg layout (positions 0-14)
+        # with block KV args at positions 11-14, plus Qwen3.5 custom args at 21-23.
+        if self.neuron_config.is_prefix_caching:
+            return self._get_model_outputs_prefix_caching(
+                input_ids,
+                attention_mask,
+                position_ids,
+                seq_ids,
+                sampling_params,
+                prev_hidden,
+                adapter_ids,
+                llava_args,
+                slot_mapping,
+                block_table,
+                full_context_lens,
+                computed_context_lens,
+            )
+
         is_prefill = self._is_prefill(position_ids)
 
         seq_len = input_ids.shape[1]
@@ -3210,6 +3625,115 @@ class NeuronQwen35MoeForCausalLM(NeuronBaseForCausalLM):
 
             is_run_on_neuron = self.token_generation_model.is_neuron()
 
+        return outputs, is_run_on_neuron
+
+    def _get_model_outputs_prefix_caching(
+        self,
+        input_ids,
+        attention_mask,
+        position_ids,
+        seq_ids,
+        sampling_params,
+        prev_hidden,
+        adapter_ids,
+        llava_args,
+        slot_mapping,
+        block_table,
+        full_context_lens,
+        computed_context_lens,
+    ):
+        """Handle prefix caching using block KV layout.
+
+        Uses the base class prefix caching arg layout (positions 0-14) which aligns
+        with the model's forward() parameter positions, plus Qwen3.5 custom args
+        (mRoPE, vision) at positions 21-23.
+
+        Trace layout:
+        0: input_ids, 1: attention_mask, 2: position_ids, 3: seq_ids,
+        4: sampling_params, 5: prev_hidden (empty), 6: adapter_ids,
+        7-10: empties (medusa slots),
+        11: slot_mapping, 12: active_block_table, 13: num_queries,
+        14: computed_context_lens, 15-20: empties,
+        21: mrope_position_ids, 22: vision_embeddings, 23: vision_mask
+        """
+        batch_size = input_ids.shape[0]
+        seq_len = input_ids.shape[1]
+        is_prefill = self._is_prefill(position_ids)
+
+        # Compute num_queries from full_context_lens and computed_context_lens
+        num_queries = full_context_lens - computed_context_lens
+
+        # Determine which model to use (CTE or TKG)
+        is_context_encoding = input_ids.shape[-1] > 1 and not position_ids.min().item()
+        base_model = (
+            self.context_encoding_model
+            if is_context_encoding
+            else self.token_generation_model
+        )
+
+        # Extract vision inputs from llava_args
+        if llava_args and len(llava_args) >= 2:
+            vision_embeddings = llava_args[0]
+            vision_mask = llava_args[1]
+            mrope_position_ids = llava_args[2] if len(llava_args) >= 3 else None
+        elif is_prefill:
+            vision_embeddings = torch.zeros(
+                (batch_size, seq_len, self.config.hidden_size),
+                dtype=self.config.neuron_config.torch_dtype,
+            )
+            vision_mask = torch.full(
+                (batch_size, seq_len, 1),
+                fill_value=seq_len - 1,
+                dtype=torch.int32,
+            )
+            mrope_position_ids = None
+        else:
+            vision_embeddings = torch.zeros((0,), dtype=torch.float32)
+            vision_mask = torch.zeros((0,), dtype=torch.int32)
+            mrope_position_ids = None
+
+        # For CTE: generate mRoPE position IDs if not provided
+        if is_prefill:
+            if mrope_position_ids is None:
+                mrope_position_ids = (
+                    torch.arange(0, seq_len, dtype=torch.int32)
+                    .unsqueeze(0)
+                    .unsqueeze(0)
+                    .expand(3, batch_size, -1)
+                    .contiguous()
+                )
+        else:
+            mrope_position_ids = torch.zeros((0,), dtype=torch.int32)
+
+        # Build empties for unused positions
+        empties_7_10 = [torch.empty(0) for _ in range(4)]  # positions 7-10
+        empties_15_20 = [torch.empty(0) for _ in range(6)]  # positions 15-20
+
+        # Call the model with the prefix caching layout
+        # Call the model with the prefix caching layout
+        outputs = base_model(
+            input_ids,  # 0
+            attention_mask,  # 1
+            position_ids,  # 2
+            seq_ids,  # 3
+            sampling_params,  # 4
+            torch.empty(0),  # 5: prev_hidden (unused in prefix caching)
+            adapter_ids,  # 6
+            *empties_7_10,  # 7-10: medusa slots (empty)
+            slot_mapping,  # 11: slot_mapping
+            block_table,  # 12: active_block_table
+            num_queries,  # 13: num_queries
+            computed_context_lens,  # 14: computed_context_lens
+            *empties_15_20,  # 15-20: empty
+            mrope_position_ids,  # 21: rotary_position_id
+            vision_embeddings,  # 22: vision_embeddings
+            vision_mask,  # 23: vision_mask
+        )
+
+        if is_context_encoding:
+            self.kv_cache_populated = True
+
+        is_run_on_neuron = base_model.is_neuron()
         return outputs, is_run_on_neuron
 
     def get_compiler_args(self):
