@@ -124,11 +124,42 @@ with torch.no_grad():
     print(tokenizer.decode(logits.argmax().item()))
 ```
 
+## Expert Parallelism (EP)
+
+This model supports Expert Parallelism for distributing the 512 experts across multiple EP ranks. EP reduces per-rank HBM usage for expert weights and enables full-chip utilization on trn2.48xlarge.
+
+### Validated Configurations
+
+| EP | TP | World Size | Cores | Status |
+|----|----|-----------:|------:|--------|
+| 1 | 8 | 8 | 8 | Baseline |
+| 2 | 8 | 16 | 16 | Validated |
+| 4 | 8 | 32 | 32 | Validated |
+| 8 | 8 | 64 | 64 | Validated (full chip) |
+
+### EP Configuration
+
+```python
+neuron_config = MoENeuronConfig(
+    tp_degree=8,
+    ep_degree=4,           # Expert Parallelism degree
+    moe_ep_degree=4,       # Must match ep_degree
+    moe_tp_degree=8,       # Must match tp_degree
+    # ... other config
+)
+```
+
+### EP Implementation Notes
+
+- **Shared expert scaling**: With EP > 1, the framework's world_group all-reduce sums the shared expert output `ep_degree` times (since it's identical across EP ranks). The model compensates by dividing the shared expert output by `ep_degree` in the CTE path.
+- **CTE dispatch**: The `ExpertMLPsV2.forward` must be patched to use `forward_blockwise` for CTE (the default `forward_selective_loading` does not support EP). A monkeypatch is provided in the test scripts.
+- **ctx=32 with EP=8**: Compilation fails due to NKI DeltaNet kernel assertion. Use ctx >= 128 with EP=8.
+
 ## Compatibility Matrix
 
 | Instance | SDK 2.30 |
 |----------|----------|
-| trn2.48xlarge (TP=8) | VALIDATED |
+| trn2.48xlarge (TP=8, EP=1-8) | VALIDATED |
 | trn2.3xlarge (TP=4) | NOT SUPPORTED (HBM OOM) |
 
 ## Example Checkpoints
@@ -187,3 +218,5 @@ This model supports vLLM serving via the `vllm/` directory. See `vllm/start_vllm
 3. **TP=16 not supported** — NKI DeltaNet kernel requires `linear_value_head_dim >= 16` per rank (128/16=8 is too small).
 4. **DeltaNet state reset** — Must call `model.reset()` between independent prompts to clear recurrent state.
 5. **NKI deprecation warnings** on import (cosmetic, from blockwise_mm internals in neuronx-distributed).
+6. **EP=8 requires ctx >= 128** — NKI DeltaNet kernel fails at ctx=32 with EP=8 ("Out-of-bound access... index range [0, 127] exceed dimension size of 33"). Use context_encoding_buckets with minimum size 128 for EP=8.
+7. **position_ids for padded CTE inputs** — When manually padding inputs for CTE, padding positions must have `position_id = 0` (not incrementing values). The framework uses `torch.max(position_ids)` to find the last real token. Incorrect position_ids will cause the model to output `<|endoftext|>`.

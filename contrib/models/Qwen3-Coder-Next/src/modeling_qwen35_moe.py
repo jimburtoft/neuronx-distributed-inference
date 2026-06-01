@@ -1567,7 +1567,6 @@ class SigmoidGatedSharedExperts(nn.Module):
     def __init__(self, config):
         super().__init__()
         from neuronx_distributed.modules.moe.shared_experts import SharedExperts
-        from neuronx_distributed.parallel_layers import parallel_state
 
         self.shared_experts = SharedExperts(
             hidden_size=config.hidden_size,
@@ -1582,6 +1581,9 @@ class SigmoidGatedSharedExperts(nn.Module):
 
         # Sigmoid gate: linear(hidden_size -> 1) applied to full hidden states
         self.sigmoid_gate = nn.Linear(config.hidden_size, 1, bias=False)
+
+        # Store EP degree for scaling in forward (constant, safe for tracing)
+        self.ep_degree = config.neuron_config.ep_degree
 
     @property
     def sequence_parallel_enabled(self):
@@ -1601,13 +1603,29 @@ class SigmoidGatedSharedExperts(nn.Module):
 
         Returns:
             output: (T, H) sigmoid-gated shared expert output (TP-partial from down_proj)
+
+        Note on EP scaling:
+            When Expert Parallelism is active, this output is added to the routed-expert
+            output (also TP-partial) and then all-reduced across the world_group (TP*EP).
+            The routed output is unique per EP rank (each handles different experts),
+            but this shared output is IDENTICAL across EP ranks. Without correction the
+            world_group all-reduce sums it ep_degree times. We compensate by dividing
+            by ep_degree here so the final reduced value is correct.
         """
         # Compute shared expert MLP output (TP-partial from down_proj)
         shared_output = self.shared_experts(x, seq_len)
 
         # Apply sigmoid gate: sigmoid(x @ gate_weight.T) -> (T, 1)
         gate_value = torch.sigmoid(self.sigmoid_gate(x))  # (T, 1)
-        return shared_output * gate_value
+        output = shared_output * gate_value
+
+        # Scale down by EP degree to compensate for world_group all-reduce overcounting.
+        # This only matters when ep_degree > 1 (CTE path). For TKG, the decoder handles
+        # shared experts separately with its own TP-only all-reduce.
+        if self.ep_degree > 1:
+            output = output / self.ep_degree
+
+        return output
 
 
 # ============================================================
@@ -1876,11 +1894,17 @@ class NeuronQwen35DecoderLayer(nn.Module):
 
                 shared_input = self.post_attention_layernorm(residual)
                 shared_input_flat = shared_input.reshape(-1, shared_input.shape[-1])
-                # shared_output is TP-partial (from down_proj reduce_output=False)
+                # shared_output is TP-partial (from down_proj reduce_output=False).
+                # Note: SigmoidGatedSharedExperts.forward() divides by ep_degree to
+                # correct for world_group overcounting in the CTE path. But in TKG
+                # the all-reduce is TP-only (no overcounting), so we undo the scaling.
                 shared_output = self.mlp.shared_experts(
                     shared_input_flat, shared_input.shape[1]
                 )
-                # All-reduce to match moe_output which is already fully reduced
+                ep_degree = self.config.neuron_config.ep_degree
+                if ep_degree > 1:
+                    shared_output = shared_output * ep_degree
+                # All-reduce across TP group only (not world_group)
                 shared_output = mappings.reduce_from_tensor_model_parallel_region(
                     shared_output,
                     process_group=parallel_state.get_tensor_model_parallel_group(),
