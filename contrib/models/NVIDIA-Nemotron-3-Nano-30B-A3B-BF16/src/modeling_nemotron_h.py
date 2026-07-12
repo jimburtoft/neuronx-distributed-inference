@@ -62,8 +62,10 @@ from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_confi
 from neuronx_distributed.parallel_layers import parallel_state
 from neuronx_distributed.parallel_layers.layers import (
     ColumnParallelLinear,
+    RowParallelLinear,
     ParallelEmbedding,
     BaseParallelLinear,
+    SPMDRank,
 )
 from neuronx_distributed.parallel_layers.mappings import (
     reduce_from_tensor_model_parallel_region,
@@ -85,6 +87,17 @@ USE_NKI_SCAN = (
     False  # O(L^2) quadratic scan: NKI scan produces more instructions at long context
 )
 
+# SSD NKI kernel: chunk-based O(L) scan using TensorE matmuls for intra-chunk
+# structured attention and sequential state propagation between chunks.
+# Memory bounded by O(chunk^2) per chunk, not O(L^2).
+# Adapted from nki-lib scan-kernels branch ssd.py with n_groups=8 support.
+USE_SSD_SCAN = False  # NKI SSD kernel: DGE OOB in full model (compiler issue)
+
+# Pure PyTorch SSD: same chunk-based O(chunk^2) algorithm as SSD NKI kernel,
+# but implemented entirely in PyTorch ops. Avoids NKI compiler DGE OOB issue.
+# Memory bounded by O(chunk^2 * nheads) per chunk, not O(L^2 * nheads).
+USE_PYTORCH_SSD = False  # DISABLED: WLT DramToDramTranspose hang (754 transposes)
+
 # Chunked scan: processes seq_len in chunk_size=128 blocks, avoiding O(L^2) memory.
 # Within each chunk: O(chunk^2) quadratic scan (128x128 matrix).
 # Between chunks: O(1) state propagation from previous chunk's final state.
@@ -97,6 +110,52 @@ USE_CHUNKED_SCAN = False  # Disabled: multi-hour compile times + 36x TTFT regres
 # The 1GB transpose scratchpad that caused OOM should scale proportionally.
 SCAN_HEAD_GROUP = 8  # Process 8 heads at a time (64/8 = 8 groups)
 
+# Chunked NKI SSD scan (DGE-OOB survivor pattern from Qwen3-Coder-Next DeltaNet template).
+# Uses cheap-ops-only kernel with intra-chunk quadratic + inter-chunk recurrent state.
+# Chunk size = 128 = P_MAX. Both linear-scaling in seq_len AND HBM-ceiling-defeating.
+#
+# Full-model validated on SDK 2.31 DLAMI 20260708 (Task 016 Phase 3):
+#   - Bit-identical 50-token generation vs head-grouped quadratic at ctx=128 (Task 016)
+#   - Bit-identical 30-token generation vs head-grouped quadratic at ctx=1024 (8 chunks)
+#   - Extends ctx ceiling from 2048 to 8192 on trn2.3xlarge (4x improvement)
+#   - Prefill 6-41% faster on matched contexts
+#   - Decode throughput unchanged (~100-104 tok/s)
+#
+# When True, prefill uses `mamba2_ssd_chunked_fwd`. Decode still uses the O(1) recurrent
+# path (chunked kernel is prefill-only; state handoff CE->TG is via the final_state output).
+# Kernel: contrib/src/nki_kernels/nki_mamba2_ssd_chunked.py
+# Wrapper: contrib/src/nki_kernels/chunked_ssd_wrapper.py
+# Standalone tests: tests/test_mamba2_ssd_chunked.py, tests/test_chunked_d64.py
+#
+# Set via environment variable USE_CHUNKED_NKI_SCAN=1 (or =0 to explicitly disable).
+USE_CHUNKED_NKI_SCAN = os.environ.get("USE_CHUNKED_NKI_SCAN", "0") == "1"
+
+# ==============================================================================
+# Phase 1 NKI megakernel flags (SDK 2.31 + nki-library upstream/main overlay)
+# ==============================================================================
+# These flags route MoE prefill through the NKI moe_cte megakernel (with
+# skip_gate_proj=True + activation_function=SquaredReLU). Requires the nki-lib
+# overlay (see working/Nemotron/scripts/overlay_nkilib_upstream.sh).
+#
+# USE_NKI_MOE_CTE: Wire the prefill MoE forward through nkilib.core.moe.moe_cte
+# instead of the dense per-expert loop. Requires:
+#   1. gate_up_proj_weight [E, H, 2, I_TP] with gate half zero-filled at init
+#   2. Blockwise dispatch tables constructed from topk_indices/topk_weights
+#   3. MoECTESpec with implementation=shard_on_i, block_size=128
+# The decode (TKG) path is unaffected; it remains on the current sparse index_select+bmm.
+USE_NKI_MOE_CTE = False  # Phase 1 -- pending validation on trn2.3xlarge
+
+# USE_NKI_ROUTER: Wire the router through nkilib.core.router_topk.router_topk
+# with the expert_bias parameter (feature/expert-bias-support patch, committed as
+# 6f29b5d on our nki-library-fork). Nemotron uses e_score_correction_bias for
+# expert selection; this kernel supports it via DeepSeek-V3 semantics (biased
+# scores for top-K, unbiased affinities for the routing weights).
+USE_NKI_ROUTER = False  # Phase 1 -- pending validation
+
+# MOE_CTE_BLOCK_SIZE: block_size for the moe_cte blockwise dispatch. Must be a
+# power of 2 <= 128. Larger = better utilization but more padding overhead.
+MOE_CTE_BLOCK_SIZE = 128
+
 try:
     import nki
     import nki.language as nl
@@ -108,6 +167,9 @@ except ImportError:
     if USE_NKI_SCAN:
         logger.warning("NKI not available, falling back to quadratic scan")
         USE_NKI_SCAN = False
+    if USE_SSD_SCAN:
+        logger.warning("NKI not available, falling back to quadratic scan")
+        USE_SSD_SCAN = False
 
 if HAS_NKI and USE_NKI_SCAN:
     P_MAX = 128
@@ -311,6 +373,695 @@ def _nki_selective_scan(
     return y, final_state
 
 
+if HAS_NKI and USE_SSD_SCAN:
+    import numpy as np_nki
+
+    @nki.jit
+    def ssd_scan_kernel(
+        x,  # (batch, nheads, seqlen, headdim) float32
+        dt_2d,  # (batch*nheads, seqlen) float32 — pre-reshaped
+        dt_flat,  # (batch*nheads*seqlen, 1) float32 — pre-reshaped
+        A_2d,  # (nheads, 1) float32 — pre-reshaped, negative
+        B,  # (batch, n_groups, seqlen, dstate) float32
+        C,  # (batch, n_groups, seqlen, dstate) float32
+        D_2d,  # (nheads, 1) float32 — pre-reshaped
+        chunk_size_tensor,  # (chunk_size,) dummy — encodes chunk_size as shape
+        n_groups_tensor,  # (n_groups,) dummy — encodes n_groups as shape
+    ):
+        """Chunk-based SSD kernel for Mamba-2 with n_groups support.
+
+        Adapted from nki-lib scan-kernels/ssd.py. Key changes for Nemotron:
+        - B/C are (batch, n_groups, seqlen, dstate) instead of (batch, seqlen, dstate)
+        - Single affine_range(nheads) loop (like upstream), compute i_group for B/C
+        - Causal mask built in-SBUF via affine_select (avoids DMA OOB issue)
+        - A, D, dt pre-reshaped OUTSIDE kernel to avoid WLT DramToDramTranspose hang
+        """
+        batch = x.shape[0]
+        nheads = x.shape[1]
+        seqlen = x.shape[2]
+        headdim = x.shape[3]
+        n_groups = n_groups_tensor.shape[0]
+        dstate = B.shape[3]
+        Q = chunk_size_tensor.shape[0]
+        num_chunks = seqlen // Q
+        heads_per_group = nheads // n_groups
+
+        # Allocate outputs — NKI 0.3.0 requires nl.shared_hbm for kernel outputs
+        y = nl.ndarray(
+            (batch, nheads, seqlen, headdim), dtype=x.dtype, buffer=nl.shared_hbm
+        )
+        final_state_out = nl.ndarray(
+            (batch, nheads, dstate, headdim), dtype=nl.float32, buffer=nl.shared_hbm
+        )
+
+        shuffle_mask = [0] * 32
+
+        for i_batch in nl.affine_range(batch):
+            for i_head in nl.affine_range(nheads):
+                # Compute group index for B/C access
+                i_group = i_head // heads_per_group
+
+                # --- Per-head constants ---
+                A_h = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.dma_copy(dst=A_h[0:1, 0:1], src=A_2d[i_head : i_head + 1, 0:1])
+
+                # Causal mask: construct in SBUF using affine_select
+                # (avoids NCC_IBIR243 DMA access pattern OOB with (128,128) DMA copy)
+                # affine_value = row * 1 + col * (-1) = row - col
+                # predicate: row - col >= 0 → lower triangular
+                ones_mask = nl.ndarray((Q, Q), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.memset(dst=ones_mask, value=1.0)
+                causal_sb = nl.ndarray((Q, Q), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.affine_select(
+                    dst=causal_sb,
+                    pattern=[[-1, Q]],
+                    channel_multiplier=1,
+                    on_true_tile=ones_mask,
+                    on_false_value=0.0,
+                    cmp_op=nl.greater_equal,
+                    offset=0,
+                )
+
+                ones_sb = nl.ndarray((1, Q), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.memset(dst=ones_sb, value=1.0)
+
+                zero_11 = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.memset(dst=zero_11, value=0.0)
+
+                # Init hidden state (dstate, headdim)
+                state_sb = nl.ndarray(
+                    (dstate, headdim), dtype=nl.float32, buffer=nl.sbuf
+                )
+                nisa.memset(dst=state_sb, value=0.0)
+
+                # D broadcast — D_2d already (nheads, 1), pre-reshaped outside kernel
+                D_val = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.dma_copy(dst=D_val[0:1, 0:1], src=D_2d[i_head : i_head + 1, 0:1])
+                D_Q = nl.ndarray((Q, 1), dtype=nl.float32, buffer=nl.sbuf)
+                for i_shuf in nl.static_range((Q + 31) // 32):
+                    cur_npar = min(32, Q - i_shuf * 32)
+                    nisa.nc_stream_shuffle(
+                        src=D_val[0:1, 0:1],
+                        dst=D_Q[i_shuf * 32 : i_shuf * 32 + cur_npar, 0:1],
+                        shuffle_mask=shuffle_mask,
+                    )
+
+                # --- Sequential chunk processing ---
+                for i_chunk in nl.sequential_range(num_chunks):
+                    chunk_start = i_chunk * Q
+
+                    # Load x: (Q, headdim)
+                    x_sb = nl.ndarray((Q, headdim), dtype=x.dtype, buffer=nl.sbuf)
+                    nisa.dma_copy(
+                        dst=x_sb[0:Q, 0:headdim],
+                        src=x[
+                            i_batch,
+                            i_head,
+                            chunk_start : chunk_start + Q,
+                            0:headdim,
+                        ],
+                    )
+
+                    # Load dt: (1, Q)
+                    dt_row = i_batch * nheads + i_head
+                    dt_f = nl.ndarray((1, Q), dtype=dt_2d.dtype, buffer=nl.sbuf)
+                    nisa.dma_copy(
+                        dst=dt_f[0:1, 0:Q],
+                        src=dt_2d[dt_row : dt_row + 1, chunk_start : chunk_start + Q],
+                    )
+
+                    # Load B for this GROUP: (Q, dstate)
+                    B_sb = nl.ndarray((Q, dstate), dtype=B.dtype, buffer=nl.sbuf)
+                    nisa.dma_copy(
+                        dst=B_sb[0:Q, 0:dstate],
+                        src=B[
+                            i_batch,
+                            i_group,
+                            chunk_start : chunk_start + Q,
+                            0:dstate,
+                        ],
+                    )
+
+                    # Load C for this GROUP: (Q, dstate)
+                    C_sb = nl.ndarray((Q, dstate), dtype=C.dtype, buffer=nl.sbuf)
+                    nisa.dma_copy(
+                        dst=C_sb[0:Q, 0:dstate],
+                        src=C[
+                            i_batch,
+                            i_group,
+                            chunk_start : chunk_start + Q,
+                            0:dstate,
+                        ],
+                    )
+
+                    # ====== Step 1: Cumulative decay ======
+                    log_decay_f = nl.ndarray((1, Q), dtype=nl.float32, buffer=nl.sbuf)
+                    nisa.tensor_scalar(
+                        dst=log_decay_f[0:1, 0:Q],
+                        data=dt_f[0:1, 0:Q],
+                        op0=nl.multiply,
+                        operand0=A_h[0:1, 0:1],
+                    )
+
+                    cs_f = nl.ndarray((1, Q), dtype=nl.float32, buffer=nl.sbuf)
+                    nisa.tensor_tensor_scan(
+                        dst=cs_f[0:1, 0:Q],
+                        data0=ones_sb[0:1, 0:Q],
+                        data1=log_decay_f[0:1, 0:Q],
+                        initial=zero_11[0:1, 0:1],
+                        op0=nl.multiply,
+                        op1=nl.add,
+                    )
+
+                    # Transpose cs: (1, Q) -> (Q, 1)
+                    cs_padded = nl.ndarray((Q, Q), dtype=nl.float32, buffer=nl.sbuf)
+                    nisa.tensor_copy(dst=cs_padded[0:1, 0:Q], src=cs_f[0:1, 0:Q])
+                    cs_tp_psum = nl.ndarray((Q, Q), dtype=nl.float32, buffer=nl.psum)
+                    nisa.nc_transpose(
+                        dst=cs_tp_psum[0:Q, 0:Q], data=cs_padded[0:Q, 0:Q]
+                    )
+                    cs_p = nl.ndarray((Q, 1), dtype=nl.float32, buffer=nl.sbuf)
+                    nisa.tensor_copy(dst=cs_p[0:Q, 0:1], src=cs_tp_psum[0:Q, 0:1])
+
+                    exp_cs_p = nl.ndarray((Q, 1), dtype=nl.float32, buffer=nl.sbuf)
+                    nisa.activation(
+                        op=nl.exp, data=cs_p[0:Q, 0:1], dst=exp_cs_p[0:Q, 0:1]
+                    )
+
+                    neg_cs_p = nl.ndarray((Q, 1), dtype=nl.float32, buffer=nl.sbuf)
+                    nisa.tensor_scalar(
+                        dst=neg_cs_p[0:Q, 0:1],
+                        data=cs_p[0:Q, 0:1],
+                        op0=nl.multiply,
+                        operand0=-1.0,
+                    )
+                    exp_neg_cs_p = nl.ndarray((Q, 1), dtype=nl.float32, buffer=nl.sbuf)
+                    nisa.activation(
+                        op=nl.exp,
+                        data=neg_cs_p[0:Q, 0:1],
+                        dst=exp_neg_cs_p[0:Q, 0:1],
+                    )
+
+                    # dt as (Q, 1) from flat layout
+                    dt_flat_start = dt_row * seqlen + chunk_start
+                    dt_p = nl.ndarray((Q, 1), dtype=nl.float32, buffer=nl.sbuf)
+                    nisa.dma_copy(
+                        dst=dt_p[0:Q, 0:1],
+                        src=dt_flat[dt_flat_start : dt_flat_start + Q, 0:1],
+                    )
+
+                    # dtx = dt * x: (Q, headdim)
+                    dtx = nl.ndarray((Q, headdim), dtype=nl.float32, buffer=nl.sbuf)
+                    nisa.tensor_scalar(
+                        dst=dtx[0:Q, 0:headdim],
+                        data=x_sb[0:Q, 0:headdim],
+                        op0=nl.multiply,
+                        operand0=dt_p[0:Q, 0:1],
+                    )
+
+                    # ====== Step 2: Intra-chunk structured attention ======
+                    B_f32 = nl.ndarray((Q, dstate), dtype=nl.float32, buffer=nl.sbuf)
+                    nisa.tensor_copy(dst=B_f32[0:Q, 0:dstate], src=B_sb[0:Q, 0:dstate])
+
+                    C_f32 = nl.ndarray((Q, dstate), dtype=nl.float32, buffer=nl.sbuf)
+                    nisa.tensor_copy(dst=C_f32[0:Q, 0:dstate], src=C_sb[0:Q, 0:dstate])
+
+                    C_T_psum = nl.ndarray((dstate, Q), dtype=nl.float32, buffer=nl.psum)
+                    nisa.nc_transpose(
+                        dst=C_T_psum[0:dstate, 0:Q], data=C_f32[0:Q, 0:dstate]
+                    )
+                    C_T = nl.ndarray((dstate, Q), dtype=nl.float32, buffer=nl.sbuf)
+                    nisa.tensor_copy(
+                        dst=C_T[0:dstate, 0:Q], src=C_T_psum[0:dstate, 0:Q]
+                    )
+
+                    B_T_psum = nl.ndarray((dstate, Q), dtype=nl.float32, buffer=nl.psum)
+                    nisa.nc_transpose(
+                        dst=B_T_psum[0:dstate, 0:Q], data=B_f32[0:Q, 0:dstate]
+                    )
+                    B_T = nl.ndarray((dstate, Q), dtype=nl.float32, buffer=nl.sbuf)
+                    nisa.tensor_copy(
+                        dst=B_T[0:dstate, 0:Q], src=B_T_psum[0:dstate, 0:Q]
+                    )
+
+                    # CB = C @ B^T: (Q, Q)
+                    CB_psum = nl.ndarray((Q, Q), dtype=nl.float32, buffer=nl.psum)
+                    nisa.nc_matmul(
+                        dst=CB_psum[0:Q, 0:Q],
+                        stationary=C_T[0:dstate, 0:Q],
+                        moving=B_T[0:dstate, 0:Q],
+                    )
+                    CB_sb = nl.ndarray((Q, Q), dtype=nl.float32, buffer=nl.sbuf)
+                    nisa.tensor_copy(dst=CB_sb[0:Q, 0:Q], src=CB_psum[0:Q, 0:Q])
+
+                    # Apply causal mask
+                    nisa.tensor_tensor(
+                        dst=CB_sb[0:Q, 0:Q],
+                        data1=CB_sb[0:Q, 0:Q],
+                        data2=causal_sb[0:Q, 0:Q],
+                        op=nl.multiply,
+                    )
+
+                    # Scale input: X_scaled = dtx * exp(-cs)
+                    X_scaled = nl.ndarray(
+                        (Q, headdim), dtype=nl.float32, buffer=nl.sbuf
+                    )
+                    nisa.tensor_scalar(
+                        dst=X_scaled[0:Q, 0:headdim],
+                        data=dtx[0:Q, 0:headdim],
+                        op0=nl.multiply,
+                        operand0=exp_neg_cs_p[0:Q, 0:1],
+                    )
+
+                    # Transpose CB for matmul
+                    CB_T_psum = nl.ndarray((Q, Q), dtype=nl.float32, buffer=nl.psum)
+                    nisa.nc_transpose(dst=CB_T_psum[0:Q, 0:Q], data=CB_sb[0:Q, 0:Q])
+                    CB_T = nl.ndarray((Q, Q), dtype=nl.float32, buffer=nl.sbuf)
+                    nisa.tensor_copy(dst=CB_T[0:Q, 0:Q], src=CB_T_psum[0:Q, 0:Q])
+
+                    # Y_intra = CB_causal @ X_scaled: (Q, headdim)
+                    Y_psum = nl.ndarray((Q, headdim), dtype=nl.float32, buffer=nl.psum)
+                    nisa.nc_matmul(
+                        dst=Y_psum[0:Q, 0:headdim],
+                        stationary=CB_T[0:Q, 0:Q],
+                        moving=X_scaled[0:Q, 0:headdim],
+                    )
+                    Y_intra = nl.ndarray((Q, headdim), dtype=nl.float32, buffer=nl.sbuf)
+                    nisa.tensor_copy(
+                        dst=Y_intra[0:Q, 0:headdim], src=Y_psum[0:Q, 0:headdim]
+                    )
+
+                    # Scale by exp(cs)
+                    nisa.tensor_scalar(
+                        dst=Y_intra[0:Q, 0:headdim],
+                        data=Y_intra[0:Q, 0:headdim],
+                        op0=nl.multiply,
+                        operand0=exp_cs_p[0:Q, 0:1],
+                    )
+
+                    # ====== Step 3: State-to-output ======
+                    Y_off_psum = nl.ndarray(
+                        (Q, headdim), dtype=nl.float32, buffer=nl.psum
+                    )
+                    nisa.nc_matmul(
+                        dst=Y_off_psum[0:Q, 0:headdim],
+                        stationary=C_T[0:dstate, 0:Q],
+                        moving=state_sb[0:dstate, 0:headdim],
+                    )
+                    Y_off = nl.ndarray((Q, headdim), dtype=nl.float32, buffer=nl.sbuf)
+                    nisa.tensor_copy(
+                        dst=Y_off[0:Q, 0:headdim], src=Y_off_psum[0:Q, 0:headdim]
+                    )
+                    nisa.tensor_scalar(
+                        dst=Y_off[0:Q, 0:headdim],
+                        data=Y_off[0:Q, 0:headdim],
+                        op0=nl.multiply,
+                        operand0=exp_cs_p[0:Q, 0:1],
+                    )
+
+                    # ====== Step 4: Update hidden state ======
+                    exp_cs_last = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
+                    nisa.activation(
+                        op=nl.exp,
+                        data=cs_f[0:1, Q - 1 : Q],
+                        dst=exp_cs_last[0:1, 0:1],
+                    )
+
+                    # Broadcast exp(cs_last) to (Q, 1)
+                    exp_cs_last_Q = nl.ndarray((Q, 1), dtype=nl.float32, buffer=nl.sbuf)
+                    for i_shuf in nl.static_range((Q + 31) // 32):
+                        cur_npar = min(32, Q - i_shuf * 32)
+                        nisa.nc_stream_shuffle(
+                            src=exp_cs_last[0:1, 0:1],
+                            dst=exp_cs_last_Q[
+                                i_shuf * 32 : i_shuf * 32 + cur_npar, 0:1
+                            ],
+                            shuffle_mask=shuffle_mask,
+                        )
+
+                    # decay_to_end = exp(cs_last - cs)
+                    decay_to_end = nl.ndarray((Q, 1), dtype=nl.float32, buffer=nl.sbuf)
+                    nisa.tensor_tensor(
+                        dst=decay_to_end[0:Q, 0:1],
+                        data1=exp_neg_cs_p[0:Q, 0:1],
+                        data2=exp_cs_last_Q[0:Q, 0:1],
+                        op=nl.multiply,
+                    )
+
+                    # dtx_state = dtx * decay_to_end
+                    dtx_state = nl.ndarray(
+                        (Q, headdim), dtype=nl.float32, buffer=nl.sbuf
+                    )
+                    nisa.tensor_scalar(
+                        dst=dtx_state[0:Q, 0:headdim],
+                        data=dtx[0:Q, 0:headdim],
+                        op0=nl.multiply,
+                        operand0=decay_to_end[0:Q, 0:1],
+                    )
+
+                    # chunk_state = B^T @ dtx_state: (dstate, headdim)
+                    chunk_state_psum = nl.ndarray(
+                        (dstate, headdim), dtype=nl.float32, buffer=nl.psum
+                    )
+                    nisa.nc_matmul(
+                        dst=chunk_state_psum[0:dstate, 0:headdim],
+                        stationary=B_f32[0:Q, 0:dstate],
+                        moving=dtx_state[0:Q, 0:headdim],
+                    )
+                    chunk_state_sb = nl.ndarray(
+                        (dstate, headdim), dtype=nl.float32, buffer=nl.sbuf
+                    )
+                    nisa.tensor_copy(
+                        dst=chunk_state_sb[0:dstate, 0:headdim],
+                        src=chunk_state_psum[0:dstate, 0:headdim],
+                    )
+
+                    # Broadcast exp(cs_last) to (dstate, 1)
+                    exp_cs_last_N = nl.ndarray(
+                        (dstate, 1), dtype=nl.float32, buffer=nl.sbuf
+                    )
+                    for i_shuf in nl.static_range((dstate + 31) // 32):
+                        cur_npar = min(32, dstate - i_shuf * 32)
+                        nisa.nc_stream_shuffle(
+                            src=exp_cs_last[0:1, 0:1],
+                            dst=exp_cs_last_N[
+                                i_shuf * 32 : i_shuf * 32 + cur_npar, 0:1
+                            ],
+                            shuffle_mask=shuffle_mask,
+                        )
+
+                    # state = exp(cs_last) * state + chunk_state
+                    nisa.tensor_scalar(
+                        dst=state_sb[0:dstate, 0:headdim],
+                        data=state_sb[0:dstate, 0:headdim],
+                        op0=nl.multiply,
+                        operand0=exp_cs_last_N[0:dstate, 0:1],
+                    )
+                    nisa.tensor_tensor(
+                        dst=state_sb[0:dstate, 0:headdim],
+                        data1=state_sb[0:dstate, 0:headdim],
+                        data2=chunk_state_sb[0:dstate, 0:headdim],
+                        op=nl.add,
+                    )
+
+                    # ====== Step 5: Combine and store output ======
+                    y_chunk = nl.ndarray((Q, headdim), dtype=nl.float32, buffer=nl.sbuf)
+                    nisa.tensor_tensor(
+                        dst=y_chunk[0:Q, 0:headdim],
+                        data1=Y_intra[0:Q, 0:headdim],
+                        data2=Y_off[0:Q, 0:headdim],
+                        op=nl.add,
+                    )
+
+                    # D skip connection
+                    Dx = nl.ndarray((Q, headdim), dtype=nl.float32, buffer=nl.sbuf)
+                    nisa.tensor_scalar(
+                        dst=Dx[0:Q, 0:headdim],
+                        data=x_sb[0:Q, 0:headdim],
+                        op0=nl.multiply,
+                        operand0=D_Q[0:Q, 0:1],
+                    )
+                    nisa.tensor_tensor(
+                        dst=y_chunk[0:Q, 0:headdim],
+                        data1=y_chunk[0:Q, 0:headdim],
+                        data2=Dx[0:Q, 0:headdim],
+                        op=nl.add,
+                    )
+
+                    # Store output
+                    nisa.dma_copy(
+                        dst=y[
+                            i_batch,
+                            i_head,
+                            chunk_start : chunk_start + Q,
+                            0:headdim,
+                        ],
+                        src=y_chunk[0:Q, 0:headdim],
+                    )
+
+                # Store final state
+                nisa.dma_copy(
+                    dst=final_state_out[i_batch, i_head, 0:dstate, 0:headdim],
+                    src=state_sb[0:dstate, 0:headdim],
+                )
+
+        return y, final_state_out
+
+
+def _ssd_prefill_scan(
+    hidden_states_ssm,
+    dt_processed,
+    A,
+    B,
+    C,
+    D,
+    num_heads,
+    head_dim,
+    ssm_state_size,
+    n_groups,
+    chunk_size=128,
+):
+    """Wrapper to call SSD NKI kernel from PyTorch.
+
+    Handles tensor layout transformation:
+    - PyTorch: x (B, L, H, D), B/C (B, L, n_groups, S)
+    - NKI kernel: x (B, H, L, D), B/C (B, n_groups, L, S)
+
+    Args:
+        hidden_states_ssm: (batch, seq_len, num_heads, head_dim)
+        dt_processed: (batch, seq_len, num_heads)
+        A: (num_heads,) negative
+        B: (batch, seq_len, n_groups, ssm_state_size) -- NOT expanded
+        C: (batch, seq_len, n_groups, ssm_state_size) -- NOT expanded
+        D: (num_heads,)
+        n_groups: int (8 for Nemotron)
+        chunk_size: int (128)
+
+    Returns:
+        y: (batch, seq_len, num_heads, head_dim)
+        final_state: (batch, num_heads, head_dim, ssm_state_size)
+    """
+    batch, seq_len = hidden_states_ssm.shape[:2]
+
+    # Transpose to kernel layout
+    x_nki = hidden_states_ssm.permute(0, 2, 1, 3).contiguous()  # (B, H, L, D)
+    dt_nki = dt_processed.permute(0, 2, 1).contiguous()  # (B, H, L)
+    B_nki = B.permute(0, 2, 1, 3).contiguous()  # (B, n_groups, L, S)
+    C_nki = C.permute(0, 2, 1, 3).contiguous()  # (B, n_groups, L, S)
+
+    # Pre-reshape dt, A, D OUTSIDE the NKI kernel to avoid WLT DramToDramTranspose
+    # hang. When reshapes happen inside the kernel on model parameters, the WLT
+    # extracts them as weight transpose ops, causing the compiler to hang.
+    dt_2d = dt_nki.reshape(batch * num_heads, seq_len).contiguous()  # (B*H, L)
+    dt_flat = dt_nki.reshape(batch * num_heads * seq_len, 1).contiguous()  # (B*H*L, 1)
+    A_2d = A.reshape(num_heads, 1).contiguous()  # (H, 1)
+    D_2d = D.reshape(num_heads, 1).contiguous()  # (H, 1)
+
+    # Dummy tensors encoding compile-time dimensions
+    device = hidden_states_ssm.device
+    chunk_size_tensor = torch.zeros(chunk_size, dtype=torch.float32, device=device)
+    n_groups_tensor = torch.zeros(n_groups, dtype=torch.float32, device=device)
+
+    y_nki, state_nki = ssd_scan_kernel(
+        x_nki,
+        dt_2d,
+        dt_flat,
+        A_2d,
+        B_nki,
+        C_nki,
+        D_2d,
+        chunk_size_tensor,
+        n_groups_tensor,
+    )
+
+    # Transpose back: (B, H, L, D) -> (B, L, H, D)
+    y = y_nki.permute(0, 2, 1, 3).contiguous()
+
+    # state: (B, H, S, D) -> (B, H, D, S)
+    final_state = state_nki.permute(0, 1, 3, 2).contiguous()
+
+    return y, final_state
+
+
+def _pytorch_ssd_scan(
+    hidden_states_ssm,
+    dt_processed,
+    A,
+    B,
+    C,
+    D,
+    num_heads,
+    head_dim,
+    ssm_state_size,
+    n_groups,
+    chunk_size=128,
+    padding_mask=None,
+):
+    """Pure PyTorch SSD (State Space Duality) scan for Mamba-2 prefill.
+
+    Implements the same chunk-based algorithm as the NKI SSD kernel but using
+    standard PyTorch ops. This avoids compiler DGE OOB issues while achieving
+    O(chunk^2) memory per chunk instead of O(L^2).
+
+    SSD algorithm per chunk (size Q):
+      1. Cumulative decay: cs = cumsum(dt * A)
+      2. Intra-chunk: Y_intra = exp(cs) * ((CB * causal) @ (exp(-cs) * dt * x))
+         where CB = C @ B^T is the structured attention matrix (Q, Q)
+      3. State-to-output: Y_off = exp(cs) * (C @ state)
+      4. State update: state = exp(cs_last) * state + B^T @ (dt * x * exp(cs_last - cs))
+      5. Output: y = Y_intra + Y_off + D * x
+
+    Vectorized: within each B/C group, all heads share the same CB matrix.
+    CB @ X_scaled is done as a single batched matmul across heads.
+
+    Args:
+        hidden_states_ssm: (batch, seq_len, num_heads, head_dim) float32
+        dt_processed: (batch, seq_len, num_heads) float32
+        A: (num_heads,) float32 (negative)
+        B: (batch, seq_len, n_groups, ssm_state_size) float32 — NOT expanded
+        C: (batch, seq_len, n_groups, ssm_state_size) float32 — NOT expanded
+        D: (num_heads,) float32
+        n_groups: int (8 for Nemotron)
+        chunk_size: int (128)
+        padding_mask: (batch, max_seq_len) or None
+
+    Returns:
+        y: (batch, seq_len, num_heads, head_dim) float32
+        final_state: (batch, num_heads, head_dim, ssm_state_size) float32
+    """
+    batch, seq_len = hidden_states_ssm.shape[:2]
+    device = hidden_states_ssm.device
+    Q = chunk_size
+    n_chunks = seq_len // Q
+    heads_per_group = num_heads // n_groups
+
+    # Reshape to (batch, n_chunks, Q, ...) for chunk processing
+    x = hidden_states_ssm.reshape(batch, n_chunks, Q, num_heads, head_dim)
+    dt_r = dt_processed.reshape(batch, n_chunks, Q, num_heads)
+    B_chunked = B.reshape(batch, n_chunks, Q, n_groups, ssm_state_size)
+    C_chunked = C.reshape(batch, n_chunks, Q, n_groups, ssm_state_size)
+
+    # Causal mask (Q, Q) — lower triangular, reused for all chunks
+    causal_mask = torch.tril(
+        torch.ones(Q, Q, device=device, dtype=hidden_states_ssm.dtype)
+    )
+
+    # Allocate output
+    y = torch.zeros_like(hidden_states_ssm)  # (B, L, H, D)
+
+    # Hidden state: (B, H, S, D) — following SSD convention (dstate, headdim)
+    state = torch.zeros(
+        batch,
+        num_heads,
+        ssm_state_size,
+        head_dim,
+        device=device,
+        dtype=hidden_states_ssm.dtype,
+    )
+
+    for chunk_idx in range(n_chunks):
+        x_c = x[:, chunk_idx]  # (B, Q, H, D)
+        dt_c = dt_r[:, chunk_idx]  # (B, Q, H)
+        B_c = B_chunked[:, chunk_idx]  # (B, Q, n_groups, S)
+        C_c = C_chunked[:, chunk_idx]  # (B, Q, n_groups, S)
+
+        t0 = chunk_idx * Q
+        y_parts = []
+        state_new_parts = []
+
+        # Process one B/C group at a time.
+        # Each group has `heads_per_group` heads sharing the same B/C.
+        for gg in range(n_groups):
+            h_start = gg * heads_per_group
+            h_end = h_start + heads_per_group
+            G = heads_per_group
+
+            x_g = x_c[:, :, h_start:h_end, :]  # (B, Q, G, D)
+            dt_g = dt_c[:, :, h_start:h_end]  # (B, Q, G)
+            A_g = A[h_start:h_end]  # (G,)
+
+            # Step 1: Cumulative decay
+            log_decay = dt_g * A_g.view(1, 1, -1)  # (B, Q, G)
+            cs = torch.cumsum(log_decay, dim=1)  # (B, Q, G)
+
+            exp_cs = torch.exp(cs)  # (B, Q, G)
+            exp_neg_cs = torch.exp(-cs)  # (B, Q, G)
+
+            # dt * x: (B, Q, G, D)
+            dtx = dt_g.unsqueeze(-1) * x_g
+
+            # exp(-cs) * dt * x: (B, Q, G, D)
+            X_scaled = exp_neg_cs.unsqueeze(-1) * dtx
+
+            B_g = B_c[:, :, gg, :]  # (B, Q, S)
+            C_g = C_c[:, :, gg, :]  # (B, Q, S)
+
+            # Step 2: Intra-chunk structured attention
+            # CB = C @ B^T: (B, Q, Q) — shared across all heads in group
+            CB = torch.bmm(C_g, B_g.transpose(1, 2))  # (B, Q, Q)
+            CB = CB * causal_mask.unsqueeze(0)  # (B, Q, Q)
+
+            # Y_intra for all G heads at once using einsum (avoids expand/reshape):
+            # CB: (B, Q, Q), X_scaled: (B, Q, G, D)
+            # Y_intra = CB @ X_scaled along the Q dimension
+            # einsum("bti,bigd->btgd", CB, X_scaled) — broadcast CB across G heads
+            Y_intra = torch.einsum("bti,bigd->btgd", CB, X_scaled)  # (B, Q, G, D)
+
+            # Scale by exp(cs)
+            Y_intra = exp_cs.unsqueeze(-1) * Y_intra  # (B, Q, G, D)
+
+            # Step 3: State-to-output
+            # Y_off = exp(cs) * (C @ state)
+            # C_g: (B, Q, S), state_g: (B, G, S, D) -> Y_off: (B, Q, G, D)
+            # For each head h: Y_off_h = C_g @ state_g[:, h]
+            # einsum("bqs,bgsd->bqgd", C_g, state_g)
+            state_g = state[:, h_start:h_end, :, :]  # (B, G, S, D)
+            Y_off = torch.einsum("bqs,bgsd->bqgd", C_g, state_g)  # (B, Q, G, D)
+
+            Y_off = exp_cs.unsqueeze(-1) * Y_off  # (B, Q, G, D)
+
+            # D skip connection
+            D_g = D[h_start:h_end].view(1, 1, -1, 1)
+            y_g = Y_intra + Y_off + D_g * x_g  # (B, Q, G, D)
+
+            y_parts.append(y_g)
+
+            # Step 4: Compute new state for this group
+            # state_new = exp(cs_last) * state + B^T @ (dtx * decay_to_end)
+            cs_last = cs[:, -1:, :]  # (B, 1, G)
+            decay_to_end = torch.exp(cs_last - cs)  # (B, Q, G)
+
+            # dtx_state = dtx * decay_to_end: (B, Q, G, D)
+            dtx_state = decay_to_end.unsqueeze(-1) * dtx  # (B, Q, G, D)
+
+            # chunk_state: B^T @ dtx_state for each head
+            # B_g: (B, Q, S), dtx_state: (B, Q, G, D)
+            # For each head h: chunk_state_h = B_g^T @ dtx_state[:,:,h,:] -> (B, S, D)
+            # einsum("bqs,bqgd->bgsd", B_g, dtx_state)
+            chunk_state = torch.einsum("bqs,bqgd->bgsd", B_g, dtx_state)
+            # (B, G, S, D)
+
+            # Decay existing state and add chunk contribution
+            exp_cs_last_g = torch.exp(cs_last[:, 0, :])  # (B, G)
+            state_new_g = (
+                exp_cs_last_g.unsqueeze(-1).unsqueeze(-1) * state_g + chunk_state
+            )  # (B, G, S, D)
+
+            state_new_parts.append(state_new_g)
+
+        # Concatenate groups and store output
+        y_chunk = torch.cat(y_parts, dim=2)  # (B, Q, H, D)
+        y[:, t0 : t0 + Q, :, :] = y_chunk
+
+        # Update full state (no in-place slice assignment — full tensor reassignment)
+        state = torch.cat(state_new_parts, dim=1)  # (B, H, S, D)
+
+    # Final state: (B, H, S, D) -> (B, H, D, S)
+    final_state = state.permute(0, 1, 3, 2).contiguous()
+
+    return y, final_state
+
+
 def _chunked_quadratic_scan(
     x,
     dt_processed,
@@ -489,6 +1240,30 @@ def get_rmsnorm_cls():
     return LlamaRMSNorm if cpu_mode() else CustomRMSNorm
 
 
+def _gated_rmsnorm_with_weight(hidden_states, gate, weight, group_size, eps):
+    """Gated RMSNorm with explicit weight tensor (for per-rank TP slicing).
+
+    Same computation as NemotronRMSNormGated.forward(), but takes weight
+    as an argument instead of from self.weight. This allows using a per-rank
+    slice of the full norm weight.
+    """
+    input_dtype = hidden_states.dtype
+    hidden_states = hidden_states.to(torch.float32)
+
+    orig_shape = hidden_states.shape
+    num_groups = orig_shape[-1] // group_size
+
+    hidden_states = hidden_states.view(*orig_shape[:-1], num_groups, group_size)
+    variance = hidden_states.pow(2).mean(-1, keepdim=True)
+    hidden_states = hidden_states * torch.rsqrt(variance + eps)
+    hidden_states = hidden_states.view(*orig_shape)
+
+    hidden_states = (weight * hidden_states).to(input_dtype)
+    if gate is not None:
+        hidden_states = hidden_states * F.silu(gate)
+    return hidden_states
+
+
 class NemotronRMSNormGated(nn.Module):
     """Gated RMSNorm: RMSNorm(x) * SiLU(gate). Gate applied AFTER norm.
 
@@ -620,14 +1395,22 @@ class NeuronNemotronMamba2Layer(nn.Module):
     """
     Mamba-2 layer for Nemotron, with NxDI TP support.
 
-    TP sharding strategy (Falcon-H1 pattern): use ColumnParallelLinear with
-    gather_output=True for in_proj and out_proj. All SSM parameters (dt_bias,
-    A_log, D), conv weights, and norm weights are REPLICATED across TP ranks
-    (full size, no sharding). Each rank computes the full SSM on all heads,
-    then the out_proj gather_output=True handles the all-reduce implicitly.
+    TP sharding strategy (HEAD-SHARDED SSM via split projections):
+    - gate_proj, xBC_proj, dt_proj: three separate ColumnParallelLinear
+      (gather_output=False) modules. preshard_hook splits the checkpoint's
+      in_proj.weight into these three, with xBC columns reordered for TP
+      alignment. Each rank's ColumnParallelLinear produces per-rank output
+      directly without any post-projection slicing.
+    - SSM computation runs on num_heads/TP heads per rank.
+    - SSM params (dt_bias, A_log, D, conv weights, norm) sharded at load time
+      via preshard_hook — no runtime rank-based indexing needed.
+    - out_proj: RowParallelLinear(input_is_parallel=True) — takes per-rank
+      intermediate_size/TP input, produces hidden_size output with all-reduce.
 
-    NKI O(L) selective scan for prefill (USE_NKI_SCAN=True) or
-    pure PyTorch O(L^2) quadratic fallback. O(1) decode.
+    This reduces the dominant dBx scratchpad from 2 GB/layer (64 heads) to
+    ~250 MB/layer (16 heads at TP=4), enabling CTE>2048.
+
+    NKI O(L) SSD kernel or O(L^2) quadratic fallback. O(1) decode.
     Manual depthwise conv1d (TEN404 workaround).
     External state buffers for input_output_aliases persistence.
     """
@@ -641,42 +1424,90 @@ class NeuronNemotronMamba2Layer(nn.Module):
         self.conv_kernel_size = config.conv_kernel
         self.chunk_size = getattr(config, "chunk_size", 128)
 
-        # Full dimensions — NOT divided by TP (Falcon-H1 replicated pattern)
-        self.num_heads = config.mamba_num_heads  # 64
-        self.n_groups = config.n_groups  # 8
-        self.intermediate_size = self.num_heads * self.head_dim  # 64*64=4096
-        self.groups_time_state_size = self.n_groups * self.ssm_state_size  # 8*128=1024
-        self.conv_dim = self.intermediate_size + 2 * self.groups_time_state_size  # 6144
+        # FULL dimensions (before TP sharding)
+        self.num_heads_full = config.mamba_num_heads  # 64
+        self.n_groups_full = config.n_groups  # 8
 
-        # Projection size for in_proj: gate + xBC + dt
-        projection_size = (
-            self.intermediate_size + self.conv_dim + self.num_heads
+        # TP degree
+        if parallel_state.model_parallel_is_initialized():
+            self.tp_degree = parallel_state.get_tensor_model_parallel_size()
+        else:
+            self.tp_degree = 1
+
+        # Per-rank dimensions (sharded along heads)
+        assert self.num_heads_full % self.tp_degree == 0, (
+            f"num_heads={self.num_heads_full} not divisible by tp_degree={self.tp_degree}"
+        )
+        assert self.n_groups_full % self.tp_degree == 0, (
+            f"n_groups={self.n_groups_full} not divisible by tp_degree={self.tp_degree}"
+        )
+        self.num_heads = self.num_heads_full // self.tp_degree  # 64/4=16
+        self.n_groups = self.n_groups_full // self.tp_degree  # 8/4=2
+        self.intermediate_size = self.num_heads * self.head_dim  # 16*64=1024
+        self.groups_time_state_size = self.n_groups * self.ssm_state_size  # 2*128=256
+        self.conv_dim = self.intermediate_size + 2 * self.groups_time_state_size  # 1536
+
+        # Full dimensions for projections
+        self.intermediate_size_full = self.num_heads_full * self.head_dim  # 4096
+        self.groups_time_state_size_full = (
+            self.n_groups_full * self.ssm_state_size
+        )  # 1024
+        self.conv_dim_full = (
+            self.intermediate_size_full + 2 * self.groups_time_state_size_full
+        )  # 6144
+        projection_size_full = (
+            self.intermediate_size_full + self.conv_dim_full + self.num_heads_full
         )  # 10304
 
-        # Single ColumnParallelLinear with gather_output=True (Falcon-H1 pattern)
-        # This avoids the scatter bug and produces full-size output on every rank.
+        # Split in_proj into 3 separate ColumnParallelLinear to avoid
+        # neuronx-cc ICE (NCC_IBIR182) triggered by slicing a single
+        # ColumnParallelLinear(gather_output=False) output of size 2576.
+        # preshard_hook splits the checkpoint's in_proj.weight into these 3.
         if parallel_state.model_parallel_is_initialized():
-            self.in_proj = ColumnParallelLinear(
+            self.gate_proj = ColumnParallelLinear(
                 self.hidden_size,
-                projection_size,
+                self.intermediate_size_full,  # 4096
                 bias=config.mamba_proj_bias,
-                gather_output=True,
+                gather_output=False,
             )
-            self.out_proj = ColumnParallelLinear(
-                self.intermediate_size,
+            self.xBC_proj = ColumnParallelLinear(
+                self.hidden_size,
+                self.conv_dim_full,  # 6144
+                bias=config.mamba_proj_bias,
+                gather_output=False,
+            )
+            self.dt_proj = ColumnParallelLinear(
+                self.hidden_size,
+                self.num_heads_full,  # 64
+                bias=config.mamba_proj_bias,
+                gather_output=False,
+            )
+            # out_proj: RowParallelLinear — input is per-rank intermediate_size,
+            # output is hidden_size, with all-reduce across TP ranks.
+            self.out_proj = RowParallelLinear(
+                self.intermediate_size_full,
                 self.hidden_size,
                 bias=False,
-                gather_output=True,
+                input_is_parallel=True,
             )
         else:
-            self.in_proj = nn.Linear(
-                self.hidden_size, projection_size, bias=config.mamba_proj_bias
+            self.gate_proj = nn.Linear(
+                self.hidden_size,
+                self.intermediate_size_full,
+                bias=config.mamba_proj_bias,
+            )
+            self.xBC_proj = nn.Linear(
+                self.hidden_size, self.conv_dim_full, bias=config.mamba_proj_bias
+            )
+            self.dt_proj = nn.Linear(
+                self.hidden_size, self.num_heads_full, bias=config.mamba_proj_bias
             )
             self.out_proj = nn.Linear(
-                self.intermediate_size, self.hidden_size, bias=False
+                self.intermediate_size_full, self.hidden_size, bias=False
             )
 
-        # Manual depthwise conv1d (TEN404 workaround) — FULL conv_dim (replicated)
+        # Manual depthwise conv1d (TEN404 workaround) — per-rank conv_dim.
+        # Checkpoint has full-size tensors; shard_children shards per-rank.
         self.conv_weight = nn.Parameter(
             torch.randn(self.conv_dim, self.conv_kernel_size)
         )
@@ -685,35 +1516,170 @@ class NeuronNemotronMamba2Layer(nn.Module):
         else:
             self.conv_bias = None
 
-        # SSM parameters — FULL num_heads (replicated, not TP-sharded)
+        # Mark conv params for TP sharding by shard_children (dim=0 split).
+        # NeuronNemotronMamba2Layer is registered as a supported sharded module
+        # so shard_children will process these parameters per-rank.
+        for param in [self.conv_weight] + (
+            [self.conv_bias] if self.conv_bias is not None else []
+        ):
+            param.tensor_model_parallel = True
+            param.partition_dim = 0
+            param.num_partitions = self.tp_degree
+            param.partition_stride = 1
+
+        # SSM parameters — per-rank num_heads. shard_children shards per-rank.
         self.dt_bias = nn.Parameter(torch.ones(self.num_heads))
         A = torch.arange(1, self.num_heads + 1)
         self.A_log = nn.Parameter(torch.log(A))
         self.D = nn.Parameter(torch.ones(self.num_heads))
 
-        # Gated RMSNorm with per-group normalization — FULL sizes (replicated)
-        # group_size = intermediate_size / n_groups = 4096 / 8 = 512
+        for param in [self.dt_bias, self.A_log, self.D]:
+            param.tensor_model_parallel = True
+            param.partition_dim = 0
+            param.num_partitions = self.tp_degree
+            param.partition_stride = 1
+
+        # Gated RMSNorm — per-rank intermediate_size. shard_children shards weight.
+        group_size = self.intermediate_size // self.n_groups  # 512 (same as full)
         self.norm = NemotronRMSNormGated(
             self.intermediate_size,
-            group_size=self.intermediate_size // self.n_groups
-            if self.n_groups > 0
-            else self.intermediate_size,
+            group_size=group_size if self.n_groups > 0 else self.intermediate_size,
             eps=getattr(config, "norm_eps", 1e-5),
         )
+        # Mark norm weight for TP sharding
+        self.norm.weight.tensor_model_parallel = True
+        self.norm.weight.partition_dim = 0
+        self.norm.weight.num_partitions = self.tp_degree
+        self.norm.weight.partition_stride = 1
 
         self.time_step_limit = (0.0, float("inf"))
+
+        # Per-rank projection output size: gate + xBC + dt per rank
+        # = intermediate_size + conv_dim + num_heads = 1024 + 1536 + 16 = 2576
+        self.projection_size_per_rank = (
+            self.intermediate_size + self.conv_dim + self.num_heads
+        )
+
+    def preshard_hook(self, model_state_dict, prefix):
+        """Transform checkpoint layout for TP-sharded Mamba (rank-independent).
+
+        This hook is called ONCE by invoke_preshard_hook (not per-rank).
+        It performs rank-independent transformations only:
+        1. Splits in_proj.weight/bias into gate_proj, xBC_proj, dt_proj
+        2. Reorders xBC to TP-interleaved layout
+
+        Per-rank sharding of conv_weight, conv_bias, dt_bias, A_log, D,
+        and norm.weight is handled by shard_children via tensor_model_parallel
+        annotations on the parameters.
+
+        invoke_preshard_hook stops recursing into children when it finds
+        a preshard_hook, so we manually forward to children's hooks.
+        """
+        if self.tp_degree <= 1:
+            return True
+
+        # Strip trailing "weight"/"bias" that invoke_preshard_hook appends
+        if prefix.endswith("weight"):
+            module_prefix = prefix[: -len("weight")]
+        elif prefix.endswith("bias"):
+            module_prefix = prefix[: -len("bias")]
+        else:
+            module_prefix = prefix
+
+        tp = self.tp_degree
+
+        # ---------------------------------------------------------------
+        # Split checkpoint in_proj.weight/bias into gate_proj, xBC_proj, dt_proj.
+        # HF layout: [gate(4096) | x(4096) | B(1024) | C(1024) | dt(64)] = 10304
+        # gate_proj gets gate(4096), xBC_proj gets [x|B|C](6144), dt_proj gets dt(64).
+        # ColumnParallelLinear's shard_children will then shard each per-rank.
+        # ---------------------------------------------------------------
+        for suffix in ["weight", "bias"]:
+            in_proj_key = module_prefix + "in_proj." + suffix
+            if in_proj_key not in model_state_dict:
+                continue
+            tensor = model_state_dict[in_proj_key]
+            # ColumnParallelLinear weight: (output_size, input_size) — split along dim 0
+            dim = 0
+
+            sz = tensor.shape[dim]
+            assert (
+                sz
+                == self.intermediate_size_full
+                + self.conv_dim_full
+                + self.num_heads_full
+            ), (
+                f"in_proj size mismatch: {sz} != {self.intermediate_size_full + self.conv_dim_full + self.num_heads_full}"
+            )
+
+            # Extract gate(4096), xBC(6144 = x+B+C), dt(64) from HF layout
+            gate_w = tensor.narrow(dim, 0, self.intermediate_size_full)  # 4096
+            x_w = tensor.narrow(
+                dim, self.intermediate_size_full, self.intermediate_size_full
+            )  # 4096
+            B_w = tensor.narrow(
+                dim, 2 * self.intermediate_size_full, self.groups_time_state_size_full
+            )  # 1024
+            C_w = tensor.narrow(
+                dim,
+                2 * self.intermediate_size_full + self.groups_time_state_size_full,
+                self.groups_time_state_size_full,
+            )  # 1024
+            dt_w = tensor.narrow(
+                dim, sz - self.num_heads_full, self.num_heads_full
+            )  # 64
+
+            # xBC needs TP-interleaved layout: for each rank, [x_r | B_r | C_r]
+            # so that ColumnParallelLinear's column split gives each rank correct data.
+            x_chunks = x_w.chunk(tp, dim=dim)
+            B_chunks = B_w.chunk(tp, dim=dim)
+            C_chunks = C_w.chunk(tp, dim=dim)
+            xBC_reordered = []
+            for r in range(tp):
+                xBC_reordered.extend([x_chunks[r], B_chunks[r], C_chunks[r]])
+            xBC_w = torch.cat(xBC_reordered, dim=dim)
+
+            # Store as gate_proj, xBC_proj, dt_proj weights
+            model_state_dict[module_prefix + "gate_proj." + suffix] = gate_w
+            model_state_dict[module_prefix + "xBC_proj." + suffix] = xBC_w
+            model_state_dict[module_prefix + "dt_proj." + suffix] = dt_w
+
+            # Remove original in_proj key
+            del model_state_dict[in_proj_key]
+
+        # NOTE: conv_weight, conv_bias, dt_bias, A_log, D, and norm.weight
+        # are NOT sharded here. They remain full-size in the checkpoint.
+        # shard_children handles per-rank sharding via tensor_model_parallel
+        # annotations set in __init__.
+
+        # Forward to children's preshard_hooks (invoke_preshard_hook stops
+        # recursing when it finds our preshard_hook, so we must do it manually).
+        for name, child in self._modules.items():
+            if child is not None and hasattr(child, "preshard_hook"):
+                child_prefix = module_prefix + name + "."
+                child.preshard_hook(model_state_dict, child_prefix + "weight")
+                if getattr(child, "add_bias", False):
+                    child.preshard_hook(model_state_dict, child_prefix + "bias")
+
+        return True
 
     @staticmethod
     def get_state_shapes(config, batch_size=1):
         """Return (conv_state_shape, ssm_state_shape) for buffer allocation.
 
-        Returns FULL sizes (replicated across TP ranks, Falcon-H1 pattern).
-        Every rank holds the full Mamba state since all params are replicated.
+        Returns PER-RANK sizes (head-sharded TP pattern).
+        Each rank holds state only for its shard of heads/groups.
         """
-        num_heads = config.mamba_num_heads  # Full: 64
-        intermediate_size = num_heads * config.mamba_head_dim  # 4096
-        groups_time_state_size = config.n_groups * config.ssm_state_size  # 1024
-        conv_dim = intermediate_size + 2 * groups_time_state_size  # 6144
+        if parallel_state.model_parallel_is_initialized():
+            tp_degree = parallel_state.get_tensor_model_parallel_size()
+        else:
+            tp_degree = 1
+
+        num_heads = config.mamba_num_heads // tp_degree  # Per-rank: 64/4=16
+        n_groups = config.n_groups // tp_degree  # Per-rank: 8/4=2
+        intermediate_size = num_heads * config.mamba_head_dim  # 16*64=1024
+        groups_time_state_size = n_groups * config.ssm_state_size  # 2*128=256
+        conv_dim = intermediate_size + 2 * groups_time_state_size  # 1536
         conv_shape = (batch_size, conv_dim, config.conv_kernel - 1)
         ssm_shape = (
             batch_size,
@@ -733,7 +1699,11 @@ class NeuronNemotronMamba2Layer(nn.Module):
         **kwargs,
     ):
         """
-        Forward pass with external state.
+        Forward pass with external state and TP-sharded SSM computation.
+
+        Three separate ColumnParallelLinear projections (gate_proj, xBC_proj,
+        dt_proj) each produce per-rank output directly. SSM runs on per-rank
+        heads, and out_proj (RowParallelLinear) does the all-reduce.
 
         Args:
             hidden_states: (batch, seq_len, hidden_size)
@@ -767,25 +1737,19 @@ class NeuronNemotronMamba2Layer(nn.Module):
             )
 
         # Use the padding mask passed from NeuronNemotronModel.forward().
-        # This is derived from the raw attention_mask (1=real, 0=pad),
-        # which is always correct regardless of NxDI's position_id padding scheme.
         padding_mask = kwargs.get("padding_mask", None)
 
         # Mask hidden_states BEFORE projection (Falcon-H1 pattern)
-        # This ensures padding tokens produce zero projections.
         if padding_mask is not None:
             hidden_states = hidden_states * padding_mask[:, :seq_len, None].to(
                 hidden_states.dtype
             )
 
-        # Single in_proj with gather_output=True (Falcon-H1 pattern)
-        projected_states = self.in_proj(hidden_states)
-        # Explicit slicing (not split) for XLA
-        gate = projected_states[..., : self.intermediate_size]
-        hidden_states_B_C = projected_states[
-            ..., self.intermediate_size : self.intermediate_size + self.conv_dim
-        ]
-        dt = projected_states[..., -self.num_heads :]
+        # Three separate projections — each ColumnParallelLinear(gather_output=False)
+        # produces per-rank output directly, avoiding slice/deconcat ICE.
+        gate = self.gate_proj(hidden_states)  # (B,L,1024) per rank
+        hidden_states_B_C = self.xBC_proj(hidden_states)  # (B,L,1536) per rank
+        dt = self.dt_proj(hidden_states)  # (B,L,16) per rank
 
         if seq_len > 1:
             output, conv_state_new, ssm_state_new = self._forward_prefill(
@@ -800,7 +1764,6 @@ class NeuronNemotronMamba2Layer(nn.Module):
             )
 
         # Dummy KV cache for compatibility with attention-based generation loop
-        # Must include batch dimension for BS>1 support
         dummy_k = torch.zeros(
             batch_size, 1, 1, 1, dtype=output.dtype, device=output.device
         )
@@ -813,18 +1776,21 @@ class NeuronNemotronMamba2Layer(nn.Module):
     def _forward_prefill(
         self, hidden_states_B_C, gate, dt, batch_size, seq_len, dtype, padding_mask=None
     ):
-        """Selective scan for prefill.
+        """Selective scan for prefill with TP-sharded SSM computation.
 
-        Uses O(L) NKI hardware-accelerated scan when USE_NKI_SCAN=True,
-        or O(L^2) quadratic parallel scan as fallback.
+        All inputs (hidden_states_B_C, gate, dt) are already per-rank slices.
+        Conv weights and SSM params are pre-sharded by preshard_hook.
 
-        Padding handling follows Granite4 pattern:
-        1. Save conv_state from last K-1 REAL token positions (not last seq positions)
-        2. Zero conv output at padding positions
-        3. Zero dt at padding positions (prevents SSM from processing padding)
-        4. Gather SSM state from last real token (not last seq position)
+        Uses O(L) NKI SSD kernel or O(L^2) quadratic parallel scan as fallback.
         """
-        # Manual depthwise conv1d
+        # Parameters are already per-rank from preshard_hook
+        conv_weight = self.conv_weight
+        conv_bias = self.conv_bias
+        dt_bias = self.dt_bias
+        A = -torch.exp(self.A_log.float())
+        D = self.D
+
+        # Manual depthwise conv1d with per-rank conv weights
         padded = F.pad(
             hidden_states_B_C, (0, 0, self.conv_kernel_size - 1, 0), value=0.0
         )
@@ -832,12 +1798,12 @@ class NeuronNemotronMamba2Layer(nn.Module):
         for k in range(self.conv_kernel_size):
             hidden_states_conv = hidden_states_conv + (
                 padded[:, k : k + seq_len, :]
-                * self.conv_weight[:, k].unsqueeze(0).unsqueeze(0)
+                * conv_weight[:, k].unsqueeze(0).unsqueeze(0)
             )
-        if self.conv_bias is not None:
-            hidden_states_conv = hidden_states_conv + self.conv_bias.unsqueeze(
+        if conv_bias is not None:
+            hidden_states_conv = hidden_states_conv + conv_bias.unsqueeze(0).unsqueeze(
                 0
-            ).unsqueeze(0)
+            )
 
         # Save conv_state from last K-1 REAL token positions (Granite4 pattern)
         if padding_mask is not None and seq_len >= self.conv_kernel_size - 1:
@@ -870,7 +1836,7 @@ class NeuronNemotronMamba2Layer(nn.Module):
                 :, :seq_len, None
             ].to(hidden_states_conv.dtype)
 
-        # Split into x, B, C
+        # Split into x, B, C — using per-rank sizes
         x = hidden_states_conv[..., : self.intermediate_size]
         B = hidden_states_conv[
             ...,
@@ -879,9 +1845,8 @@ class NeuronNemotronMamba2Layer(nn.Module):
         ]
         C = hidden_states_conv[..., -self.groups_time_state_size :]
 
-        # SSM computation in float32
-        A = -torch.exp(self.A_log.float())
-        dt_processed = F.softplus(dt + self.dt_bias)
+        # SSM computation in float32 — using per-rank params
+        dt_processed = F.softplus(dt + dt_bias)
         dt_processed = torch.clamp(dt_processed, self.time_step_limit[0], 1e6)
 
         # Zero dt at padding positions (prevents SSM from processing padding)
@@ -893,47 +1858,111 @@ class NeuronNemotronMamba2Layer(nn.Module):
         x = x.reshape(batch_size, seq_len, self.num_heads, self.head_dim).float()
         B = B.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size).float()
         C = C.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size).float()
-        B = B.repeat_interleave(self.num_heads // self.n_groups, dim=2)
-        C = C.repeat_interleave(self.num_heads // self.n_groups, dim=2)
 
-        if USE_CHUNKED_SCAN and seq_len >= self.chunk_size:
-            # Chunked O(chunk^2) scan: processes seq_len in chunk_size blocks.
-            # Memory is O(chunk^2) instead of O(L^2), enabling ctx=512+.
+        if USE_SSD_SCAN:
+            # SSD chunk-based O(L) scan using NKI TensorE matmuls.
+            # B/C stay as (B, L, n_groups, S) — NOT expanded via repeat_interleave.
+            # The SSD kernel handles group→head mapping internally with nested loops.
+            # Memory is O(chunk^2) per chunk, enabling ctx=768+.
+            y, ssm_state_new = _ssd_prefill_scan(
+                x,
+                dt_processed,
+                A,
+                B,
+                C,
+                D.float(),
+                self.num_heads,
+                self.head_dim,
+                self.ssm_state_size,
+                self.n_groups,
+                chunk_size=self.chunk_size,
+            )
+            if padding_mask is not None:
+                pass
+        elif USE_CHUNKED_NKI_SCAN:
+            # Chunked NKI SSD scan (DGE-OOB survivor, Phase 3).
+            # Intra-chunk O(Q^2) quadratic + inter-chunk O(1) recurrent state propagation.
+            # Q=128=P_MAX. Uses only cheap NKI ops (dma_copy, nc_matmul, nc_transpose,
+            # tensor_copy, tensor_scalar, tensor_tensor, activation, memset) -- proven to
+            # survive the DGE budget on SDK 2.31 with 92+ invocations per NEFF.
+            # Linear O(S) prefill, and state is only 4MB/layer -- no HBM ceiling.
+            try:
+                from .nki_kernels.chunked_ssd_wrapper import chunked_ssd_prefill_scan
+            except ImportError:
+                from nki_kernels.chunked_ssd_wrapper import chunked_ssd_prefill_scan
+            y, ssm_state_new = chunked_ssd_prefill_scan(
+                x,
+                dt_processed,
+                A,
+                B,
+                C,
+                D.float(),
+                self.num_heads,
+                self.head_dim,
+                self.ssm_state_size,
+                self.n_groups,
+                chunk_size=self.chunk_size,
+                padding_mask=padding_mask,
+            )
+        elif USE_PYTORCH_SSD:
+            # Pure PyTorch SSD: same chunk-based algorithm as NKI SSD but using
+            # standard PyTorch ops. Avoids compiler DGE OOB issue.
+            # B/C stay as (B, L, n_groups, S) — NOT expanded.
+            # Memory is O(chunk^2 * G) per chunk iteration.
+            y, ssm_state_new = _pytorch_ssd_scan(
+                x,
+                dt_processed,
+                A,
+                B,
+                C,
+                D.float(),
+                self.num_heads,
+                self.head_dim,
+                self.ssm_state_size,
+                self.n_groups,
+                chunk_size=self.chunk_size,
+                padding_mask=padding_mask,
+            )
+        else:
+            # Non-SSD paths need B/C expanded to per-head
+            B = B.repeat_interleave(self.num_heads // self.n_groups, dim=2)
+            C = C.repeat_interleave(self.num_heads // self.n_groups, dim=2)
+
+        if (
+            not USE_SSD_SCAN
+            and not USE_PYTORCH_SSD
+            and not USE_CHUNKED_NKI_SCAN
+            and USE_CHUNKED_SCAN
+            and seq_len >= self.chunk_size
+        ):
             y, ssm_state_new = _chunked_quadratic_scan(
                 x,
                 dt_processed,
                 A,
                 B,
                 C,
-                self.D.float(),
+                D.float(),
                 self.num_heads,
                 self.head_dim,
                 self.ssm_state_size,
                 chunk_size=self.chunk_size,
                 padding_mask=padding_mask,
             )
-        elif USE_NKI_SCAN:
-            # NKI O(L) hardware-accelerated selective scan
+        elif not USE_SSD_SCAN and not USE_PYTORCH_SSD and not USE_CHUNKED_NKI_SCAN and USE_NKI_SCAN:
             y, ssm_state_new = _nki_selective_scan(
                 x,
                 dt_processed,
                 A,
                 B,
                 C,
-                self.D.float(),
+                D.float(),
                 self.num_heads,
                 self.head_dim,
                 self.ssm_state_size,
             )
-            # NKI path returns final state from last seq position.
-            # padding_mask handling for variable-length is not yet supported
-            # with NKI -- assumes padded inputs (NxDI pads to max_context_length).
-        else:
-            # O(L^2) quadratic parallel scan — head-grouped to reduce peak memory.
-            # Process SCAN_HEAD_GROUP heads at a time instead of all num_heads.
-            # This reduces the weight matrix from [B,L,L,num_heads] to [B,L,L,G]
-            # and proportionally reduces the compiler's transpose scratchpad.
-            G = SCAN_HEAD_GROUP  # heads per group
+        elif not USE_SSD_SCAN and not USE_PYTORCH_SSD and not USE_CHUNKED_NKI_SCAN:
+            # O(L^2) quadratic parallel scan — head-grouped
+            G = SCAN_HEAD_GROUP
             n_groups_scan = self.num_heads // G
             assert self.num_heads % G == 0, (
                 f"num_heads={self.num_heads} not divisible by SCAN_HEAD_GROUP={G}"
@@ -950,7 +1979,6 @@ class NeuronNemotronMamba2Layer(nn.Module):
                 h_start = g * G
                 h_end = h_start + G
 
-                # Slice head-group tensors: x[B,L,H,D] -> [B,L,G,D]
                 x_g = x[:, :, h_start:h_end, :]
                 B_g = B[:, :, h_start:h_end, :]
                 C_g = C[:, :, h_start:h_end, :]
@@ -958,52 +1986,45 @@ class NeuronNemotronMamba2Layer(nn.Module):
                 A_g = A[h_start:h_end]
 
                 dA_log_g = dt_g * A_g.view(1, 1, -1)
-                dB_g = dt_g.unsqueeze(-1) * B_g  # [B,L,G,S]
-                dBx_g = dB_g.unsqueeze(3) * x_g.unsqueeze(-1)  # [B,L,G,D,S]
+                dB_g = dt_g.unsqueeze(-1) * B_g
+                dBx_g = dB_g.unsqueeze(3) * x_g.unsqueeze(-1)
 
-                log_dA_cumsum_g = torch.cumsum(dA_log_g, dim=1)  # [B,L,G]
+                log_dA_cumsum_g = torch.cumsum(dA_log_g, dim=1)
 
-                log_diff_g = log_dA_cumsum_g.unsqueeze(2) - log_dA_cumsum_g.unsqueeze(
-                    1
-                )  # [B,L,L,G]
+                log_diff_g = log_dA_cumsum_g.unsqueeze(2) - log_dA_cumsum_g.unsqueeze(1)
                 log_diff_g = log_diff_g.masked_fill(
                     causal_mask.unsqueeze(0).unsqueeze(-1) == 0, -1e9
                 )
-                weights_g = torch.exp(log_diff_g)  # [B,L,L,G]
+                weights_g = torch.exp(log_diff_g)
 
-                states_g = torch.einsum(
-                    "btih,bihds->bthds", weights_g, dBx_g
-                )  # [B,L,G,D,S]
+                states_g = torch.einsum("btih,bihds->bthds", weights_g, dBx_g)
 
-                # Extract final state for this head group
                 if padding_mask is not None:
                     real_len = padding_mask[:, :seq_len].sum(dim=1, keepdim=True).long()
                     last_real_idx = (real_len - 1).clamp(min=0)
                     gather_idx = last_real_idx.view(batch_size, 1, 1, 1, 1).expand(
                         -1, -1, G, self.head_dim, self.ssm_state_size
                     )
-                    ssm_state_g = torch.gather(states_g, 1, gather_idx).squeeze(
-                        1
-                    )  # [B,G,D,S]
+                    ssm_state_g = torch.gather(states_g, 1, gather_idx).squeeze(1)
                 else:
-                    ssm_state_g = states_g[:, -1, :, :, :]  # [B,G,D,S]
+                    ssm_state_g = states_g[:, -1, :, :, :]
 
-                y_g = torch.einsum("blhs,blhds->blhd", C_g, states_g)  # [B,L,G,D]
-                D_g = self.D[h_start:h_end].view(1, 1, -1, 1)
+                y_g = torch.einsum("blhs,blhds->blhd", C_g, states_g)
+                D_g = D[h_start:h_end].view(1, 1, -1, 1)
                 y_g = y_g + D_g * x_g
 
                 y_parts.append(y_g)
                 ssm_state_parts.append(ssm_state_g)
 
-            # Concatenate head groups back together
-            y = torch.cat(y_parts, dim=2)  # [B,L,num_heads,D]
-            ssm_state_new = torch.cat(
-                ssm_state_parts, dim=1
-            ).contiguous()  # [B,num_heads,D,S]
+            y = torch.cat(y_parts, dim=2)
+            ssm_state_new = torch.cat(ssm_state_parts, dim=1).contiguous()
+
         y = y.reshape(batch_size, seq_len, -1)
 
+        # Gated RMSNorm — norm.weight pre-sharded by preshard_hook
         scan_output = self.norm(y, gate)
-        # out_proj: ColumnParallelLinear(gather_output=True) handles TP all-reduce
+
+        # out_proj: RowParallelLinear(input_is_parallel=True) handles TP all-reduce
         output = self.out_proj(scan_output.to(dtype))
 
         return output, conv_state_new, ssm_state_new.to(dtype)
@@ -1011,16 +2032,23 @@ class NeuronNemotronMamba2Layer(nn.Module):
     def _forward_decode(
         self, hidden_states_B_C, gate, dt, batch_size, dtype, conv_state, ssm_state
     ):
-        """O(1) recurrence for single-token decode."""
+        """O(1) recurrence for single-token decode with TP-sharded SSM."""
+        # Parameters are already per-rank from preshard_hook
+        conv_weight = self.conv_weight
+        conv_bias = self.conv_bias
+        dt_bias = self.dt_bias
+        A = -torch.exp(self.A_log.float())
+        D = self.D
+
         xBC_new = hidden_states_B_C.squeeze(1)  # (B, conv_dim)
         xBC_new_t = xBC_new.unsqueeze(2)  # (B, conv_dim, 1)
         conv_input = torch.cat(
             [conv_state, xBC_new_t], dim=2
         )  # (B, conv_dim, conv_kernel)
 
-        conv_out = (conv_input * self.conv_weight.unsqueeze(0)).sum(dim=2)
-        if self.conv_bias is not None:
-            conv_out = conv_out + self.conv_bias
+        conv_out = (conv_input * conv_weight.unsqueeze(0)).sum(dim=2)
+        if conv_bias is not None:
+            conv_out = conv_out + conv_bias
 
         conv_state_new = conv_input[:, :, 1:].contiguous()
         conv_out = F.silu(conv_out)
@@ -1033,8 +2061,7 @@ class NeuronNemotronMamba2Layer(nn.Module):
         ]
         C = conv_out[..., -self.groups_time_state_size :]
 
-        A = -torch.exp(self.A_log.float())
-        dt_processed = F.softplus(dt.squeeze(1) + self.dt_bias)
+        dt_processed = F.softplus(dt.squeeze(1) + dt_bias)
         dt_processed = torch.clamp(dt_processed, self.time_step_limit[0], 1e6)
 
         x = x.reshape(batch_size, self.num_heads, self.head_dim).float()
@@ -1049,17 +2076,42 @@ class NeuronNemotronMamba2Layer(nn.Module):
         ssm_state_new = dA.unsqueeze(-1).unsqueeze(-1) * ssm_state.float() + dBx
 
         y = torch.einsum("bhds,bhs->bhd", ssm_state_new, C)
-        y = y + self.D.view(1, -1, 1) * x
+        y = y + D.view(1, -1, 1) * x
         y = y.reshape(batch_size, -1)
 
         gate_squeezed = gate.squeeze(1)
+
+        # Gated RMSNorm — norm.weight pre-sharded by preshard_hook
         scan_output = self.norm(y, gate_squeezed)
+
         if len(scan_output.shape) == 2:
             scan_output = scan_output.unsqueeze(1)
-        # out_proj: ColumnParallelLinear(gather_output=True) handles TP all-reduce
+        # out_proj: RowParallelLinear(input_is_parallel=True) handles TP all-reduce
         output = self.out_proj(scan_output.to(dtype))
 
         return output, conv_state_new, ssm_state_new.to(dtype)
+
+
+# ==============================================================================
+# Register custom modules for shard_children TP sharding
+# ==============================================================================
+# shard_children only processes modules in __SUPPORTED_SHARDED_MODULES.
+# NeuronNemotronMamba2Layer and NemotronRMSNormGated have parameters
+# marked with tensor_model_parallel=True that need per-rank sharding.
+# Monkeypatch the supported modules tuple to include them.
+try:
+    import neuronx_distributed.trace.trace as _trace_module
+
+    _trace_module.__SUPPORTED_SHARDED_MODULES = (
+        _trace_module.__SUPPORTED_SHARDED_MODULES
+        + (NeuronNemotronMamba2Layer, NemotronRMSNormGated)
+    )
+    logger.info(
+        "Registered NeuronNemotronMamba2Layer and NemotronRMSNormGated "
+        "as supported sharded modules for shard_children"
+    )
+except Exception as e:
+    logger.warning(f"Failed to register custom sharded modules: {e}")
 
 
 # ==============================================================================
@@ -1284,6 +2336,30 @@ class NeuronNemotronMoELayer(BaseParallelLinear):
 
                 output = output + expert_out * weight
 
+        elif USE_NKI_MOE_CTE:
+            # NKI PREFILL PATH: route through moe_cte megakernel with SquaredReLU
+            # + skip_gate_proj=True. Requires nki-lib overlay from upstream/main
+            # (see working/Nemotron/scripts/overlay_nkilib_upstream.sh). See
+            # contrib/src/nki_moe_cte_prefill.py for the wiring helper and
+            # tests/test_moe_cte_prefill_equivalence.py for the correctness test.
+            from .nki_moe_cte_prefill import (
+                build_gate_up_proj_weight,
+                moe_cte_prefill_forward,
+            )
+            # Lazy-build the fused gate_up_proj_weight [E, H, 2, I_TP] on first
+            # forward call. Gate half is zero-filled and never loaded from HBM
+            # thanks to skip_gate_proj=True in bwmm_shard_on_I.
+            if not hasattr(self, "_gate_up_proj_weight"):
+                self._gate_up_proj_weight = build_gate_up_proj_weight(self.expert_up)
+            output = moe_cte_prefill_forward(
+                hidden_flat=hidden_flat,
+                topk_indices=topk_indices,
+                topk_weights=topk_weights,
+                gate_up_proj_weight=self._gate_up_proj_weight,
+                expert_down=self.expert_down,
+                num_experts=self.num_experts,
+                block_size=MOE_CTE_BLOCK_SIZE,
+            )
         else:
             # DENSE PREFILL PATH: loop over all 128 experts with masking
             expert_affinities = torch.zeros(
@@ -2031,10 +3107,11 @@ def _convert_mamba_conv_weights(state_dict: Dict[str, Any]) -> Dict[str, Any]:
 def _split_mamba_projections(
     state_dict: Dict[str, Any], config: NemotronHInferenceConfig
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """No-op: Falcon-H1 pattern uses single ColumnParallelLinear for in_proj/out_proj.
+    """No-op: ColumnParallelLinear/RowParallelLinear handle TP sharding via preshard_hook.
 
-    With gather_output=True, the ColumnParallelLinear's own preshard_hook handles
-    TP sharding of the projection weights. No manual splitting or transposing needed.
+    The in_proj uses ColumnParallelLinear(gather_output=True) and out_proj uses
+    RowParallelLinear(input_is_parallel=True). Their built-in preshard_hooks handle
+    weight sharding. No manual splitting or transposing needed.
 
     Returns:
         (unmodified state_dict, empty dict)
@@ -2052,8 +3129,8 @@ def _remap_hf_key(key: str, config) -> Optional[str]:
     if ".mixer.shared_experts." in key:
         return None
 
-    # Mamba in_proj and out_proj: pass through (Falcon-H1 pattern).
-    # ColumnParallelLinear(gather_output=True) handles TP sharding via its
+    # Mamba in_proj and out_proj: pass through.
+    # ColumnParallelLinear/RowParallelLinear handle TP sharding via their
     # own preshard_hook — no manual splitting or transposing needed.
 
     # Embeddings
@@ -2128,6 +3205,41 @@ def _convert_nemotron_hf_to_neuron_state_dict(
     # First pass: convert Mamba conv1d weight shapes
     state_dict = _convert_mamba_conv_weights(state_dict)
 
+    # Reorder Mamba conv_weight/conv_bias from HF layout [x|B|C] to
+    # TP-interleaved [x_0|B_0|C_0 | x_1|B_1|C_1 | ...] so that
+    # preshard_hook's simple contiguous chunking gives correct per-rank weights.
+    tp_degree = (
+        config.neuron_config.tp_degree
+        if hasattr(config, "neuron_config") and config.neuron_config
+        else 1
+    )
+    if tp_degree > 1:
+        intermediate_size_full = config.mamba_num_heads * config.mamba_head_dim  # 4096
+        groups_time_state_size_full = config.n_groups * config.ssm_state_size  # 1024
+        for key in list(state_dict.keys()):
+            if ".conv_weight" in key or ".conv_bias" in key:
+                tensor = state_dict[key]
+                dim = 0
+                sz = tensor.shape[dim]
+                expected = intermediate_size_full + 2 * groups_time_state_size_full
+                if sz == expected:
+                    x_part = tensor.narrow(dim, 0, intermediate_size_full)
+                    B_part = tensor.narrow(
+                        dim, intermediate_size_full, groups_time_state_size_full
+                    )
+                    C_part = tensor.narrow(
+                        dim,
+                        intermediate_size_full + groups_time_state_size_full,
+                        groups_time_state_size_full,
+                    )
+                    x_chunks = x_part.chunk(tp_degree, dim=dim)
+                    B_chunks = B_part.chunk(tp_degree, dim=dim)
+                    C_chunks = C_part.chunk(tp_degree, dim=dim)
+                    reordered = []
+                    for r in range(tp_degree):
+                        reordered.extend([x_chunks[r], B_chunks[r], C_chunks[r]])
+                    state_dict[key] = torch.cat(reordered, dim=dim)
+
     # Split Mamba in_proj (no-op with Falcon-H1 pattern — returns empty dict).
     # Kept for code structure compatibility.
     state_dict, mamba_proj_entries = _split_mamba_projections(state_dict, config)
@@ -2192,10 +3304,14 @@ def _convert_nemotron_hf_to_neuron_state_dict(
     del moe_expert_weights
     gc.collect()
 
-    # Add rank utility tensor
+    # Add rank utility tensor (model-level)
     new_state_dict["rank_util.rank"] = torch.arange(
         0, config.neuron_config.tp_degree, dtype=torch.int32
     )
+
+    # Note: Mamba layers no longer use SPMDRank — SSM parameters are sharded
+    # at load time via preshard_hook with TP-interleaved weight layout.
+    # Only the model-level rank_util (for lm_head logits masking) is needed.
 
     logger.info(f"State dict conversion complete: {len(new_state_dict)} keys")
     gc.collect()

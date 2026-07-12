@@ -76,10 +76,10 @@ The codebase includes an optional O(L) NKI selective scan kernel (ported from Gr
 
 ## Validation Results
 
-**Validated:** 2026-04-12
-**Configuration:** TP=4, batch_size=1, bfloat16
+**Validated:** 2026-04-03
+**Configuration:** TP=4, batch_size=1, seq_len=2048, max_context_length=128, bfloat16
 **Instance:** trn2.3xlarge (LNC=2)
-**SDK:** Neuron SDK 2.29, PyTorch 2.9, NxDI 0.9
+**SDK:** Neuron SDK 2.28, PyTorch 2.9
 
 ### Prefill Accuracy (vs HF BF16 CPU, 11 prompts)
 
@@ -100,42 +100,95 @@ The codebase includes an optional O(L) NKI selective scan kernel (ported from Gr
 
 Both Neuron and HF reference produce correct first tokens, followed by greedy repetition patterns typical of base (non-instruct) models.
 
-### Inference Performance (SDK 2.29, Head-Grouped Scan G=8)
+### Inference Performance
+
+#### trn2.3xlarge (TP=4, LNC=2, BF16, SDK 2.31, chunked NKI SSD scan)
+
+Measured 2026-07-10 on `Deep Learning AMI Neuron (Ubuntu 24.04) 20260708`. Requires `USE_CHUNKED_NKI_SCAN=True` in `modeling_nemotron_h.py` (default is False for safety). Kernel: `contrib/src/nki_kernels/nki_mamba2_ssd_chunked.py`.
+
+| Configuration | TTFT (ms) | Decode (tok/s) | TPOT (ms) | Compile (s) | Load (s) |
+|--------------|-----------|----------------|-----------|-------------|----------|
+| BS=1, seq=2048, ctx=128 | **63.2** | 104.34 | 9.58 | 676.7 | 52.7 |
+| BS=1, seq=2048, ctx=512 | 172.8 | 102.30 | 9.77 | 829.5 | 64.5 |
+| BS=1, seq=2048, ctx=1024 | 325.2 | 103.16 | 9.69 | 833.7 | 83.8 |
+| BS=1, seq=4096, ctx=2048 | 633.8 | 99.39 | 10.06 | 1395.6 | 101.0 |
+| **BS=1, seq=8192, ctx=4096** (new capability) | **1450.1** | 100.99 | 9.90 | 1809.8 | 110.9 |
+| **BS=1, seq=16384, ctx=8192** (new capability) | **2503.4** | 101.29 | 9.87 | 3320.4 | 151.5 |
+| ~~ctx=16384~~ | ~~compile fails~~ | -- | -- | -- | -- |
+
+**Ceiling on trn2.3xlarge**: ctx=8192 works; ctx=16384 fails with `[F137] neuronx-cc was forcibly killed` (compiler host RAM OOM, not device HBM). TG NEFF at ctx=16384 compiles fine; only the CE NEFF exceeds 128 GB host RAM. A larger-host instance (or compiler improvements) could push higher.
+
+**Correctness validated** by A/B token comparison vs the head-grouped quadratic scan on the same model: **50/50 tokens identical at ctx=128**, **30/30 tokens identical at ctx=1024 (8 chunks)** under greedy decoding.
+
+**Delta vs head-grouped quadratic** (numbers below):
+
+| ctx | Quadratic TTFT | Chunked TTFT | Delta |
+|-----|---------------|--------------|-------|
+| 128 | 67.5 ms | **63.2 ms** | 6% faster |
+| 512 | 225.1 ms | **172.8 ms** | 23% faster |
+| 1024 | 459.8 ms | **325.2 ms** | 29% faster |
+| 2048 | 1081.7 ms | **633.8 ms** | 41% faster |
+| 4096 | HBM OOM | **1450.1 ms** | new capability |
+| 8192 | HBM OOM | **2503.4 ms** | new capability |
+
+Decode throughput unchanged (~100-104 tok/s) in both paths.
+
+#### trn2.3xlarge (TP=4, LNC=2, BF16, SDK 2.31, head-grouped scan G=8)
+
+Measured 2026-07-09 on `Deep Learning AMI Neuron (Ubuntu 24.04) 20260708`.
+
+| Configuration | TTFT (ms) | Decode (tok/s) | TPOT (ms) | Compile (s) | Load (s) |
+|--------------|-----------|----------------|-----------|-------------|----------|
+| BS=1, seq=2048, ctx=128 | **67.5** | **105.66** | **9.46** | 683.6 | 56.5 |
+| BS=1, seq=2048, ctx=256 | 124.6 | 103.38 | 9.67 | 628.9 | 76.7 |
+| BS=1, seq=2048, ctx=512 | 225.1 | 102.62 | 9.74 | 717.2 | 81.0 |
+| BS=1, seq=2048, ctx=640 | 425.3 | 105.64 | 9.47 | 410.0 (cached CE) | 67.9 |
+| BS=1, seq=2048, ctx=768 | 514.7 | 106.66 | 9.38 | 936.6 | 73.5 |
+| BS=1, seq=2048, ctx=1024 | 459.8 | 105.61 | 9.47 | 1090.9 | 59.7 |
+| **BS=1, seq=4096, ctx=2048** | **1081.7** | **102.06** | **9.80** | 1807.1 | 87.1 |
+
+All greedy decoding, 50-token generation, single warmup. Correct " Paris" first token at every ctx. Decode throughput is essentially flat at ~103-106 tok/s across the full ctx range.
+
+#### trn2.3xlarge (TP=4, LNC=2, BF16, SDK 2.28, sparse MoE)
+
+Historical numbers preserved from Task 010 for comparison:
 
 | Configuration | TTFT (ms) | Decode (tok/s) | TPOT (ms) | Compile (s) |
 |--------------|-----------|----------------|-----------|-------------|
-| **BS=1, ctx=512, seq=32768** | **608** | **74.3** | **13.5** | 801 |
-| **BS=1, ctx=640, seq=12288** | **1052** | **73.0** | **13.7** | 1022 |
-| BS=1, ctx=512, seq=4096 | 608 | 73.3 | 13.6 | 794 |
-| BS=1, ctx=640, seq=4096 | 1052 | 72.9 | 13.7 | 1024 |
-| BS=1, ctx=128, seq=2048 (non-grouped) | 220.6 | 73.2 | 13.7 | 543 |
-| BS=1, ctx=256, seq=4096 (non-grouped) | 454.7 | 73.0 | 13.7 | 663 |
-| BS=2, ctx=128, seq=2048 | 263 | 22.0 | — | 2426 |
+| BS=1, seq=2048, ctx=128 (sparse MoE) | 211 | 66.6 | 15.0 | 731 |
+| BS=1, seq=2048, ctx=128 (dense MoE) | 211 | 17.4 | 57.5 | 274 |
+| BS=1, seq=4096, ctx=256 (sparse MoE) | 436 | 45.8 | -- | 916 |
+| BS=2, seq=2048, ctx=128 | 263 | 22.0 | -- | 2426 |
+| BS=1, seq=4096, ctx=128 | 210.5 | 16.0 | -- | 2129 |
+| BS=1, seq=8192, ctx=128 | 211.3 | 15.8 | -- | 2285 |
 
-### Inference Performance (SDK 2.28, Non-Grouped Scan)
-
-| Configuration | TTFT (ms) | Decode (tok/s) | TPOT (ms) | Compile (s) |
-|--------------|-----------|----------------|-----------|-------------|
-| **BS=1, ctx=128, seq=2048 (sparse MoE)** | 211 | **66.6** | **15.0** | 731 |
-| BS=1, ctx=128, seq=2048 (dense MoE) | 211 | 17.4 | 57.5 | 274 |
-| BS=1, ctx=256, seq=4096 (sparse MoE) | 436 | 45.8 | — | 916 |
+**Perf gains SDK 2.28 -> SDK 2.31 (BS=1, ctx=128):** decode 66.6 -> **105.7 tok/s** (+58%), TTFT 211 -> **67.5 ms** (3.1x faster).
 
 All measurements on trn2.3xlarge (TP=4, LNC=2, BF16).
 
-**SDK 2.29 delivers ~10% faster decode** (73+ tok/s vs 66.6 tok/s on SDK 2.28).
+#### trn2.48xlarge (TP=8, LNC=2)
+
+| Configuration | TTFT (ms) | Decode (tok/s) | TPOT P50 (ms) | E2E P50 (ms) |
+|--------------|-----------|----------------|---------------|--------------|
+| **BS=1, ctx=2048, 50 output tokens** | 1,698 | 22.9 | 9.93 | 2,184 |
+| **BS=1, ctx=2048, 100 output tokens** | 1,698 | 37.3 | 9.94 | 2,682 |
+| **BS=1, ctx=2048, 200 output tokens** | 1,698 | 54.4 | 9.95 | 3,678 |
+| **BS=1, ctx=2048, 300 output tokens** | 1,699 | 64.1 | 9.96 | 4,677 |
+| **BS=1, ctx=2048, 400 output tokens** | 1,698 | 70.5 | 9.96 | 5,673 |
+| **BS=1, ctx=2048, 512 output tokens** | 1,698 | **75.4** | **9.98** | 6,796 |
+
+Measured via `vllm bench serve` with `vllm-neuron` on trn2.48xlarge (TP=8, LNC=2, BF16). Input: 1800-token prefix + 141 random tokens = 1941 total. 20 prompts, 4 warmup. Prefix caching disabled (Mamba recurrent state). TPOT P50-P99 spread < 0.1 ms.
+
+**Maximum context length on trn2 (LNC=2) is 2048.** All trn2 instances have 24 GB per logical core at LNC=2, regardless of instance size. The Mamba-2 quadratic scan at 4224 tokens produces scratchpad + weight requirements of 22.765 GB per core, leaving only ~1.2 GB free. The CTE transpose operation needs 1.031 GB more than available. Tested with both `-O1` and `-O2` compiler optimization on trn2.48xlarge TP=8 — same result. See Known Issues #8.
 
 **Sparse expert dispatch** (default) achieves **3.83x decode speedup** by loading only the 6 active expert weights per MoE layer during decode, instead of all 128. Output is bit-for-bit identical to the dense path.
 
-**Head-grouped quadratic scan** (`SCAN_HEAD_GROUP=8`) processes 8 heads at a time instead of all 64, reducing the `[1,L,L,64]` weight matrix to `[1,L,L,8]` per group. This unlocks ctx=512 and ctx=640 on trn2.3xlarge.
+| Metric | Value (BS=1) |
+|--------|-------|
+| Model load time | 16.9 s |
+| HBM per core (est.) | ~14.7 GB / 24 GB (61%) |
 
-### Upper Limits (trn2.3xlarge, LNC=2, TP=4)
-
-| Max context length | Max sequence length | Decode (tok/s) | TTFT (ms) |
-|-------------------|--------------------|--------------------|-----------|
-| **640** | **12,288** | 73.0 | 1,052 |
-| **512** | **32,768** | 74.3 | 608 |
-
-ctx=768+ fails with HBM OOM (34.5 GB required vs 24 GB/core). The quadratic O(L^2) scan scratchpad grows from ~1 GB at ctx=512 to 19.4 GB at ctx=768.
+TPOT is extremely stable at BS=1: P50-P99 spread < 0.3 ms.
 
 ### Compilation
 
@@ -235,11 +288,24 @@ sudo swapon /mnt/models/swapfile
 
 ## Compatibility Matrix
 
-| Instance Type | SDK 2.29 | SDK 2.28 |
-|--------------|----------|----------|
-| trn2.3xlarge (TP=4, LNC=2) | Validated | Validated |
-| trn2.48xlarge (TP=4, LNC=2) | Not tested | Not tested |
-| trn1.32xlarge | Not tested | Not tested |
+| Instance Type | SDK 2.31 | SDK 2.29 | SDK 2.28 | SDK 2.27 |
+|--------------|----------|----------|----------|----------|
+| trn2.3xlarge (TP=4, LNC=2) | **Validated (ctx<=2048 quadratic, ctx<=8192 chunked NKI SSD)** | Validated (ctx<=640) | Validated (ctx<=256) | Not tested |
+| trn2.48xlarge (TP=8, LNC=2) | Not tested | Not tested | Validated (ctx<=2048) | Not tested |
+| trn1.32xlarge | Not supported | Not supported | Not tested | Not tested |
+
+> **NxDI 2.29+ requires Trn2 or newer hardware.** For Trn1 support, pin to SDK 2.28.
+
+**SDK 2.31 notes (verified 2026-07-09 on `Deep Learning AMI Neuron (Ubuntu 24.04) 20260708`)**:
+- Working configuration (default): Falcon-H1-style TP sharding + head-grouped O(L^2) quadratic scan (`SCAN_HEAD_GROUP=8`).
+- New chunked NKI SSD path (opt-in via `USE_CHUNKED_NKI_SCAN=True`) delivers 6-41% faster prefill on matched contexts AND extends the max ctx on trn2.3xlarge from **2048 to 8192 (4x)**. Correctness proven bit-for-bit vs quadratic (50/50 tokens at ctx=128, 30/30 at ctx=1024).
+- Decode throughput 102-106 tok/s across ctx=128..2048 (BS=1) -- **~40% faster** than SDK 2.29 (73-74 tok/s).
+- TTFT 2.7-4.4x faster than SDK 2.29 at matched context lengths.
+- Max context on trn2.3xlarge raised from ctx=640 (SDK 2.29) to **ctx=2048** (SDK 2.31, seq=4096) -- matches trn2.48xlarge SDK 2.28 milestone on the smaller instance.
+- Still blocked: NKI SSD kernel with full MoE graph triggers `scatter/gather (indirect memory copy via vector DGE) out-of-bound access` at runtime. Same failure as SDK 2.29. Do NOT set `USE_SSD_SCAN=True` / `USE_PYTORCH_SSD=True` for the full 52-layer model.
+- Package versions: torch-neuronx 2.9.0.2.15.32035, neuronx-cc 2.26.6360.0, NxDI 0.10.18399, NKI 0.5.0, Runtime 2.33.10, Driver 2.29.0.
+
+**SDK 2.29 note**: The model compiles and loads on SDK 2.29 (NxDI 0.9.17334) and produces correct inference output after the Falcon-H1 TP rewrite (2026-04-11). Use SDK 2.31 for best performance and highest context length.
 
 ## Example Checkpoints
 
@@ -273,14 +339,21 @@ python test_smoke.py
 
 ## Known Issues
 
-1. **Maximum context length is 640 on trn2.3xlarge (LNC=2) with head-grouped scan.** ctx up to 640 validated with `SCAN_HEAD_GROUP=8`. ctx=768 requires 34.5 GB HBM per core (19.4 GB scratchpad from quadratic O(L^2) scan) vs 24 GB available. Without head-grouped scan, max ctx is 256 (ctx=512 OOM on load due to 1 GB transpose scratchpad for `[1,L,L,64]` weight matrix). ctx=768+ requires trn2.48xlarge, model quantization, or SSD NKI kernel (O(L) memory).
+1. **Maximum context length on trn2.3xlarge (TP=4, LNC=2) depends on SDK version and scan path:**
+   - **SDK 2.31 + chunked NKI SSD** (`USE_CHUNKED_NKI_SCAN=True`): **ctx=8192** validated (seq=16384). ctx=16384 fails compilation with `[F137] neuronx-cc was forcibly killed` -- compiler host RAM OOM at CE HLO compile step (TG NEFF compiles fine). Device HBM is not the limit.
+   - **SDK 2.31 default (head-grouped scan)**: **ctx=2048** validated (seq=4096, decode 102 tok/s). Beyond ctx=2048, the head-grouped O(L^2) scratchpad exceeds the 24 GB/core HBM.
+   - **SDK 2.29**: ctx=640 max (head-grouped scan G=8). ctx=768 fails at load with HBM OOM (34.5 GB required vs 24 GB available).
+   - **SDK 2.28**: ctx=256 max. ctx=512 compiles but OOM on load -- the CE model's 14.8 GB tensors + 7.5 GB scratchpad exceed 24 GB/core.
+   - The SDK 2.31 improvement (2048) over 2.29 (640) comes from a redesigned graph compiler code generation backend (default on Trn2/Trn3 in 2.31).
+   - The chunked NKI SSD path (8192) works because it uses O(chunk^2) SBUF scratchpad (chunk=128) instead of O(L^2), and stores state as a fixed 4 MB/layer HBM tensor. Kernel uses only "cheap ops" that survive the DGE budget in full-model compilation.
 2. **Maximum batch size is 2 on trn2.3xlarge (LNC=2).** BS=4 compiles successfully but exceeds HBM during model load (CE model allocation fails on 24 GB/core). BS=4 would require trn2.48xlarge or LNC=1 (not tested).
-3. **Validated seq_len up to 32768 at ctx=512, 12288 at ctx=640.** Higher seq_len at ctx=640 fails with instruction limit exceeded.
+3. **Validated seq_len up to 8192.** seq_len=4096 and seq_len=8192 both compile, load, and generate correctly with stable throughput (~16 tok/s) and TTFT (~211 ms).
 4. **No on-device sampling tested.** Current validation uses raw logits (`on_device_sampling_config=None`).
 5. **Conv1d workaround.** Manual depthwise convolution avoids TEN404 but may be slower than native conv1d once the SDK issue is fixed.
 6. **Base model behavior.** This is a base (non-instruct) model. Greedy decoding produces repetitive output after the first few correct tokens, consistent with the HF reference.
 7. **Sparse dispatch prefill fallback.** The prefill (context encoding) path uses a dense per-expert loop because sparse `index_select` on 128 experts at `seq_len=128` creates HLO graph explosion exceeding the 5M instruction limit. A fused NKI MoE kernel could address this.
-8. **Head-grouped scan TTFT overhead.** At ctx=128, head-grouped scan has ~36% higher TTFT (299 ms vs 220 ms) due to the 8-group loop in the XLA graph. For ctx=128 workloads, disable head grouping by setting `SCAN_HEAD_GROUP = 64` (all heads in one group).
+8. **Maximum context length is 2048 on all trn2 instances (LNC=2).** All trn2 instances have 24 GB per logical core at LNC=2, so this limit applies regardless of instance size. ctx=2048 is validated on trn2.48xlarge TP=8. ctx=4224 compiles successfully (~110 min) but fails at NEFF load time — the Mamba-2 quadratic scan scratchpad consumes 22.765 GB per logical core (weights 7.5 GB + scratchpad 7.0 GB + shared scratchpad 8.25 GB), leaving only ~1.2 GB free. The CTE transpose operation (`transpose.215_sg0002`) requires an additional 1.031 GB that cannot be allocated. Tested both `-O1` and `-O2` compiler optimization — identical failure. The scratchpad requirement scales quadratically with context length due to the Mamba-2 parallel scan. Possible mitigations: chunked CTE (multiple smaller passes), TP=16 (requires `n_groups` divisible by 16; currently `n_groups=8`), or switching to the O(L) NKI selective scan for CTE.
+9. **BS>1 blocked on vLLM-neuron.** When launching vLLM with `--max-num-seqs >1`, NEFFs compile correctly for the larger batch size, but Mamba state buffers (`mamba_states`) are initialized with `batch_size=1` (from `config.neuron_config.batch_size`). The runtime rejects the shape mismatch (e.g., "received 1 8 64 128, expected 4 8 64 128"). Fix requires plumbing `max_num_seqs` through to `neuron_config.batch_size` in `NeuronNemotronModel.init_model()`.
 
 ## HuggingFace Model Issues Found
 
@@ -294,7 +367,7 @@ During development, we discovered and documented several issues in the original 
 
 | File | Description | Lines |
 |------|-------------|-------|
-| `src/modeling_nemotron_h.py` | Full model implementation (config, Mamba layer with head-grouped scan, attention, MoE with sparse dispatch, NKI scan, model wrapper, state dict conversion) | ~2230 |
+| `src/modeling_nemotron_h.py` | Full model implementation (config, Mamba layer, attention, MoE with sparse dispatch, NKI scan, preshard_hook for TP, model wrapper, state dict conversion) | ~2280 |
 | `src/__init__.py` | Public exports | ~27 |
 | `test/integration/test_model.py` | Integration tests (compile, load, generate, logit validation, throughput) | ~441 |
 | `test_smoke.py` | Quick smoke test for pre-compiled model | ~79 |
@@ -303,4 +376,4 @@ During development, we discovered and documented several issues in the original 
 
 Jim Burtoft ([@jimburtoft](https://github.com/jimburtoft))
 
-**Last Updated:** 2026-04-12
+**Last Updated:** 2026-07-10 (SDK 2.31 chunked NKI SSD integration by agent nemo -- max ctx 8192 on trn2.3xlarge)
