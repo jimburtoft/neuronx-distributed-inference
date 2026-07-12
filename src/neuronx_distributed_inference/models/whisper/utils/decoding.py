@@ -19,6 +19,8 @@ class NeuronInference(Inference):
 
     def logits(self, tokens: Tensor, audio_features: Tensor) -> Tensor:
         tokens = tokens.to(torch.int32)
+        # bf16 patch: cast audio_features to model dtype so decoder inputs match
+        audio_features = audio_features.to(self.model.config.neuron_config.torch_dtype)
         padded_tokens, last_pos, pad_mask = self.model._prepare_decoder_inputs(tokens)
 
         if tokens.shape[-1] > self.initial_token_length:
@@ -27,7 +29,10 @@ class NeuronInference(Inference):
             return self.model.decoder(tokens, audio_features, last_pos, pad_mask)
         else:
             tokens = padded_tokens
-        return self.model.decoder(tokens, audio_features, last_pos, pad_mask)[:, : last_pos + 1]
+        # BS>1 patch: last_pos is now (BS,); all entries identical during decode
+        # (all batch items start from same initial-tokens prompt), so last_pos[0]+1
+        # is a scalar suitable for Python slicing.
+        return self.model.decoder(tokens, audio_features, last_pos, pad_mask)[:, : last_pos[0] + 1]
 
 
 class NeuronDecodingTask(DecodingTask):
@@ -66,7 +71,7 @@ def decode(
         options = replace(options, **kwargs)
 
     dtype = model.config.neuron_config.torch_dtype
-    assert dtype in [torch.float16, torch.float32], f"Unsupported dtype: {dtype}"
+    assert dtype in [torch.float16, torch.float32, torch.bfloat16], f"Unsupported dtype: {dtype}"
     options = replace(options, fp16=(dtype == torch.float16))
 
     result = NeuronDecodingTask(model, options).run(mel)

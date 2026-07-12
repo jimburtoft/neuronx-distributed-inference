@@ -397,7 +397,11 @@ class NeuronTextDecoder(nn.Module):
         if is_prefill:
             pe = self.positional_embedding.weight
         else:
-            pe = self.positional_embedding(last_pos)  # TODO: check if it's correct when batch_size > 1
+            # BS>1 patch: unsqueeze to (BS, 1, n_state) so it broadcasts correctly
+            # against token_embedding(x) shape (BS, 1, n_state). Stock code returns
+            # (BS, n_state) which PyTorch broadcasts as (1, BS, n_state), producing
+            # (BS, BS, n_state) cross-batch contamination for BS>1.
+            pe = self.positional_embedding(last_pos).unsqueeze(1)
         x = self.token_embedding(x) + pe
         x = x.to(xa.dtype)
 
@@ -526,7 +530,7 @@ class ModelWrapperWhisperDecoderPrefill(ModelWrapper):
             dtype=self.neuron_config.torch_dtype,
         )
         padded_tokens = torch.zeros((self.neuron_config.batch_size, self.config.dims.n_text_ctx), dtype=torch.int32)
-        last_pos = torch.zeros(1, dtype=torch.int32)
+        last_pos = torch.zeros(self.neuron_config.batch_size, dtype=torch.int32)
         pad_mask = torch.zeros((self.neuron_config.batch_size, self.config.dims.n_text_ctx), dtype=torch.int32)
         inputs = [
             (padded_tokens, audio_embed, last_pos, pad_mask),
@@ -554,7 +558,7 @@ class ModelWrapperWhisperDecoderDecode(ModelWrapper):
             dtype=self.neuron_config.torch_dtype,
         )
         padded_tokens = torch.zeros((self.neuron_config.batch_size, 1), dtype=torch.int32)
-        last_pos = torch.zeros(1, dtype=torch.int32)
+        last_pos = torch.zeros(self.neuron_config.batch_size, dtype=torch.int32)
         pad_mask = torch.zeros((self.neuron_config.batch_size, self.config.dims.n_text_ctx), dtype=torch.int32)
         inputs = [
             (padded_tokens, audio_embed, last_pos, pad_mask),
@@ -590,6 +594,8 @@ class NeuronApplicationWhisperEncoder(NeuronApplicationBase):
         compiler_args += " --tensorizer-options='--enable-ccop-compute-overlap --cc-pipeline-tiling-factor=2'"
         if self.config.neuron_config.torch_dtype == torch.float32:
             compiler_args += " --auto-cast=none"
+        # lnc patch: pass logical_nc_config through to compiler so NEFF matches runtime.
+        compiler_args += f" --lnc={self.config.neuron_config.logical_nc_config}"
         return compiler_args
 
     @staticmethod
@@ -645,6 +651,8 @@ class NeuronApplicationWhisperDecoder(NeuronApplicationBase):
         compiler_args += " --tensorizer-options='--enable-ccop-compute-overlap --cc-pipeline-tiling-factor=2'"
         if self.config.neuron_config.torch_dtype == torch.float32:
             compiler_args += " --auto-cast=none"
+        # lnc patch: pass logical_nc_config through to compiler so NEFF matches runtime.
+        compiler_args += f" --lnc={self.config.neuron_config.logical_nc_config}"
         return compiler_args
 
     @staticmethod
