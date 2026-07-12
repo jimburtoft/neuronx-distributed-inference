@@ -1243,12 +1243,22 @@ def get_rmsnorm_cls():
 def _gated_rmsnorm_with_weight(hidden_states, gate, weight, group_size, eps):
     """Gated RMSNorm with explicit weight tensor (for per-rank TP slicing).
 
-    Same computation as NemotronRMSNormGated.forward(), but takes weight
-    as an argument instead of from self.weight. This allows using a per-rank
-    slice of the full norm weight.
+    Matches HF MambaRMSNormGated with `norm_before_gate=False`, which in
+    mamba-ssm's rmsnorm_fn means: y = RMSNorm(x * SiLU(z)) * w.
+
+    The gate is applied to x BEFORE variance is computed, NOT after normalization.
+    Previous versions of this file applied SiLU(gate) *after* normalization, which
+    was a bug that produced ~82% argmax match with the HF PyTorch fallback
+    (which had the same bug), but produced fundamentally wrong output vs
+    the true CUDA reference. See https://github.com/state-spaces/mamba,
+    layernorm_gated.py: `if z is not None and not norm_before_gate: x = x * F.silu(z)`.
     """
     input_dtype = hidden_states.dtype
     hidden_states = hidden_states.to(torch.float32)
+
+    # Apply gate BEFORE normalization (norm_before_gate=False semantics)
+    if gate is not None:
+        hidden_states = hidden_states * F.silu(gate.to(torch.float32))
 
     orig_shape = hidden_states.shape
     num_groups = orig_shape[-1] // group_size
@@ -1259,22 +1269,24 @@ def _gated_rmsnorm_with_weight(hidden_states, gate, weight, group_size, eps):
     hidden_states = hidden_states.view(*orig_shape)
 
     hidden_states = (weight * hidden_states).to(input_dtype)
-    if gate is not None:
-        hidden_states = hidden_states * F.silu(gate)
     return hidden_states
 
 
 class NemotronRMSNormGated(nn.Module):
-    """Gated RMSNorm: RMSNorm(x) * SiLU(gate). Gate applied AFTER norm.
+    """Gated RMSNorm: y = RMSNorm(x * SiLU(gate)) * weight.
 
-    Matches HF MambaRMSNormGated with norm_before_gate=False:
-    the norm is computed on x alone, then the result is multiplied by SiLU(gate).
+    Matches HF MambaRMSNormGated with `norm_before_gate=False`, which in
+    mamba-ssm's `rmsnorm_fn` means: **the gate is applied to x BEFORE variance
+    is computed**, NOT `RMSNorm(x) * SiLU(gate)` as the name might suggest.
+
+    Reference (state-spaces/mamba, layernorm_gated.py):
+        if z is not None and not norm_before_gate:
+            x = x * F.silu(z)
+        rstd = 1 / sqrt(x.square().mean(-1) + eps)
+        out = x * rstd * weight
 
     CRITICAL: Uses group_size for per-group normalization. The CUDA rmsnorm_fn
     normalizes per-group (groups of group_size elements), NOT over the full dim.
-    The HF PyTorch fallback has an issue where it ignores group_size and normalizes
-    over the full dimension, producing garbage decode output.
-
     For Nemotron: intermediate_size=4096, n_groups=8, group_size=512.
     This means 8 independent RMSNorms, each over 512 elements.
     """
@@ -1289,6 +1301,10 @@ class NemotronRMSNormGated(nn.Module):
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
 
+        # Apply gate BEFORE normalization (norm_before_gate=False semantics)
+        if gate is not None:
+            hidden_states = hidden_states * F.silu(gate.to(torch.float32))
+
         # Group-wise RMSNorm: reshape into groups, normalize each independently
         orig_shape = hidden_states.shape
         group_size = self.group_size
@@ -1300,8 +1316,6 @@ class NemotronRMSNormGated(nn.Module):
         hidden_states = hidden_states.view(*orig_shape)
 
         hidden_states = (self.weight * hidden_states).to(input_dtype)
-        if gate is not None:
-            hidden_states = hidden_states * F.silu(gate)
         return hidden_states
 
 

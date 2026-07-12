@@ -68,7 +68,14 @@ The auto-inserted NKI Conv1d kernel has previously crashed on `seq_len=1` (decod
 
 ### Gated RMSNorm with Per-Group Normalization
 
-Nemotron's Mamba layers use gated RMSNorm with `norm_before_gate=False` and per-group normalization (`group_size = intermediate_size / n_groups = 4096 / 8 = 512`). The CUDA Triton kernel (`rmsnorm_fn`) handles this correctly, but the PyTorch fallback in the original HF code ignores `group_size` entirely — causing incorrect normalization and incoherent decode output. Our `NemotronRMSNormGated` implements correct per-group normalization for all backends.
+Nemotron's Mamba layers use gated RMSNorm with `norm_before_gate=False` and per-group normalization (`group_size = intermediate_size / n_groups = 4096 / 8 = 512`). The CUDA Triton kernel (`rmsnorm_fn` from `mamba-ssm`) handles this correctly, but the PyTorch fallback in the original HF code has **two bugs** that any naive port will inherit:
+
+1. It ignores `group_size` entirely, normalizing over the full hidden dim.
+2. The `norm_before_gate=False` naming is counter-intuitive. It means the gate is applied to `x` BEFORE variance is computed: `y = RMSNorm(x * SiLU(z)) * w`. The HF fallback (and initial versions of this file) reads the name literally and computes `y = RMSNorm(x) * SiLU(z) * w`, which is a different function.
+
+Symptom of either bug: the model produces the correct first token, then degenerates into repetition. With `apply_chat_template`, output becomes coherent English words but semantically garbage.
+
+Our `NemotronRMSNormGated` implements both fixes correctly for all backends. Reference: [state-spaces/mamba layernorm_gated.py](https://github.com/state-spaces/mamba/blob/main/mamba_ssm/ops/triton/layernorm_gated.py) function `rms_norm_ref`.
 
 ### NKI Selective Scan (Optional)
 
@@ -80,28 +87,30 @@ The codebase includes an optional O(L) NKI selective scan kernel (ported from Gr
 **SDK:** Neuron SDK 2.31, DLAMI `Deep Learning AMI Neuron (Ubuntu 24.04) 20260708`
 **Configuration:** batch_size=1, bfloat16
 
-### Prefill Accuracy (vs HF BF16 CPU, 11 prompts)
+### End-to-end coherent output with chat template
 
-| Metric | Value |
-|--------|-------|
-| **Average cosine similarity** | **0.968** |
-| **Argmax match rate** | **9/11 (82%)** |
-| Min cosine | 0.931 |
-| Max cosine | 0.995 |
+The model produces **coherent, factually correct, reasoning-quality output** when invoked with `apply_chat_template()`. Sample greedy generations at ctx=128 with the model card's recommended invocation (system prompt empty, `enable_thinking=True` default) exactly match what a properly-deployed Nemotron 3 Nano is expected to produce:
 
-### Decode Quality (greedy, 20 tokens)
+| User prompt | Generated response (greedy, ctx=128) |
+|-------------|---------------------------------------|
+| "What is 2+2?" | `The user asks a simple question: "What is 2+2?" The answer is 4. Provide a concise answer.</think>4<\|im_end\|>` |
+| "What is the capital of France?" | `The user asks: "What is the capital of France?" The answer is Paris. Provide concise answer.</think>The capital of France is **Paris**.<\|im_end\|>` |
+| "Write a haiku about GPUs" | `We need to respond with a haiku about GPUs. Haiku is 5-7-5 syllable structure. Let's craft: "Silicon whispers / Parallel hearts beat in silicon / Light streams forth". Count syllables...` |
 
-| Prompt | First Token | Quality |
-|--------|-------------|---------|
-| "The capital of France is" | Paris | Correct factual answer |
-| "Albert Einstein was born in" | 1885 | Approximately correct |
-| "1 + 1 =" | 2 | Correct |
+The `<think>...</think>` reasoning trace followed by a concise final answer + `<|im_end|>` is exactly the behavior documented on the model card.
 
-Both Neuron and HF reference produce correct first tokens, followed by greedy repetition patterns typical of base (non-instruct) models.
+### Raw completion prompts (no chat template)
+
+For raw completion prompts, the model still produces the correct first token but degenerates into repetition, because Nemotron 3 Nano is instruction-tuned + RLHF'd -- it expects chat-templated input. Both Neuron and HF CPU reference behave the same way on raw completion prompts:
+
+| Prompt | Neuron first token | HF CPU first token | Match |
+|--------|---------------------|---------------------|-------|
+| "The capital of France is" | ` Paris` | ` Paris` | ✓ |
+| "Albert Einstein was born in" | ` 1` (then diverges) | ` 1` (then diverges) | ✓ first token only |
 
 ### Chunked NKI SSD end-to-end correctness
 
-Bit-exact A/B token comparison between the chunked NKI SSD path and the head-grouped quadratic scan on the same model, greedy decoding:
+Bit-exact A/B token comparison between the chunked NKI SSD path and the head-grouped quadratic scan on the same model, greedy decoding on raw completion prompts:
 
 | ctx | Chunks | Tokens generated | Match |
 |-----|--------|------------------|-------|
@@ -247,10 +256,10 @@ huggingface-cli download nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 \
 
 The original HuggingFace `modeling_nemotron_h.py` has several issues that must be patched for non-CUDA execution:
 
-1. **CUDA import fallbacks** — `rmsnorm_fn`, `selective_state_update`, `causal_conv1d` imports fail without CUDA. Wrap in try/except.
-2. **Per-group RMSNorm** — `MambaRMSNormGated.forward()` PyTorch fallback ignores `group_size`, producing incorrect normalization. Add per-group CPU fallback.
-3. **Cache attribute issues** — `HybridMambaAttentionDynamicCache` accesses `.device` on Python lists instead of tensor elements.
-4. **`torch.cuda.stream`** — Replace with `if True:` for non-CUDA backends.
+1. **CUDA import fallbacks** -- `rmsnorm_fn`, `selective_state_update`, `causal_conv1d` imports fail without CUDA. Change `raise ImportError(...)` at line ~66 to `rmsnorm_fn = None`.
+2. **`MambaRMSNormGated` PyTorch fallback** -- two bugs: ignores `group_size` and applies gate AFTER normalization instead of BEFORE. For `norm_before_gate=False` (Nemotron's setting), the correct math is `y = RMSNorm(x * SiLU(z)) * w`. See our `test/integration/test_model.py::_patch_hf_rmsnorm` for the corrected implementation.
+3. **`HybridMambaAttentionDynamicCache` attribute issues** -- accesses `.device` on Python lists instead of tensor elements. Replace `self.conv_states.device` with `new_conv_state.device` (and similar for `ssm_states`).
+4. **`torch.cuda.stream(torch.cuda.default_stream(...))`** -- Replace with `if True:` for non-CUDA backends.
 
 ### Swap Space
 
@@ -317,7 +326,7 @@ python test/unit/test_chunked_d64.py
 3. **The `USE_SSD_SCAN=True` / `USE_PYTORCH_SSD=True` paths remain broken** in the full 52-layer graph: the NKI SSD kernel with 128-expert MoE triggers a runtime error, `scatter/gather (indirect memory copy via vector DGE) out-of-bound access`. This is a compiler-level issue independent of our modeling code. The chunked NKI SSD path (`USE_CHUNKED_NKI_SCAN=1`) is the supported way to get chunk-based SSD scan into the full model.
 4. **No on-device sampling tested.** Current validation uses raw logits (`on_device_sampling_config=None`).
 5. **Manual depthwise conv1d.** We use an explicit weight loop instead of the auto-inserted NKI Conv1d kernel to avoid past crashes on `seq_len=1`. This may be slower than a native conv1d once the SDK issue is fully resolved.
-6. **Base model behavior.** This is a base (non-instruct) model. Greedy decoding produces repetitive output after the first few correct tokens, consistent with the HF reference.
+6. **Model expects chat-templated input.** Nemotron 3 Nano is fully instruction-tuned + RLHF'd (not a base model). Feed prompts through `tokenizer.apply_chat_template(messages, add_generation_prompt=True, ...)` to get coherent output. Raw completion prompts (e.g., `"The capital of France is"`) get the correct first token but degenerate into repetition, which is expected instruct-model behavior on unaligned input.
 7. **Sparse dispatch prefill fallback.** The prefill (context encoding) path uses a dense per-expert loop because sparse `index_select` on 128 experts at `seq_len=128` creates an HLO graph too large for the 5M instruction limit. A fused NKI MoE kernel could address this.
 8. **BS>1 blocked on vLLM-neuron.** When launching vLLM with `--max-num-seqs >1`, NEFFs compile correctly for the larger batch size, but Mamba state buffers (`mamba_states`) are initialized with `batch_size=1` (from `config.neuron_config.batch_size`). The runtime rejects the shape mismatch (e.g., "received 1 8 64 128, expected 4 8 64 128"). Fix requires plumbing `max_num_seqs` through to `neuron_config.batch_size` in `NeuronNemotronModel.init_model()`.
 
@@ -325,9 +334,15 @@ python test/unit/test_chunked_d64.py
 
 During development, we discovered and documented several issues in the original HuggingFace `modeling_nemotron_h.py`:
 
-1. **`MambaRMSNormGated` ignores `group_size`** — The PyTorch fallback normalizes over the full hidden dimension instead of per-group. The CUDA Triton kernel is correct. This causes incoherent decode output on CPU/non-CUDA backends.
-2. **`HybridMambaAttentionDynamicCache` attribute issues** — `self.ssm_states` and `self.conv_states` are Python lists but accessed as tensors (`.device`, `.zero_()`).
-3. **Cache key mismatch** — `prepare_inputs_for_generation()` stores cache under `"past_key_values"` but `forward()` expects `"cache_params"`, preventing proper state persistence in HF's `generate()`.
+1. **`MambaRMSNormGated` has two related bugs in its PyTorch/CUDA-fallback path**:
+   - **(a) Ignores `group_size`** -- normalizes over the full hidden dimension instead of per-group. The Triton `rmsnorm_fn` from `mamba-ssm` is correct.
+   - **(b) Wrong gate order for `norm_before_gate=False`** -- the CUDA `rmsnorm_fn` with `norm_before_gate=False` computes `y = RMSNorm(x * SiLU(z)) * w` (gate applied to x BEFORE variance). The HF fallback (and any naive port that reads the name literally) computes `y = RMSNorm(x) * SiLU(z) * w`, which is mathematically different.
+   - **Symptom:** On CPU without the CUDA fast path, the model produces the correct first token, then degenerates into repetition. On instruction-following prompts (with `apply_chat_template`), output becomes coherent English words but semantically garbage (e.g., `"I'm sorry, I'm not sure I'm going to be able to..."`).
+   - Both bugs are fixed in our `src/modeling_nemotron_h.py` (`NemotronRMSNormGated` and `_gated_rmsnorm_with_weight`) and in the HF CPU reference patch in `test/integration/test_model.py::_patch_hf_rmsnorm`.
+2. **`HybridMambaAttentionDynamicCache` attribute issues** -- `self.ssm_states` and `self.conv_states` are Python lists but accessed as tensors (`.device`, `.zero_()`).
+3. **Cache key mismatch** -- `prepare_inputs_for_generation()` stores cache under `"past_key_values"` but `forward()` expects `"cache_params"`, preventing proper state persistence in HF's `generate()`.
+4. **`torch.cuda.stream(torch.cuda.default_stream(...))` in `NemotronHBlock.forward`** -- fails without CUDA. Must be wrapped in `if True: ...` or `contextlib.nullcontext()` for CPU/Neuron.
+5. **`mamba-ssm` `ImportError` at import time** -- the module fails to load without the mamba-ssm package installed. Change `raise ImportError(...)` to `rmsnorm_fn = None` so the fallback path can be used.
 
 ## Source Files
 
@@ -349,4 +364,4 @@ During development, we discovered and documented several issues in the original 
 
 Jim Burtoft ([@jimburtoft](https://github.com/jimburtoft))
 
-**Last Updated:** 2026-07-12 (SDK 2.31 chunked NKI SSD, max ctx 8192 on trn2.3xlarge)
+**Last Updated:** 2026-07-12 (Gated RMSNorm gate-order bug fix -- model now produces coherent reasoning output with chat template)

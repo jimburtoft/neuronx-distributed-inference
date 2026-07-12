@@ -366,26 +366,44 @@ def test_logit_accuracy(gen_adapter, tokenizer):
 
 
 def _patch_hf_rmsnorm(model):
-    """Patch HF MambaRMSNormGated with correct per-group normalization.
+    """Patch HF MambaRMSNormGated to match the CUDA rmsnorm_fn semantics.
 
-    The HF PyTorch fallback ignores group_size, causing incorrect normalization
-    on CPU. This patches all MambaRMSNormGated instances in the model.
+    Two bugs in the HF PyTorch fallback are fixed here:
+      1. It ignores group_size and normalizes over the full dimension.
+      2. It applies gate AFTER normalization (RMSNorm(x) * SiLU(z)) when the
+         CUDA rmsnorm_fn with norm_before_gate=False actually applies gate
+         BEFORE normalization: y = RMSNorm(x * SiLU(z)) * w.
+
+    Reference (state-spaces/mamba, layernorm_gated.py rms_norm_ref):
+        if z is not None and not norm_before_gate:
+            x = x * F.silu(z)
+        rstd = 1 / sqrt(x.square().mean(-1) + eps)
+        out = x * rstd * weight
+
+    Without both fixes, the HF CPU reference produces incoherent output on
+    instruction-following prompts, which is why the original 0.968 cosine
+    similarity metric was misleading -- it was comparing two equally broken
+    implementations.
     """
     import types
 
     def fixed_forward(self, hidden_states, gate=None):
-        x = hidden_states
+        input_dtype = hidden_states.dtype
+        x = hidden_states.to(torch.float32)
+
+        # Apply gate BEFORE normalization (norm_before_gate=False semantics)
+        if gate is not None:
+            x = x * torch.nn.functional.silu(gate.to(torch.float32))
+
         shape = x.shape
         gs = self.group_size
         num_groups = shape[-1] // gs
         x_grouped = x.reshape(*shape[:-1], num_groups, gs)
-        variance = x_grouped.to(torch.float32).pow(2).mean(-1, keepdim=True)
+        variance = x_grouped.pow(2).mean(-1, keepdim=True)
         x_normed = x_grouped * torch.rsqrt(variance + self.variance_epsilon)
         x_normed = x_normed.reshape(shape)
         x_normed = x_normed * self.weight
-        if gate is not None:
-            x_normed = x_normed * torch.nn.functional.silu(gate)
-        return x_normed.to(hidden_states.dtype)
+        return x_normed.to(input_dtype)
 
     patched = 0
     for module in model.modules():
