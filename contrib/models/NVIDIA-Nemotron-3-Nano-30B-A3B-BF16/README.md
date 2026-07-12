@@ -64,7 +64,7 @@ The 128-expert MoE layers use tensor-parallel sharding on the intermediate dimen
 
 ### Manual Depthwise Conv1d
 
-SDK 2.28 has a compiler issue (TEN404) where the auto-inserted NKI Conv1d kernel crashes on `seq_len=1` (decode path). We work around this by implementing depthwise convolution manually using weight parameters and a loop over kernel positions.
+The auto-inserted NKI Conv1d kernel has previously crashed on `seq_len=1` (decode path) with compiler error TEN404. We implement depthwise convolution manually using explicit weight parameters and a loop over kernel positions to avoid this dependency.
 
 ### Gated RMSNorm with Per-Group Normalization
 
@@ -72,14 +72,13 @@ Nemotron's Mamba layers use gated RMSNorm with `norm_before_gate=False` and per-
 
 ### NKI Selective Scan (Optional)
 
-The codebase includes an optional O(L) NKI selective scan kernel (ported from Granite4 contrib) using `nisa.tensor_tensor_scan`. However, benchmarking showed that at `max_context_length=128`, the quadratic O(L^2) parallel scan is actually **23x faster for TTFT** (211 ms vs 4932 ms) and **3x faster for decode** (18.3 vs 6.6 tok/s). This is because the NKI kernel invocation overhead per layer (23 Mamba layers) dominates at short sequence lengths. The quadratic scan is the default (`USE_NKI_SCAN = False`). Set `USE_NKI_SCAN = True` to experiment with the NKI path for longer sequences.
+The codebase includes an optional O(L) NKI selective scan kernel (ported from Granite4 contrib) using `nisa.tensor_tensor_scan`. It is off by default (`USE_NKI_SCAN = False`) because the head-grouped quadratic scan and the chunked NKI SSD kernel (see below) are faster for the sequence lengths this model targets.
 
 ## Validation Results
 
-**Validated:** 2026-04-03
-**Configuration:** TP=4, batch_size=1, seq_len=2048, max_context_length=128, bfloat16
-**Instance:** trn2.3xlarge (LNC=2)
-**SDK:** Neuron SDK 2.28, PyTorch 2.9
+**Instance:** trn2.3xlarge (LNC=2, TP=4)
+**SDK:** Neuron SDK 2.31, DLAMI `Deep Learning AMI Neuron (Ubuntu 24.04) 20260708`
+**Configuration:** batch_size=1, bfloat16
 
 ### Prefill Accuracy (vs HF BF16 CPU, 11 prompts)
 
@@ -100,42 +99,22 @@ The codebase includes an optional O(L) NKI selective scan kernel (ported from Gr
 
 Both Neuron and HF reference produce correct first tokens, followed by greedy repetition patterns typical of base (non-instruct) models.
 
+### Chunked NKI SSD end-to-end correctness
+
+Bit-exact A/B token comparison between the chunked NKI SSD path and the head-grouped quadratic scan on the same model, greedy decoding:
+
+| ctx | Chunks | Tokens generated | Match |
+|-----|--------|------------------|-------|
+| 128 | 1 | 50 | **50/50 identical** |
+| 1024 | 8 | 30 | **30/30 identical** |
+
 ### Inference Performance
 
-#### trn2.3xlarge (TP=4, LNC=2, BF16, SDK 2.31, chunked NKI SSD scan)
+All measurements on trn2.3xlarge (TP=4, LNC=2, BF16) with SDK 2.31 (`Deep Learning AMI Neuron (Ubuntu 24.04) 20260708`). BS=1, greedy decoding, single warmup, 50-token generation. Correct " Paris" first token at every ctx.
 
-Measured 2026-07-10 on `Deep Learning AMI Neuron (Ubuntu 24.04) 20260708`. Requires `USE_CHUNKED_NKI_SCAN=True` in `modeling_nemotron_h.py` (default is False for safety). Kernel: `contrib/src/nki_kernels/nki_mamba2_ssd_chunked.py`.
+#### Default path: head-grouped quadratic scan
 
-| Configuration | TTFT (ms) | Decode (tok/s) | TPOT (ms) | Load (s) |
-|--------------|-----------|----------------|-----------|----------|
-| BS=1, seq=2048, ctx=128 | **63.2** | 104.34 | 9.58 | 52.7 |
-| BS=1, seq=2048, ctx=512 | 172.8 | 102.30 | 9.77 | 64.5 |
-| BS=1, seq=2048, ctx=1024 | 325.2 | 103.16 | 9.69 | 83.8 |
-| BS=1, seq=4096, ctx=2048 | 633.8 | 99.39 | 10.06 | 101.0 |
-| **BS=1, seq=8192, ctx=4096** (new capability) | **1450.1** | 100.99 | 9.90 | 110.9 |
-| **BS=1, seq=16384, ctx=8192** (new capability) | **2503.4** | 101.29 | 9.87 | 151.5 |
-| ~~ctx=16384~~ | ~~compile fails~~ | -- | -- | -- |
-
-**Ceiling on trn2.3xlarge**: ctx=8192 works; ctx=16384 fails with `[F137] neuronx-cc was forcibly killed` (compiler host RAM OOM, not device HBM). TG NEFF at ctx=16384 compiles fine; only the CE NEFF exceeds 128 GB host RAM. A larger-host instance (or compiler improvements) could push higher.
-
-**Correctness validated** by A/B token comparison vs the head-grouped quadratic scan on the same model: **50/50 tokens identical at ctx=128**, **30/30 tokens identical at ctx=1024 (8 chunks)** under greedy decoding.
-
-**Delta vs head-grouped quadratic** (numbers below):
-
-| ctx | Quadratic TTFT | Chunked TTFT | Delta |
-|-----|---------------|--------------|-------|
-| 128 | 67.5 ms | **63.2 ms** | 6% faster |
-| 512 | 225.1 ms | **172.8 ms** | 23% faster |
-| 1024 | 459.8 ms | **325.2 ms** | 29% faster |
-| 2048 | 1081.7 ms | **633.8 ms** | 41% faster |
-| 4096 | HBM OOM | **1450.1 ms** | new capability |
-| 8192 | HBM OOM | **2503.4 ms** | new capability |
-
-Decode throughput unchanged (~100-104 tok/s) in both paths.
-
-#### trn2.3xlarge (TP=4, LNC=2, BF16, SDK 2.31, head-grouped scan G=8)
-
-Measured 2026-07-09 on `Deep Learning AMI Neuron (Ubuntu 24.04) 20260708`.
+Ships with the model. No environment variable required.
 
 | Configuration | TTFT (ms) | Decode (tok/s) | TPOT (ms) | Load (s) |
 |--------------|-----------|----------------|-----------|----------|
@@ -147,48 +126,48 @@ Measured 2026-07-09 on `Deep Learning AMI Neuron (Ubuntu 24.04) 20260708`.
 | BS=1, seq=2048, ctx=1024 | 459.8 | 105.61 | 9.47 | 59.7 |
 | **BS=1, seq=4096, ctx=2048** | **1081.7** | **102.06** | **9.80** | 87.1 |
 
-All greedy decoding, 50-token generation, single warmup. Correct " Paris" first token at every ctx. Decode throughput is essentially flat at ~103-106 tok/s across the full ctx range.
+Decode throughput is essentially flat at ~103-106 tok/s across the full ctx range.
 
-#### trn2.3xlarge (TP=4, LNC=2, BF16, SDK 2.28, sparse MoE)
+#### Optional path: chunked NKI SSD scan (`USE_CHUNKED_NKI_SCAN=1`)
 
-Historical numbers preserved from Task 010 for comparison:
+Opt-in via environment variable. Uses the cheap-ops-only chunked NKI SSD kernel at `src/nki_kernels/nki_mamba2_ssd_chunked.py`. Faster prefill at every context length AND extends the max context on trn2.3xlarge from 2048 to 8192.
 
-| Configuration | TTFT (ms) | Decode (tok/s) | TPOT (ms) |
-|--------------|-----------|----------------|-----------|
-| BS=1, seq=2048, ctx=128 (sparse MoE) | 211 | 66.6 | 15.0 |
-| BS=1, seq=2048, ctx=128 (dense MoE) | 211 | 17.4 | 57.5 |
-| BS=1, seq=4096, ctx=256 (sparse MoE) | 436 | 45.8 | -- |
-| BS=2, seq=2048, ctx=128 | 263 | 22.0 | -- |
-| BS=1, seq=4096, ctx=128 | 210.5 | 16.0 | -- |
-| BS=1, seq=8192, ctx=128 | 211.3 | 15.8 | -- |
+| Configuration | TTFT (ms) | Decode (tok/s) | TPOT (ms) | Load (s) |
+|--------------|-----------|----------------|-----------|----------|
+| BS=1, seq=2048, ctx=128 | **63.2** | 104.34 | 9.58 | 52.7 |
+| BS=1, seq=2048, ctx=512 | 172.8 | 102.30 | 9.77 | 64.5 |
+| BS=1, seq=2048, ctx=1024 | 325.2 | 103.16 | 9.69 | 83.8 |
+| BS=1, seq=4096, ctx=2048 | 633.8 | 99.39 | 10.06 | 101.0 |
+| **BS=1, seq=8192, ctx=4096** | **1450.1** | 100.99 | 9.90 | 110.9 |
+| **BS=1, seq=16384, ctx=8192** | **2503.4** | 101.29 | 9.87 | 151.5 |
 
-**Perf gains SDK 2.28 -> SDK 2.31 (BS=1, ctx=128):** decode 66.6 -> **105.7 tok/s** (+58%), TTFT 211 -> **67.5 ms** (3.1x faster).
+**Correctness**: bit-for-bit identical token sequences vs the default quadratic path under greedy decoding (50/50 tokens at ctx=128, 30/30 tokens at ctx=1024). See Validation Results above.
 
-All measurements on trn2.3xlarge (TP=4, LNC=2, BF16).
+**Delta vs default quadratic path**:
 
-#### trn2.48xlarge (TP=8, LNC=2)
+| ctx | Default TTFT | Chunked TTFT | Delta |
+|-----|--------------|--------------|-------|
+| 128 | 67.5 ms | **63.2 ms** | 6% faster |
+| 512 | 225.1 ms | **172.8 ms** | 23% faster |
+| 1024 | 459.8 ms | **325.2 ms** | 29% faster |
+| 2048 | 1081.7 ms | **633.8 ms** | 41% faster |
+| 4096 | not available | **1450.1 ms** | new capability |
+| 8192 | not available | **2503.4 ms** | new capability |
 
-| Configuration | TTFT (ms) | Decode (tok/s) | TPOT P50 (ms) | E2E P50 (ms) |
-|--------------|-----------|----------------|---------------|--------------|
-| **BS=1, ctx=2048, 50 output tokens** | 1,698 | 22.9 | 9.93 | 2,184 |
-| **BS=1, ctx=2048, 100 output tokens** | 1,698 | 37.3 | 9.94 | 2,682 |
-| **BS=1, ctx=2048, 200 output tokens** | 1,698 | 54.4 | 9.95 | 3,678 |
-| **BS=1, ctx=2048, 300 output tokens** | 1,699 | 64.1 | 9.96 | 4,677 |
-| **BS=1, ctx=2048, 400 output tokens** | 1,698 | 70.5 | 9.96 | 5,673 |
-| **BS=1, ctx=2048, 512 output tokens** | 1,698 | **75.4** | **9.98** | 6,796 |
+Decode throughput unchanged (~100-104 tok/s) in both paths.
 
-Measured via `vllm bench serve` with `vllm-neuron` on trn2.48xlarge (TP=8, LNC=2, BF16). Input: 1800-token prefix + 141 random tokens = 1941 total. 20 prompts, 4 warmup. Prefix caching disabled (Mamba recurrent state). TPOT P50-P99 spread < 0.1 ms.
+**Enabling**:
 
-**Maximum context length on trn2 (LNC=2) is 2048.** All trn2 instances have 24 GB per logical core at LNC=2, regardless of instance size. The Mamba-2 quadratic scan at 4224 tokens produces scratchpad + weight requirements of 22.765 GB per core, leaving only ~1.2 GB free. The CTE transpose operation needs 1.031 GB more than available. Tested with both `-O1` and `-O2` compiler optimization on trn2.48xlarge TP=8 — same result. See Known Issues #8.
+```bash
+export USE_CHUNKED_NKI_SCAN=1
+python your_script.py
+```
 
-**Sparse expert dispatch** (default) achieves **3.83x decode speedup** by loading only the 6 active expert weights per MoE layer during decode, instead of all 128. Output is bit-for-bit identical to the dense path.
+Or set the flag directly in `modeling_nemotron_h.py`:
 
-| Metric | Value (BS=1) |
-|--------|-------|
-| Model load time | 16.9 s |
-| HBM per core (est.) | ~14.7 GB / 24 GB (61%) |
-
-TPOT is extremely stable at BS=1: P50-P99 spread < 0.3 ms.
+```python
+USE_CHUNKED_NKI_SCAN = os.environ.get("USE_CHUNKED_NKI_SCAN", "0") == "1"
+```
 
 ### Compilation
 
@@ -286,24 +265,13 @@ sudo swapon /mnt/models/swapfile
 
 ## Compatibility Matrix
 
-| Instance Type | SDK 2.31 | SDK 2.29 | SDK 2.28 | SDK 2.27 |
-|--------------|----------|----------|----------|----------|
-| trn2.3xlarge (TP=4, LNC=2) | **Validated (ctx<=2048 quadratic, ctx<=8192 chunked NKI SSD)** | Validated (ctx<=640) | Validated (ctx<=256) | Not tested |
-| trn2.48xlarge (TP=8, LNC=2) | Not tested | Not tested | Validated (ctx<=2048) | Not tested |
-| trn1.32xlarge | Not supported | Not supported | Not tested | Not tested |
+| Instance Type | SDK 2.31 |
+|--------------|----------|
+| trn2.3xlarge (TP=4, LNC=2) | **Validated** — ctx<=2048 (default quadratic scan), ctx<=8192 (chunked NKI SSD, opt-in via `USE_CHUNKED_NKI_SCAN=1`) |
+| trn2.48xlarge (TP=8, LNC=2) | Not tested on SDK 2.31 |
+| trn1.32xlarge | Not supported (NxDI 2.29+ requires Trn2 or newer) |
 
-> **NxDI 2.29+ requires Trn2 or newer hardware.** For Trn1 support, pin to SDK 2.28.
-
-**SDK 2.31 notes (verified 2026-07-09 on `Deep Learning AMI Neuron (Ubuntu 24.04) 20260708`)**:
-- Working configuration (default): Falcon-H1-style TP sharding + head-grouped O(L^2) quadratic scan (`SCAN_HEAD_GROUP=8`).
-- New chunked NKI SSD path (opt-in via `USE_CHUNKED_NKI_SCAN=True`) delivers 6-41% faster prefill on matched contexts AND extends the max ctx on trn2.3xlarge from **2048 to 8192 (4x)**. Correctness proven bit-for-bit vs quadratic (50/50 tokens at ctx=128, 30/30 at ctx=1024).
-- Decode throughput 102-106 tok/s across ctx=128..2048 (BS=1) -- **~40% faster** than SDK 2.29 (73-74 tok/s).
-- TTFT 2.7-4.4x faster than SDK 2.29 at matched context lengths.
-- Max context on trn2.3xlarge raised from ctx=640 (SDK 2.29) to **ctx=2048** (SDK 2.31, seq=4096) -- matches trn2.48xlarge SDK 2.28 milestone on the smaller instance.
-- Still blocked: NKI SSD kernel with full MoE graph triggers `scatter/gather (indirect memory copy via vector DGE) out-of-bound access` at runtime. Same failure as SDK 2.29. Do NOT set `USE_SSD_SCAN=True` / `USE_PYTORCH_SSD=True` for the full 52-layer model.
-- Package versions: torch-neuronx 2.9.0.2.15.32035, neuronx-cc 2.26.6360.0, NxDI 0.10.18399, NKI 0.5.0, Runtime 2.33.10, Driver 2.29.0.
-
-**SDK 2.29 note**: The model compiles and loads on SDK 2.29 (NxDI 0.9.17334) and produces correct inference output after the Falcon-H1 TP rewrite (2026-04-11). Use SDK 2.31 for best performance and highest context length.
+Verified on `Deep Learning AMI Neuron (Ubuntu 24.04) 20260708`. Package versions: torch-neuronx 2.9.0.2.15.32035, neuronx-cc 2.26.6360.0, NxDI 0.10.18399, NKI 0.5.0, Runtime 2.33.10, Driver 2.29.0.
 
 ## Example Checkpoints
 
@@ -326,8 +294,12 @@ python test/integration/test_model.py
 # Enable logit validation when running directly
 RUN_LOGIT_VALIDATION=1 python test/integration/test_model.py
 
-# Quick smoke test (requires pre-compiled model)
-python test_smoke.py
+# Enable the chunked NKI SSD path (opt-in)
+USE_CHUNKED_NKI_SCAN=1 python test/integration/compile_bench_231.py --ctx 128 --seq 2048
+
+# Standalone kernel unit tests (no HF checkpoint required)
+python test/unit/test_mamba2_ssd_chunked.py
+python test/unit/test_chunked_d64.py
 ```
 
 **Environment variables:**
@@ -337,21 +309,17 @@ python test_smoke.py
 
 ## Known Issues
 
-1. **Maximum context length on trn2.3xlarge (TP=4, LNC=2) depends on SDK version and scan path:**
-   - **SDK 2.31 + chunked NKI SSD** (`USE_CHUNKED_NKI_SCAN=True`): **ctx=8192** validated (seq=16384). ctx=16384 fails compilation with `[F137] neuronx-cc was forcibly killed` -- compiler host RAM OOM at CE HLO compile step (TG NEFF compiles fine). Device HBM is not the limit.
-   - **SDK 2.31 default (head-grouped scan)**: **ctx=2048** validated (seq=4096, decode 102 tok/s). Beyond ctx=2048, the head-grouped O(L^2) scratchpad exceeds the 24 GB/core HBM.
-   - **SDK 2.29**: ctx=640 max (head-grouped scan G=8). ctx=768 fails at load with HBM OOM (34.5 GB required vs 24 GB available).
-   - **SDK 2.28**: ctx=256 max. ctx=512 compiles but OOM on load -- the CE model's 14.8 GB tensors + 7.5 GB scratchpad exceed 24 GB/core.
-   - The SDK 2.31 improvement (2048) over 2.29 (640) comes from a redesigned graph compiler code generation backend (default on Trn2/Trn3 in 2.31).
-   - The chunked NKI SSD path (8192) works because it uses O(chunk^2) SBUF scratchpad (chunk=128) instead of O(L^2), and stores state as a fixed 4 MB/layer HBM tensor. Kernel uses only "cheap ops" that survive the DGE budget in full-model compilation.
+1. **Maximum context length on trn2.3xlarge (TP=4, LNC=2)** depends on which scan path is enabled:
+   - **Default (head-grouped quadratic scan)**: **ctx=2048** validated (seq=4096). Beyond ctx=2048, the O(L^2) SBUF scratchpad exceeds the 24 GB/core HBM.
+   - **Chunked NKI SSD** (`USE_CHUNKED_NKI_SCAN=1`): **ctx=8192** validated (seq=16384). ctx=16384 fails compilation with `[F137] neuronx-cc was forcibly killed` — the CE HLO exceeds available host RAM during `neuronx-cc` compilation (TG NEFF compiles fine). Device HBM is not the limit; a larger-host instance or a future compiler improvement could push the ceiling higher.
+   - The chunked NKI SSD path works because it uses O(chunk^2) SBUF scratchpad (chunk=128) instead of O(L^2), and stores state as a fixed 4 MB/layer HBM tensor. The kernel uses only "cheap ops" that survive the DGE budget in full-model compilation. See `src/nki_kernels/README.md` for the pattern documentation.
 2. **Maximum batch size is 2 on trn2.3xlarge (LNC=2).** BS=4 compiles successfully but exceeds HBM during model load (CE model allocation fails on 24 GB/core). BS=4 would require trn2.48xlarge or LNC=1 (not tested).
-3. **Validated seq_len up to 8192.** seq_len=4096 and seq_len=8192 both compile, load, and generate correctly with stable throughput (~16 tok/s) and TTFT (~211 ms).
+3. **The `USE_SSD_SCAN=True` / `USE_PYTORCH_SSD=True` paths remain broken** in the full 52-layer graph: the NKI SSD kernel with 128-expert MoE triggers a runtime error, `scatter/gather (indirect memory copy via vector DGE) out-of-bound access`. This is a compiler-level issue independent of our modeling code. The chunked NKI SSD path (`USE_CHUNKED_NKI_SCAN=1`) is the supported way to get chunk-based SSD scan into the full model.
 4. **No on-device sampling tested.** Current validation uses raw logits (`on_device_sampling_config=None`).
-5. **Conv1d workaround.** Manual depthwise convolution avoids TEN404 but may be slower than native conv1d once the SDK issue is fixed.
+5. **Manual depthwise conv1d.** We use an explicit weight loop instead of the auto-inserted NKI Conv1d kernel to avoid past crashes on `seq_len=1`. This may be slower than a native conv1d once the SDK issue is fully resolved.
 6. **Base model behavior.** This is a base (non-instruct) model. Greedy decoding produces repetitive output after the first few correct tokens, consistent with the HF reference.
-7. **Sparse dispatch prefill fallback.** The prefill (context encoding) path uses a dense per-expert loop because sparse `index_select` on 128 experts at `seq_len=128` creates HLO graph explosion exceeding the 5M instruction limit. A fused NKI MoE kernel could address this.
-8. **Maximum context length is 2048 on all trn2 instances (LNC=2).** All trn2 instances have 24 GB per logical core at LNC=2, so this limit applies regardless of instance size. ctx=2048 is validated on trn2.48xlarge TP=8. ctx=4224 compiles successfully but fails at NEFF load time — the Mamba-2 quadratic scan scratchpad consumes 22.765 GB per logical core (weights 7.5 GB + scratchpad 7.0 GB + shared scratchpad 8.25 GB), leaving only ~1.2 GB free. The CTE transpose operation (`transpose.215_sg0002`) requires an additional 1.031 GB that cannot be allocated. Tested both `-O1` and `-O2` compiler optimization — identical failure. The scratchpad requirement scales quadratically with context length due to the Mamba-2 parallel scan. Possible mitigations: chunked CTE (multiple smaller passes), TP=16 (requires `n_groups` divisible by 16; currently `n_groups=8`), or switching to the O(L) NKI selective scan for CTE.
-9. **BS>1 blocked on vLLM-neuron.** When launching vLLM with `--max-num-seqs >1`, NEFFs compile correctly for the larger batch size, but Mamba state buffers (`mamba_states`) are initialized with `batch_size=1` (from `config.neuron_config.batch_size`). The runtime rejects the shape mismatch (e.g., "received 1 8 64 128, expected 4 8 64 128"). Fix requires plumbing `max_num_seqs` through to `neuron_config.batch_size` in `NeuronNemotronModel.init_model()`.
+7. **Sparse dispatch prefill fallback.** The prefill (context encoding) path uses a dense per-expert loop because sparse `index_select` on 128 experts at `seq_len=128` creates an HLO graph too large for the 5M instruction limit. A fused NKI MoE kernel could address this.
+8. **BS>1 blocked on vLLM-neuron.** When launching vLLM with `--max-num-seqs >1`, NEFFs compile correctly for the larger batch size, but Mamba state buffers (`mamba_states`) are initialized with `batch_size=1` (from `config.neuron_config.batch_size`). The runtime rejects the shape mismatch (e.g., "received 1 8 64 128, expected 4 8 64 128"). Fix requires plumbing `max_num_seqs` through to `neuron_config.batch_size` in `NeuronNemotronModel.init_model()`.
 
 ## HuggingFace Model Issues Found
 
@@ -363,15 +331,22 @@ During development, we discovered and documented several issues in the original 
 
 ## Source Files
 
-| File | Description | Lines |
-|------|-------------|-------|
-| `src/modeling_nemotron_h.py` | Full model implementation (config, Mamba layer, attention, MoE with sparse dispatch, NKI scan, preshard_hook for TP, model wrapper, state dict conversion) | ~2280 |
-| `src/__init__.py` | Public exports | ~27 |
-| `test/integration/test_model.py` | Integration tests (compile, load, generate, logit validation, throughput) | ~441 |
-| `test_smoke.py` | Quick smoke test for pre-compiled model | ~79 |
+| File | Description |
+|------|-------------|
+| `src/modeling_nemotron_h.py` | Full model implementation (config, Mamba-2 layer, GQA attention, MoE with sparse dispatch, preshard_hook for TP, model wrapper, state dict conversion, all scan-path flags) |
+| `src/__init__.py` | Public exports |
+| `src/nki_kernels/nki_mamba2_ssd_chunked.py` | Chunked NKI SSD scan kernel (opt-in via `USE_CHUNKED_NKI_SCAN=1`) |
+| `src/nki_kernels/nki_mamba2_ssd_recurrent.py` | Reference per-token recurrent kernel (foundation for the chunked variant) |
+| `src/nki_kernels/chunked_ssd_wrapper.py` | PyTorch wrapper that adapts Nemotron Mamba-2 prefill inputs to the chunked NKI kernel |
+| `src/nki_kernels/README.md` | Pattern documentation: "cheap-ops-only" DGE-OOB-survivor kernel style |
+| `test/integration/test_model.py` | Integration tests (compile, load, generate, logit validation, throughput) |
+| `test/integration/compile_bench_231.py` | Single-ctx TTFT/decode/TPOT benchmark |
+| `test/integration/ctx_sweep_driver.py` | Context-ceiling sweep runner |
+| `test/integration/compare_scans.py` | A/B token comparison between default and chunked scan paths |
+| `test/unit/test_mamba2_ssd_chunked.py`, `test/unit/test_chunked_long_seq.py`, `test/unit/test_chunked_d64.py` | Standalone kernel-level correctness tests |
 
 ## Maintainer
 
 Jim Burtoft ([@jimburtoft](https://github.com/jimburtoft))
 
-**Last Updated:** 2026-07-10 (SDK 2.31 chunked NKI SSD integration by agent nemo -- max ctx 8192 on trn2.3xlarge)
+**Last Updated:** 2026-07-12 (SDK 2.31 chunked NKI SSD, max ctx 8192 on trn2.3xlarge)
