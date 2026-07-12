@@ -27,6 +27,16 @@ class NeuronInference(Inference):
             # only need to use the last token except in the first forward pass
             tokens = tokens[:, -1:]
             return self.model.decoder(tokens, audio_features, last_pos, pad_mask)
+
+        # Task 011: prefill dispatch. Truncate padded_tokens to whisper_prompt_len
+        # when the actual prompt fits, so input_shape_map matches the short NEFF.
+        # Falls back to the full-length NEFF when the prompt is longer.
+        prompt_len_cfg = getattr(
+            self.model.config.neuron_config, "whisper_prompt_len", 0
+        )
+        actual_prompt_len = int(last_pos[0].item()) + 1
+        if 0 < prompt_len_cfg < padded_tokens.shape[1] and actual_prompt_len <= prompt_len_cfg:
+            tokens = padded_tokens[:, :prompt_len_cfg]
         else:
             tokens = padded_tokens
         # BS>1 patch: last_pos is now (BS,); all entries identical during decode

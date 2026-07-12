@@ -389,13 +389,17 @@ class NeuronTextDecoder(nn.Module):
         pad_mask : torch.Tensor, shape = (batch_size, n_ctx)
             boolean mask indicating valid positions (True) vs padded positions (False)
         """
-        assert (
-            x.shape[1] == 1 or x.shape[1] == self.seq_len
-        ), f"Input sequence length {x.shape[1]} must be 1 (decode) or {self.seq_len} (prefill)"
+        # Task 011: accept short prefill (x.shape[1] can be any prompt_len between 2 and seq_len).
+        assert x.shape[1] == 1 or 1 < x.shape[1] <= self.seq_len, (
+            f"Input sequence length {x.shape[1]} must be 1 (decode) or in [2, {self.seq_len}] (prefill)"
+        )
 
         is_prefill = x.shape[1] > 1
+        prompt_len = x.shape[1]  # Task 011: actual prefill Q length (<= self.seq_len)
         if is_prefill:
-            pe = self.positional_embedding.weight
+            # Task 011: slice positional embedding to prompt_len.
+            # Stock returned full [seq_len, n_state] which only broadcasts correctly at seq_len.
+            pe = self.positional_embedding.weight[:prompt_len]
         else:
             # BS>1 patch: unsqueeze to (BS, 1, n_state) so it broadcasts correctly
             # against token_embedding(x) shape (BS, 1, n_state). Stock code returns
@@ -407,9 +411,13 @@ class NeuronTextDecoder(nn.Module):
 
         mask = None
         if is_prefill:
-            mask = torch.full((self.seq_len, self.seq_len), True, device=pad_mask.device).tril(diagonal=0)
+            # Task 011: mask shape [prompt_len (Q), seq_len (K)] to support short prefill.
+            # K dim stays at seq_len because KV cache has seq_len slots (the short prefill
+            # only writes positions 0..prompt_len-1; positions past last_pos are masked
+            # by pad_mask, positions between prompt_len and last_pos are cache zeros).
+            mask = torch.full((prompt_len, self.seq_len), True, device=pad_mask.device).tril(diagonal=0)
             input_mask = (
-                pad_mask[:, None, None, :].expand(self.batch_size, 1, self.seq_len, self.seq_len).to(torch.bool)
+                pad_mask[:, None, None, :].expand(self.batch_size, 1, prompt_len, self.seq_len).to(torch.bool)
             )
             mask = torch.logical_and(mask, input_mask)
         else:
@@ -544,6 +552,47 @@ class ModelWrapperWhisperDecoderPrefill(ModelWrapper):
         return self.model(*args, **kwargs)
 
 
+class ModelWrapperWhisperDecoderPrefillShort(ModelWrapper):
+    """Task 011: compact prefill NEFF operating on a short prompt (prompt_len tokens).
+
+    Identical to ModelWrapperWhisperDecoderPrefill except that padded_tokens has
+    shape [batch, whisper_prompt_len] instead of [batch, n_text_ctx]. Dispatched
+    by NeuronInference.logits() when actual initial_token_length <= whisper_prompt_len.
+    Shares KV cache Parameters with the full-length prefill and decode NEFFs via
+    input_output_aliases (all three ModelWrappers instantiate the same
+    NeuronTextDecoder class; the cache_k / cache_v are seq_len-wide either way).
+    """
+
+    def __init__(self, config, model_cls, tag="", compiler_args=None, priority_model_idx=None, model_init_kwargs={}):
+        super().__init__(config, model_cls, tag, compiler_args, priority_model_idx, model_init_kwargs)
+        self.bucket_config = None
+
+    def input_generator(self) -> List[Tuple[torch.Tensor]]:
+        prompt_len = self.neuron_config.whisper_prompt_len
+        audio_embed = torch.randn(
+            self.neuron_config.batch_size,
+            self.config.dims.n_audio_ctx,
+            self.config.dims.n_audio_state,
+            dtype=self.neuron_config.torch_dtype,
+        )
+        padded_tokens = torch.zeros(
+            (self.neuron_config.batch_size, prompt_len),
+            dtype=torch.int32,
+        )
+        last_pos = torch.zeros(self.neuron_config.batch_size, dtype=torch.int32)
+        pad_mask = torch.zeros(
+            (self.neuron_config.batch_size, self.config.dims.n_text_ctx),
+            dtype=torch.int32,
+        )
+        return [(padded_tokens, audio_embed, last_pos, pad_mask)]
+
+    def get_model_instance(self):
+        return WhisperModelDecoderInstance(self.config)
+
+    def forward(self, *args, **kwargs):
+        return self.model(*args, **kwargs)
+
+
 class ModelWrapperWhisperDecoderDecode(ModelWrapper):
     def __init__(self, config, model_cls, tag="", compiler_args=None, priority_model_idx=None, model_init_kwargs={}):
         super().__init__(config, model_cls, tag, compiler_args, priority_model_idx, model_init_kwargs)
@@ -642,6 +691,22 @@ class NeuronApplicationWhisperDecoder(NeuronApplicationBase):
         )
         self.models.append(self.decoder_prefill_model)
         self.models.append(self.decoder_decode_model)
+
+        # Task 011: optional short-prefill NEFF for greedy decode.
+        # Compiled only if whisper_prompt_len > 0 and < n_text_ctx.
+        if (
+            self.config.neuron_config.whisper_prompt_len > 0
+            and self.config.neuron_config.whisper_prompt_len < self.config.dims.n_text_ctx
+        ):
+            self.decoder_prefill_short_model = ModelWrapperWhisperDecoderPrefillShort(
+                config=self.config,
+                model_cls=self._model_cls,
+                tag="DecoderPrefillShort",
+                compiler_args=self.get_compiler_args(),
+            )
+            self.models.append(self.decoder_prefill_short_model)
+        else:
+            self.decoder_prefill_short_model = None
 
         # workaround for whisper PyTorchInference init, dummy blocks
         self.blocks = []

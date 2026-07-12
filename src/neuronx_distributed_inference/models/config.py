@@ -93,6 +93,11 @@ class NeuronConfig:
         # Basic config for inference in NxD
         self.batch_size = kwargs.pop("batch_size", 1)
         self.padding_side = kwargs.pop("padding_side", "right")
+        # Task 011 (Whisper): length of the "short" prefill NEFF for greedy decode.
+        # A shorter prefill NEFF is compiled to avoid running full n_text_ctx-wide
+        # self-attention on a 3-16-token task prompt. Fallback to the full-length
+        # NEFF when actual prompt > whisper_prompt_len. Set to 0 to disable.
+        self.whisper_prompt_len = kwargs.pop("whisper_prompt_len", 16)
         self.allow_input_truncation: bool = kwargs.pop("allow_input_truncation", False)
         # TODO: see if we can consolidate n_active_tokens and n_positions into one
         self.seq_len = kwargs.pop("seq_len", 128)
@@ -367,6 +372,7 @@ class NeuronConfig:
         self.save_sharded_checkpoint = kwargs.pop("save_sharded_checkpoint", False)
         self.skip_sharding = kwargs.pop("skip_sharding", False)
         self.enable_ve_data_parallel = kwargs.pop("enable_ve_data_parallel", False)
+        self.ve_block_size = kwargs.pop("ve_block_size", self.seq_len)
 
         if self.tp_degree % self.cp_degree != 0:
             raise ValueError("TP Degree must be evenly divisible by CP Degree")
