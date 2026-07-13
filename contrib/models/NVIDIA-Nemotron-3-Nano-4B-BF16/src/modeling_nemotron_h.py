@@ -1927,6 +1927,11 @@ class NeuronNemotronMamba2Layer(nn.Module):
                 from .nki_kernels.chunked_ssd_wrapper import chunked_ssd_prefill_scan
             except ImportError:
                 from nki_kernels.chunked_ssd_wrapper import chunked_ssd_prefill_scan
+            # The chunked NKI SSD kernel requires chunk_size=128 (P_MAX / SBUF
+            # partition width). The 4B config sets chunk_size=256 for the
+            # reference SSD scan; we override to 128 for the NKI kernel path.
+            # This is safe because chunk_size only affects the block structure
+            # of the scan, not the mathematical output.
             y, ssm_state_new = chunked_ssd_prefill_scan(
                 x,
                 dt_processed,
@@ -1938,7 +1943,7 @@ class NeuronNemotronMamba2Layer(nn.Module):
                 self.head_dim,
                 self.ssm_state_size,
                 self.n_groups,
-                chunk_size=self.chunk_size,
+                chunk_size=128,  # kernel constraint (see comment above)
                 padding_mask=padding_mask,
             )
         elif USE_PYTORCH_SSD:
