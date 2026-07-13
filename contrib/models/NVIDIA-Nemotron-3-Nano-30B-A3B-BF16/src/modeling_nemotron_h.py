@@ -130,6 +130,26 @@ SCAN_HEAD_GROUP = 8  # Process 8 heads at a time (64/8 = 8 groups)
 # Set via environment variable USE_CHUNKED_NKI_SCAN=1 (or =0 to explicitly disable).
 USE_CHUNKED_NKI_SCAN = os.environ.get("USE_CHUNKED_NKI_SCAN", "0") == "1"
 
+# USE_NATIVE_CONV1D: Use F.conv1d(groups=conv_dim) instead of the manual weight
+# loop for the depthwise conv1d in Mamba-2 prefill. The manual loop was inherited
+# from Granite4 to work around a compiler crash (TEN404) on SDK 2.28. If newer
+# SDK versions no longer crash, F.conv1d should be equivalent but may compile
+# to more efficient code. Off by default while the manual loop is still needed
+# for the decode (TKG) path.
+#
+# Set via environment variable USE_NATIVE_CONV1D=1.
+USE_NATIVE_CONV1D = os.environ.get("USE_NATIVE_CONV1D", "0") == "1"
+
+# FORCE_SPARSE_MOE_PREFILL: Force the MoE prefill path to use sparse
+# index_select+bmm dispatch (the same code path as decode) instead of the dense
+# per-expert loop. On SDK 2.28 this caused HLO instruction limit exhaustion
+# because 128 tokens x 6 top-K slots x 128 experts produced a graph with >5M
+# instructions. This flag lets us retest whether SDK 2.31 handles the sparse
+# path successfully.
+#
+# Set via environment variable FORCE_SPARSE_MOE_PREFILL=1.
+FORCE_SPARSE_MOE_PREFILL = os.environ.get("FORCE_SPARSE_MOE_PREFILL", "0") == "1"
+
 # ==============================================================================
 # Phase 1 NKI megakernel flags (SDK 2.31 + nki-library upstream/main overlay)
 # ==============================================================================
@@ -1804,20 +1824,43 @@ class NeuronNemotronMamba2Layer(nn.Module):
         A = -torch.exp(self.A_log.float())
         D = self.D
 
-        # Manual depthwise conv1d with per-rank conv weights
-        padded = F.pad(
-            hidden_states_B_C, (0, 0, self.conv_kernel_size - 1, 0), value=0.0
-        )
-        hidden_states_conv = torch.zeros_like(hidden_states_B_C)
-        for k in range(self.conv_kernel_size):
-            hidden_states_conv = hidden_states_conv + (
-                padded[:, k : k + seq_len, :]
-                * conv_weight[:, k].unsqueeze(0).unsqueeze(0)
+        # Depthwise conv1d with per-rank conv weights.
+        # Two code paths (toggled by USE_NATIVE_CONV1D env var):
+        #   - Manual weight loop (default): originally added as a Granite4-era
+        #     workaround for compiler crash TEN404 on SDK 2.28.
+        #   - F.conv1d(groups=conv_dim): native depthwise conv. If SDK 2.31 no
+        #     longer crashes, this is mathematically equivalent and may compile
+        #     to more efficient code.
+        if USE_NATIVE_CONV1D:
+            # F.conv1d expects (B, C, L) with weight (C_out, C_in/groups, K).
+            # For depthwise: groups=conv_dim, C_in/groups=1, weight shape (conv_dim, 1, K).
+            x_bcl = hidden_states_B_C.transpose(1, 2)  # (B, conv_dim, seq_len)
+            w = conv_weight.unsqueeze(1)  # (conv_dim, 1, K)
+            conv_out = F.conv1d(
+                x_bcl,
+                w,
+                bias=conv_bias,
+                padding=self.conv_kernel_size - 1,
+                groups=self.conv_dim,
             )
-        if conv_bias is not None:
-            hidden_states_conv = hidden_states_conv + conv_bias.unsqueeze(0).unsqueeze(
-                0
+            # Output has length seq_len + K - 1; trim to seq_len from the LEFT
+            # (keeping outputs 0..seq_len-1) to match causal-conv1d semantics.
+            hidden_states_conv = conv_out[..., :seq_len].transpose(1, 2).contiguous()
+        else:
+            # Manual depthwise conv1d loop (Granite4 workaround for TEN404 on SDK 2.28).
+            padded = F.pad(
+                hidden_states_B_C, (0, 0, self.conv_kernel_size - 1, 0), value=0.0
             )
+            hidden_states_conv = torch.zeros_like(hidden_states_B_C)
+            for k in range(self.conv_kernel_size):
+                hidden_states_conv = hidden_states_conv + (
+                    padded[:, k : k + seq_len, :]
+                    * conv_weight[:, k].unsqueeze(0).unsqueeze(0)
+                )
+            if conv_bias is not None:
+                hidden_states_conv = hidden_states_conv + conv_bias.unsqueeze(0).unsqueeze(
+                    0
+                )
 
         # Save conv_state from last K-1 REAL token positions (Granite4 pattern)
         if padding_mask is not None and seq_len >= self.conv_kernel_size - 1:
@@ -2326,8 +2369,11 @@ class NeuronNemotronMoELayer(BaseParallelLinear):
         # shape at trace time, so this if/else is resolved during tracing
         # and only the relevant branch is compiled into each NEFF.
 
-        if batch_tokens <= 2:
-            # SPARSE DECODE PATH: only 6 experts loaded
+        if batch_tokens <= 2 or FORCE_SPARSE_MOE_PREFILL:
+            # SPARSE DISPATCH PATH: only 6 experts loaded per token.
+            # Default for decode (T<=2). Optionally forced for prefill via
+            # FORCE_SPARSE_MOE_PREFILL to retest whether the SDK 2.28 HLO
+            # instruction limit issue is resolved on newer compilers.
             for k in range(self.gate.top_k):
                 expert_idx = topk_indices[:, k]  # (T,)
                 weight = topk_weights[:, k].unsqueeze(-1)  # (T, 1)
