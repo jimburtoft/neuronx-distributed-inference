@@ -107,6 +107,71 @@ issues, no expert-loop instruction-limit issues. Compile and load are dramatical
 At BS=1 the 4B is ~1.4× faster on decode and ~1.7× faster on TTFT despite being the same
 per-token active-parameter count (~3 B).
 
+## GPU comparison (L40S, 1× g6e.4xlarge, vLLM 0.25.1, BF16, TP=1)
+
+Real GPU baseline captured 2026-07-14 in us-east-2 (Task 019). Note: p5.4xlarge
+(H100) spot capacity was globally exhausted at the time of the run; we used
+g6e.4xlarge (L40S, Ada Lovelace, 48 GB HBM, 864 GB/s memory bandwidth) as the
+best available fallback. **L40S is not H100.** L40S has ~26% of H100's HBM
+bandwidth (864 GB/s vs 3.35 TB/s), so these numbers are a conservative GPU
+comparison — a real H100 would be meaningfully faster on decode.
+
+**TTFT (from a `max_tokens=1` sweep, 10 samples each):**
+
+| Input tokens | L40S BS=1 | L40S BS=4 | L40S BS=8 |
+|---|---|---|---|
+| 128 | **34.0 ms** | 65.4 ms | 73.7 ms |
+| 2048 | 79.4 ms | 317.7 ms | 641.9 ms |
+
+**Decode throughput (per-stream and aggregate, computed as `output_tokens / (e2e - ttft)`):**
+
+| Workload | Input | Output | BS | TTFT (ms) | Decode per-stream (tok/s) | Decode aggregate (tok/s) | TPOT (ms) | E2E (ms) |
+|---|---|---|---|---|---|---|---|---|
+| short-short | 128 | 128 | 1 | 34.0 | 95.0 | 95.0 | 10.53 | 1382 |
+| short-short | 128 | 128 | 4 | 65.4 | 83.7 | **334.9** | 11.94 | 1594 |
+| short-short | 128 | 128 | 8 | 73.7 | 77.4 | **619.3** | 12.92 | 1727 |
+| short-long | 128 | 512 | 1 | 34.0 | 94.4 | 94.4 | 10.59 | 5456 |
+| short-long | 128 | 512 | 4 | 65.4 | 83.8 | 335.3 | 11.93 | 6174 |
+| short-long | 128 | 512 | 8 | 73.7 | 77.0 | **616.3** | 12.98 | 6720 |
+| long-short | 2048 | 128 | 1 | 79.4 | 94.0 | 94.0 | 10.63 | 1441 |
+| long-short | 2048 | 128 | 4 | 317.7 | 83.2 | 332.8 | 12.02 | 1856 |
+| long-short | 2048 | 128 | 8 | 641.9 | 75.8 | **606.3** | 13.19 | 2331 |
+| long-long | 2048 | 512 | 1 | 79.4 | 93.5 | 93.5 | 10.69 | 5553 |
+| long-long | 2048 | 512 | 4 | 317.7 | 82.7 | 330.6 | 12.10 | 6512 |
+| long-long | 2048 | 512 | 8 | 641.9 | 74.9 | **599.3** | 13.35 | 7477 |
+
+### Head-to-head: 4B Neuron vs 4B L40S (BS=1, ctx=128)
+
+| Metric | Neuron trn2.3xlarge (TP=4, LNC=2) | L40S g6e.4xlarge (TP=1) | Winner |
+|---|---|---|---|
+| TTFT (in=128) | 39.1 ms | **34.0 ms** | L40S (1.15×) |
+| TTFT (in=2048) | 782 ms | **79.4 ms** | L40S (9.9×) |
+| Decode tok/s | **144.7** | 95.0 | Neuron (1.52×) |
+| TPOT (BS=1) | **6.91 ms** | 10.53 ms | Neuron (1.52×) |
+| Aggregate at BS=8 | HBM OOM | **~600 tok/s** | L40S |
+| Load time | 10.8 s (post-compile) | 1.4 s | L40S |
+
+**Key takeaways:**
+- **BS=1 decode: Neuron wins by 1.52×.** Memory-bandwidth-bound; four LNC=2 logical cores at ~1.6 TB/s effective bandwidth aggregate to more usable decode throughput than a single L40S at 864 GB/s.
+- **TTFT: L40S wins decisively**, especially at longer contexts (9.9× faster at ctx=2048). vLLM's chunked prefill + FlashAttention 2 + fused CUDA kernels are much more efficient than our Mamba-2 prefill scan on Neuron.
+- **Batching: L40S wins** at BS=4 and BS=8. Neuron hits HBM OOM at BS=8, L40S handles it easily on 48 GB HBM.
+- **On H100 (not yet measured)**: expected decode is ~2-3× faster than L40S (extrapolating from the 30B's 269 tok/s H100 number in Task 007, since H100 has ~3.9× L40S's HBM bandwidth). A real H100 measurement would likely flip decode from Neuron-favored (1.52×) to H100-favored (~1.5-2×).
+
+### Cost per million output tokens (BS=1)
+
+| Instance | $/hr | Decode tok/s (BS=1) | $/M output tokens |
+|---|---|---|---|
+| **trn2.3xlarge** (capacity block) | $2.24 | 144.7 | **$4.30** |
+| **g6e.4xlarge** (L40S spot, us-east-2b) | $1.03 | 95.0 | **$3.01** |
+| **g6e.4xlarge** (L40S on-demand) | $3.02 | 95.0 | $8.83 |
+| **p5.4xlarge** (H100 spot, when available) | $2.53 | ~285 (est) | **~$2.46 (est)** |
+| **p5.48xlarge** (H100 spot, 1 of 8 GPUs) | $15.90 (whole box) | 269 (measured 30B) | $16.42 |
+
+L40S spot is currently the cheapest per-token option ($3.01/M tokens) for the 4B
+if you can get spot capacity. Neuron capacity block is the second cheapest ($4.30/M).
+H100 spot would be the fastest and probably the cheapest if available, but p5 spot
+was globally unavailable when we ran this benchmark.
+
 ## Known Issues
 
 1. **HBM budget is tight even at 4B.** Compared to the 30B, the 4B has a much wider dense
@@ -201,8 +266,10 @@ NEMOTRON_MODEL_PATH=$MODEL_PATH TP_DEGREE=4 BATCH_SIZE=4 \
   LNC=2.
 - **trn2.48xlarge (TP=8) BS>=4 at higher ctx.** Would need more HBM / more logical cores
   to escape the OOM ceiling.
-- **GPU baseline** on p5.4xlarge (H100 via vLLM) for head-to-head numbers. The 30B has
-  H100 data at Task 007; the 4B does not yet.
+- **H100 GPU baseline** on p5.4xlarge for a proper head-to-head. Task 019 attempted this
+  2026-07-14 but p5 spot capacity was globally exhausted -- fell back to L40S. Retry when
+  p5 spot capacity is available. Expected H100 decode ~2-3× faster than L40S (extrapolating
+  from the 30B Task 007 numbers).
 - **Bit-exact quadratic vs chunked NKI SSD comparison** at head_dim=80. Coherence-check-
   by-eye passes; formal token match rate not yet measured.
 - **Higher ctx (4096, 8192, 16384)** with chunked NKI SSD. Kernel supports arbitrary ctx
@@ -210,4 +277,4 @@ NEMOTRON_MODEL_PATH=$MODEL_PATH TP_DEGREE=4 BATCH_SIZE=4 \
 - **Native F.conv1d** (`USE_NATIVE_CONV1D=1`) not yet tested on 4B. Should work per the
   30B retest results but slower on decode by ~11% there.
 
-**Last Updated:** 2026-07-13 (initial port + BS=1/4 sweep at ctx up to 2048 on SDK 2.31)
+**Last Updated:** 2026-07-14 (Task 019: added L40S GPU baseline; H100 pending capacity)
