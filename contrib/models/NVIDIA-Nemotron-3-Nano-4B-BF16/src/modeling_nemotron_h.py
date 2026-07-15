@@ -140,6 +140,26 @@ SCAN_HEAD_GROUP = 8  # Process 8 heads at a time (64/8 = 8 groups)
 # Set via environment variable USE_CHUNKED_NKI_SCAN=1 (or =0 to explicitly disable).
 USE_CHUNKED_NKI_SCAN = os.environ.get("USE_CHUNKED_NKI_SCAN", "0") == "1"
 
+# USE_NKI_MLP: Use the nkilib fused MLP kernel (up_proj -> activation -> down_proj)
+# instead of separate ColumnParallelLinear + relu2 + RowParallelLinear ops.
+# Fuses matmul + activation + matmul + all-reduce into a single kernel,
+# eliminating intermediate HBM roundtrips for the sharded intermediate tensor.
+#
+# NOTE: nkilib's ActFnType enum does not currently support SquaredReLU (relu2).
+# The 4B model uses relu2 as its MLP activation. Available options:
+#   - USE_NKI_MLP_ACT="relu" (approximation): uses ReLU instead of relu2. Fast
+#     but numerically WRONG. Produces incoherent output. Use only for perf
+#     ceiling measurement.
+#   - USE_NKI_MLP_ACT="squared_relu" (correct): requires patching nkilib to
+#     add SquaredReLU. If the patch is applied on-instance (see task-020),
+#     this option produces correct output.
+#
+# Set via environment variables:
+#   USE_NKI_MLP=1 (default: 0)
+#   USE_NKI_MLP_ACT=squared_relu | relu | gelu | silu (default: relu -- for measurement)
+USE_NKI_MLP = os.environ.get("USE_NKI_MLP", "0") == "1"
+USE_NKI_MLP_ACT = os.environ.get("USE_NKI_MLP_ACT", "relu")
+
 # USE_NATIVE_CONV1D: Use F.conv1d(groups=conv_dim) instead of the manual weight
 # loop for the depthwise conv1d in Mamba-2 prefill. The manual loop was inherited
 # from Granite4 to work around a compiler crash (TEN404) on SDK 2.28. If newer
@@ -2179,6 +2199,10 @@ class NeuronNemotronMLP(nn.Module):
     Note: the 4B variant does NOT use a SwiGLU-style gate. It is a plain
     two-layer MLP with relu2 activation (per config `mlp_hidden_act="relu2"`).
 
+    When USE_NKI_MLP=1, the forward pass invokes `non_gated_mlp_nkilib` which
+    fuses (up_proj + activation + down_proj + all-reduce) into a single NKI
+    kernel, eliminating intermediate HBM roundtrips.
+
     Returns (hidden_states, dummy_kv, None) to match the interface expected by
     NeuronNemotronDecoderLayer (which unpacks a 3-tuple like MoE/Mamba do).
     """
@@ -2188,11 +2212,13 @@ class NeuronNemotronMLP(nn.Module):
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
+        self.use_nki_mlp = USE_NKI_MLP
 
         # dtype / init defaults inherited from the surrounding module setup
         dtype = getattr(config.neuron_config, "torch_dtype", torch.bfloat16)
         if isinstance(dtype, str):
             dtype = getattr(torch, dtype)
+        self.torch_dtype = dtype
 
         self.up_proj = ColumnParallelLinear(
             self.hidden_size,
@@ -2209,6 +2235,54 @@ class NeuronNemotronMLP(nn.Module):
             dtype=dtype,
         )
 
+        # Cache references for the NKI path
+        if self.use_nki_mlp:
+            from neuronx_distributed_inference.modules.attention.utils import (
+                transpose_parallel_linear_layer,
+            )
+            # Transpose weights to kernel-expected layout (H, I) for up_proj,
+            # (I, H) for down_proj. The transpose is a nn.Parameter replacement
+            # that's a no-op at forward-time but signals to the compiler to
+            # keep the layout in the expected form.
+            self.up_proj.weight = transpose_parallel_linear_layer(self.up_proj.weight)
+            self.down_proj.weight = transpose_parallel_linear_layer(self.down_proj.weight)
+
+            # Look up the logical_nc_config from neuron_config
+            self.logical_nc_config = getattr(config.neuron_config, "logical_nc_config", 2)
+
+            # Look up the TP process group
+            from neuronx_distributed.parallel_layers.parallel_state import (
+                get_tensor_model_parallel_group,
+            )
+            self._get_tp_group = get_tensor_model_parallel_group
+
+            # Resolve activation
+            from nkilib.core.utils.common_types import ActFnType, NormType
+            self._nki_norm_no_norm = NormType.NO_NORM
+            act_map = {
+                "silu": ActFnType.SiLU,
+                "gelu": ActFnType.GELU,
+                "relu": ActFnType.ReLU,
+            }
+            # NOTE: SquaredReLU is not in the DLAMI-bundled ActFnType enum.
+            # If USE_NKI_MLP_ACT=squared_relu, we require the patched nkilib
+            # (see task-020) to have added it. Try to resolve it, but fall
+            # back to relu with a warning.
+            act_name = USE_NKI_MLP_ACT.lower()
+            if act_name in ("squared_relu", "relu2"):
+                if hasattr(ActFnType, "SquaredReLU"):
+                    self._nki_activation_fn = ActFnType.SquaredReLU
+                else:
+                    logger.warning(
+                        "USE_NKI_MLP_ACT=squared_relu requested but ActFnType.SquaredReLU "
+                        "is not present in the current nkilib. Falling back to ReLU -- "
+                        "OUTPUT WILL BE WRONG (relu(x) != relu(x)^2). Use only for "
+                        "perf-ceiling measurement, not for accuracy validation."
+                    )
+                    self._nki_activation_fn = ActFnType.ReLU
+            else:
+                self._nki_activation_fn = act_map.get(act_name, ActFnType.ReLU)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -2217,13 +2291,51 @@ class NeuronNemotronMLP(nn.Module):
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         **kwargs,
     ):
-        # up_proj is ColumnParallel(gather_output=False), so its output is
-        # already sharded along the intermediate dim on this rank.
-        h = self.up_proj(hidden_states)
-        h = relu2(h)
-        # down_proj is RowParallel(input_is_parallel=True), which performs the
-        # all-reduce internally.
-        result = self.down_proj(h)
+        if self.use_nki_mlp:
+            from neuronx_distributed_inference.utils.nkilib_mlp_utils import (
+                non_gated_mlp_nkilib,
+            )
+            batch_size, seq_len, hidden_size = hidden_states.shape
+
+            # Pass through the fused kernel. We set normalization_type=NO_NORM
+            # because the RMSNorm is already applied in the decoder layer before
+            # this call. `fused_add_tensor` is a zero tensor since we don't
+            # fuse the residual add (decoder layer handles it after this call).
+            zero_add = torch.zeros_like(hidden_states)
+            zero_norm_weights = torch.zeros(
+                (1, hidden_size), dtype=hidden_states.dtype, device=hidden_states.device
+            )
+            up_proj_bias = torch.zeros(
+                (1, self.intermediate_size // self._get_tp_group().size()),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+
+            result = non_gated_mlp_nkilib(
+                hidden=hidden_states,
+                up_proj_weight=self.up_proj.weight,
+                down_proj_weight=self.down_proj.weight,
+                logical_nc_config=self.logical_nc_config,
+                tensor_parallel_group=self._get_tp_group(),
+                normalization_type=self._nki_norm_no_norm,
+                normalization_weights=zero_norm_weights,
+                normalization_bias=None,
+                fused_add_tensor=zero_add,
+                up_proj_bias=up_proj_bias,
+                down_proj_bias=None,
+                activation_fn=self._nki_activation_fn,
+            )
+            # non_gated_mlp_nkilib adds fused_add_result at the end; since
+            # our fused_add was zero, the result is (mlp_output + zero) = mlp_output.
+            # No further residual is needed here (decoder layer adds its own).
+        else:
+            # up_proj is ColumnParallel(gather_output=False), so its output is
+            # already sharded along the intermediate dim on this rank.
+            h = self.up_proj(hidden_states)
+            h = relu2(h)
+            # down_proj is RowParallel(input_is_parallel=True), which performs the
+            # all-reduce internally.
+            result = self.down_proj(h)
 
         # Dummy KV to satisfy the decoder layer's uniform unpack.
         batch_size = hidden_states.shape[0]
