@@ -163,6 +163,34 @@ opt-in required. On SDK 2.31 this is fully supported (the TEN404 crash that
 motivated the manual loop for SDK 2.28 is fixed). The reason we keep the manual
 loop is purely a 1.5% decode perf preference, not correctness.
 
+### Fused MLP kernel: attempted 2026-07-15, does not currently produce correct output
+
+A follow-up to Task 020 attempted to unblock `USE_NKI_MLP=1` by:
+1. Padding `hidden_size` from 3136 to 3328 (satisfies `H % (128 * LNC) == 0`; 6% overhead)
+2. Patching `nkilib` to add `ActFnType.SquaredReLU` + two-op wrapper (`nisa.activation(nl.relu)` then `nisa.activation(nl.square)`)
+3. Fixing a `mlp_tkg_gate_up_projection.py:337` bug where `gate_b.dtype` was referenced when `skip_gate_proj=True` with only `up_proj_bias`
+
+**End-to-end compile + load + run succeeds** with `USE_NKI_MLP=1 USE_NKI_MLP_ACT=squared_relu`, but:
+- **Output is numerically wrong** (garbage tokens like `"( (( r((((((..."`)
+- **Decode is 20% slower** than the fallback path (115.97 vs 145.65 tok/s)
+- Same slowdown observed even with plain `USE_NKI_MLP_ACT=relu`, indicating a fundamental integration issue rather than a SquaredReLU-specific problem
+
+Likely root causes (not investigated further):
+- Weight layout mismatch after `transpose_parallel_linear_layer()` interacts unexpectedly with padded H
+- The kernel expects `normalization_type=RMS_NORM` with internal norm (we pass `NO_NORM` because we do the norm externally in the decoder layer)
+- Padding contamination through the residual/norm path
+
+The `USE_NKI_MLP=1` code path stays in the codebase (commits `7a1fafc`, `6f56a42`, `08c21b6`) for future debugging but should **NOT** be used for production. Default remains `USE_NKI_MLP=0`.
+
+Full investigation notes + on-instance nkilib patch script:
+`working/Nemotron/results/task020_4b_nki_mlp_2026_07_15/README.md`
+
+**Recommendation**: the 20% slowdown before SquaredReLU overhead is added
+suggests the fused kernel isn't the win we hoped for at this shape/config.
+The 4B is already near memory-bandwidth-bound at 145 tok/s decode / 6.87 ms
+TPOT. A custom H=3136-native MLP kernel (avoiding padding altogether) would
+likely be more productive than continuing to patch the generic path.
+
 ## GPU comparison (L40S, 1× g6e.4xlarge, vLLM 0.25.1, BF16, TP=1)
 
 Real GPU baseline captured 2026-07-14 in us-east-2 (Task 019). Note: p5.4xlarge
@@ -335,4 +363,4 @@ NEMOTRON_MODEL_PATH=$MODEL_PATH TP_DEGREE=4 BATCH_SIZE=4 \
   nkilib. Estimated ~10-20% decode win but non-trivial to wire up. See "NKI kernel status"
   section above.
 
-**Last Updated:** 2026-07-15 (Task 020: NKI kernel audit; USE_NATIVE_CONV1D retested; fused MLP kernel blocked by H%128 constraint)
+**Last Updated:** 2026-07-15 (Task 020 follow-up: attempted fused MLP kernel via hidden_size padding + SquaredReLU nkilib patch -- integration compiles but produces garbage output and is 20% slower; documented as dead end)
