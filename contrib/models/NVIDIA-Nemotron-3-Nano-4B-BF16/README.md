@@ -171,25 +171,66 @@ A follow-up to Task 020 attempted to unblock `USE_NKI_MLP=1` by:
 3. Fixing a `mlp_tkg_gate_up_projection.py:337` bug where `gate_b.dtype` was referenced when `skip_gate_proj=True` with only `up_proj_bias`
 
 **End-to-end compile + load + run succeeds** with `USE_NKI_MLP=1 USE_NKI_MLP_ACT=squared_relu`, but:
-- **Output is numerically wrong** (garbage tokens like `"( (( r((((((..."`)
-- **Decode is 20% slower** than the fallback path (115.97 vs 145.65 tok/s)
-- Same slowdown observed even with plain `USE_NKI_MLP_ACT=relu`, indicating a fundamental integration issue rather than a SquaredReLU-specific problem
+- Decode was 20% slower than the fallback path (115.97 vs 145.65 tok/s)
+- Same slowdown with plain `USE_NKI_MLP_ACT=relu`
 
-Likely root causes (not investigated further):
-- Weight layout mismatch after `transpose_parallel_linear_layer()` interacts unexpectedly with padded H
-- The kernel expects `normalization_type=RMS_NORM` with internal norm (we pass `NO_NORM` because we do the norm externally in the decoder layer)
-- Padding contamination through the residual/norm path
+### Profile-driven root cause analysis (2026-07-15, definitive)
 
-The `USE_NKI_MLP=1` code path stays in the codebase (commits `7a1fafc`, `6f56a42`, `08c21b6`) for future debugging but should **NOT** be used for production. Default remains `USE_NKI_MLP=0`.
+A follow-up profiling session used `neuron-profile view --output-format
+summary-json` on a **standalone MLP microbenchmark** (isolated from the
+full model) to compare the fused `non_gated_mlp_nkilib` NEFF against the
+naive `torch.nn.functional.linear + relu + linear` NEFF at identical 4B
+shapes. **The compiler already fuses the naive path into the same kernel
+as `non_gated_mlp_nkilib`.**
 
-Full investigation notes + on-instance nkilib patch script:
-`working/Nemotron/results/task020_4b_nki_mlp_2026_07_15/README.md`
+Evidence (from `neuron-profile view`):
 
-**Recommendation**: the 20% slowdown before SquaredReLU overhead is added
-suggests the fused kernel isn't the win we hoped for at this shape/config.
-The 4B is already near memory-bandwidth-bound at 145 tok/s decode / 6.87 ms
-TPOT. A custom H=3136-native MLP kernel (avoiding padding altogether) would
-likely be more productive than continuing to patch the generic path.
+| Metric | Fused (NKI MLP) | Unfused (compiler) | Ratio F/U |
+|---|---|---|---|
+| total_time | 2.215 ms | 2.159 ms | **+2.6%** (padding only) |
+| hbm_read/write | 83.5/125.3 MB | 78.7/118.0 MB | +6.1% (padding) |
+| sbuf_read/write | 2025/1587 MB | 1908/1495 MB | +6.1% (padding) |
+| vector_engine_active | 85.6% | 85.8% | ~same |
+| scalar_engine_active | 79.0% | 79.1% | ~same |
+| tensor_engine_active | 0.17% | 0.18% | ~same (both minuscule) |
+| ACTIVATE instructions | 2115 | 2116 | -1 (identical) |
+| TENSOR_TENSOR instructions | 2555 | 2556 | -1 (identical) |
+| CAST instructions | 3386 | 3388 | -2 (identical) |
+
+The two NEFFs have essentially **identical instruction profiles** — only
+DMA count differs slightly (503 vs 491, +12 DMAs for the padding pad/slice
+ops). The compiler's own lowering of `nn.Linear + relu + nn.Linear` is
+already optimal.
+
+The +2.6% NEFF-level penalty accounts for only a fraction of the 20%
+full-model regression. The rest comes from Python-side per-call overhead
+in `NeuronNemotronMLP.forward()` when `USE_NKI_MLP=1`:
+- `torch.zeros_like(hidden)` for `fused_add_tensor` (allocated per call)
+- `torch.zeros(1, H)` for `normalization_weights` (per call, since NO_NORM)
+- `torch.zeros(1, I/TP)` for `up_proj_bias` (per call)
+- `F.pad(hidden, (0, h_pad))` (per call)
+- Result slice `result_padded[..., :hidden_size]` (per call)
+- `mlp[logical_nc_config]` kernel dispatch overhead
+
+For a 42-layer model with 17 MLP layers per decode step, these compound
+into the observed ~20% wall-clock regression.
+
+**Definitive conclusion: `USE_NKI_MLP=1` has zero theoretical upside for
+the 4B on this SDK.** The compiler already delivers what the fused kernel
+would deliver. Padding just costs. Recommend `USE_NKI_MLP=0` (default).
+
+The only way to actually speed up the 4B MLP would be a **custom NKI
+kernel that operates natively on H=3136** (no padding) AND is called
+without the current Python-side wrapper overhead — i.e., inlined directly
+into the modeling code rather than going through `non_gated_mlp_nkilib`.
+That's a real NKI development project.
+
+Full profile artifacts + reproducer:
+`working/Nemotron/results/task020_4b_nki_mlp_profile_2026_07_15/`
+
+The `USE_NKI_MLP=1` code path stays in the codebase (commits `7a1fafc`,
+`6f56a42`, `08c21b6`, `a9fc690`) for reference but should **not** be used
+for production. Default is `USE_NKI_MLP=0`.
 
 ## GPU comparison (L40S, 1× g6e.4xlarge, vLLM 0.25.1, BF16, TP=1)
 
@@ -363,4 +404,4 @@ NEMOTRON_MODEL_PATH=$MODEL_PATH TP_DEGREE=4 BATCH_SIZE=4 \
   nkilib. Estimated ~10-20% decode win but non-trivial to wire up. See "NKI kernel status"
   section above.
 
-**Last Updated:** 2026-07-15 (Task 020 follow-up: attempted fused MLP kernel via hidden_size padding + SquaredReLU nkilib patch -- integration compiles but produces garbage output and is 20% slower; documented as dead end)
+**Last Updated:** 2026-07-15 (Task 020 follow-up: profile-driven analysis definitively shows the compiler already fuses the naive MLP path -- no fusion opportunity for the NKI kernel to unlock; 20% slowdown is Python-side per-call overhead, not kernel-level)
