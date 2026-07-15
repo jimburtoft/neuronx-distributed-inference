@@ -2223,8 +2223,11 @@ class NeuronNemotronMLP(nn.Module):
     NeuronNemotronDecoderLayer (which unpacks a 3-tuple like MoE/Mamba do).
     """
 
-    # Class-level constant: nkilib's mlp kernel requires H % 128 == 0
-    NKI_H_ALIGN = 128
+    # Class-level constant: nkilib's mlp kernel requires H % (128 * lnc) == 0
+    # where lnc is the logical NeuronCore config (typically 2). This ensures
+    # H1 = H // 128 is evenly divisible across the LNC cores. For LNC=2 the
+    # effective alignment is 256, so we round up to a multiple of 256.
+    NKI_H_ALIGN = 256
 
     def __init__(self, config: NemotronHInferenceConfig, layer_idx: int):
         super().__init__()
