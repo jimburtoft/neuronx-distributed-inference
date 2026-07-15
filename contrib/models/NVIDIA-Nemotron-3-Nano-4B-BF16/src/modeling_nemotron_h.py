@@ -2187,7 +2187,9 @@ class NeuronNemotronMLP(nn.Module):
 
     HF layout:
         mlp.up_proj:   Linear(hidden_size, intermediate_size, bias=False)
+                        weight shape: (intermediate_size, hidden_size) = (12544, 3136)
         mlp.down_proj: Linear(intermediate_size, hidden_size, bias=False)
+                        weight shape: (hidden_size, intermediate_size) = (3136, 12544)
         activation:    relu2 (relu(x)^2)
 
     NxDI TP layout (matches the standard Llama-style MLP):
@@ -2203,9 +2205,26 @@ class NeuronNemotronMLP(nn.Module):
     fuses (up_proj + activation + down_proj + all-reduce) into a single NKI
     kernel, eliminating intermediate HBM roundtrips.
 
+    HIDDEN_SIZE PADDING (Task 020 follow-up):
+        nkilib's `mlp` kernel requires H % 128 == 0. 4B has H=3136 (not a
+        multiple of 128). When USE_NKI_MLP=1 we pad H to the next multiple
+        of 128 (H=3200) locally within this class:
+        - Layer constructors use padded_hidden_size=3200
+        - Forward-time: pad input from H=3136 to 3200 with zeros, run kernel,
+          slice output from 3200 back to 3136
+        - State-dict conversion pads up_proj (dim 1) and down_proj (dim 0)
+          weights with zeros on the H axis
+        The zero-padded input columns contribute nothing (any_weight * 0 = 0),
+        and the zero-padded weight columns produce zero output at those
+        positions (all sliced off before returning). Result is mathematically
+        identical to the un-padded computation, at ~2% extra compute overhead.
+
     Returns (hidden_states, dummy_kv, None) to match the interface expected by
     NeuronNemotronDecoderLayer (which unpacks a 3-tuple like MoE/Mamba do).
     """
+
+    # Class-level constant: nkilib's mlp kernel requires H % 128 == 0
+    NKI_H_ALIGN = 128
 
     def __init__(self, config: NemotronHInferenceConfig, layer_idx: int):
         super().__init__()
@@ -2214,14 +2233,33 @@ class NeuronNemotronMLP(nn.Module):
         self.intermediate_size = config.intermediate_size
         self.use_nki_mlp = USE_NKI_MLP
 
+        # Compute the padded hidden size for the NKI path.
+        # If H is already aligned, padding is a no-op.
+        if self.hidden_size % self.NKI_H_ALIGN == 0:
+            self.padded_hidden_size = self.hidden_size
+        else:
+            self.padded_hidden_size = (
+                (self.hidden_size + self.NKI_H_ALIGN - 1)
+                // self.NKI_H_ALIGN
+            ) * self.NKI_H_ALIGN
+        # h_pad = number of zero elements to append on the H axis
+        self.h_pad = self.padded_hidden_size - self.hidden_size
+
         # dtype / init defaults inherited from the surrounding module setup
         dtype = getattr(config.neuron_config, "torch_dtype", torch.bfloat16)
         if isinstance(dtype, str):
             dtype = getattr(torch, dtype)
         self.torch_dtype = dtype
 
+        # For the NKI path we build the layers at the padded hidden size.
+        # For the non-NKI path we keep them at the true hidden size (avoids
+        # ~2% wasted compute in the fallback).
+        layer_hidden_size = (
+            self.padded_hidden_size if self.use_nki_mlp else self.hidden_size
+        )
+
         self.up_proj = ColumnParallelLinear(
-            self.hidden_size,
+            layer_hidden_size,
             self.intermediate_size,
             bias=getattr(config, "mlp_bias", False),
             gather_output=False,
@@ -2229,7 +2267,7 @@ class NeuronNemotronMLP(nn.Module):
         )
         self.down_proj = RowParallelLinear(
             self.intermediate_size,
-            self.hidden_size,
+            layer_hidden_size,
             bias=getattr(config, "mlp_bias", False),
             input_is_parallel=True,
             dtype=dtype,
@@ -2264,20 +2302,26 @@ class NeuronNemotronMLP(nn.Module):
                 "gelu": ActFnType.GELU,
                 "relu": ActFnType.ReLU,
             }
-            # NOTE: SquaredReLU is not in the DLAMI-bundled ActFnType enum.
-            # If USE_NKI_MLP_ACT=squared_relu, we require the patched nkilib
-            # (see task-020) to have added it. Try to resolve it, but fall
-            # back to relu with a warning.
+            # SquaredReLU may or may not be in the current ActFnType enum. If
+            # the DLAMI-bundled nkilib has been patched to add it (see the
+            # task 020 follow-up patch), resolve to it. Otherwise fall back
+            # to ReLU with a loud warning -- the output will be numerically
+            # WRONG (relu != relu^2) but the kernel timings are still valid
+            # for a perf-ceiling measurement.
             act_name = USE_NKI_MLP_ACT.lower()
             if act_name in ("squared_relu", "relu2"):
                 if hasattr(ActFnType, "SquaredReLU"):
                     self._nki_activation_fn = ActFnType.SquaredReLU
+                    logger.info(
+                        "[NKI MLP] Using ActFnType.SquaredReLU (correct for Nemotron relu2)"
+                    )
                 else:
                     logger.warning(
-                        "USE_NKI_MLP_ACT=squared_relu requested but ActFnType.SquaredReLU "
-                        "is not present in the current nkilib. Falling back to ReLU -- "
-                        "OUTPUT WILL BE WRONG (relu(x) != relu(x)^2). Use only for "
-                        "perf-ceiling measurement, not for accuracy validation."
+                        "[NKI MLP] USE_NKI_MLP_ACT=squared_relu requested but "
+                        "ActFnType.SquaredReLU is not present in the current "
+                        "nkilib. Falling back to ReLU -- OUTPUT WILL BE WRONG "
+                        "(relu(x) != relu(x)^2). Use only for perf-ceiling "
+                        "measurement, not for accuracy validation."
                     )
                     self._nki_activation_fn = ActFnType.ReLU
             else:
@@ -2295,24 +2339,32 @@ class NeuronNemotronMLP(nn.Module):
             from neuronx_distributed_inference.utils.nkilib_mlp_utils import (
                 non_gated_mlp_nkilib,
             )
-            batch_size, seq_len, hidden_size = hidden_states.shape
 
-            # Pass through the fused kernel. We set normalization_type=NO_NORM
-            # because the RMSNorm is already applied in the decoder layer before
-            # this call. `fused_add_tensor` is a zero tensor since we don't
-            # fuse the residual add (decoder layer handles it after this call).
-            zero_add = torch.zeros_like(hidden_states)
+            # Pad hidden_states on the H axis from self.hidden_size to
+            # self.padded_hidden_size. No-op if h_pad == 0.
+            if self.h_pad > 0:
+                hidden_padded = F.pad(hidden_states, (0, self.h_pad))
+            else:
+                hidden_padded = hidden_states
+
+            # The kernel expects zeroed normalization weights when
+            # normalization_type=NO_NORM (we do the RMSNorm externally).
+            # The fused_add_tensor is also zero because our decoder layer
+            # handles the residual add after this call, not the kernel.
+            zero_add = torch.zeros_like(hidden_padded)
             zero_norm_weights = torch.zeros(
-                (1, hidden_size), dtype=hidden_states.dtype, device=hidden_states.device
+                (1, self.padded_hidden_size),
+                dtype=hidden_padded.dtype,
+                device=hidden_padded.device,
             )
             up_proj_bias = torch.zeros(
                 (1, self.intermediate_size // self._get_tp_group().size()),
-                dtype=hidden_states.dtype,
-                device=hidden_states.device,
+                dtype=hidden_padded.dtype,
+                device=hidden_padded.device,
             )
 
-            result = non_gated_mlp_nkilib(
-                hidden=hidden_states,
+            result_padded = non_gated_mlp_nkilib(
+                hidden=hidden_padded,
                 up_proj_weight=self.up_proj.weight,
                 down_proj_weight=self.down_proj.weight,
                 logical_nc_config=self.logical_nc_config,
@@ -2325,9 +2377,11 @@ class NeuronNemotronMLP(nn.Module):
                 down_proj_bias=None,
                 activation_fn=self._nki_activation_fn,
             )
-            # non_gated_mlp_nkilib adds fused_add_result at the end; since
-            # our fused_add was zero, the result is (mlp_output + zero) = mlp_output.
-            # No further residual is needed here (decoder layer adds its own).
+            # Slice back from padded_hidden_size to hidden_size on the last axis.
+            if self.h_pad > 0:
+                result = result_padded[..., : self.hidden_size]
+            else:
+                result = result_padded
         else:
             # up_proj is ColumnParallel(gather_output=False), so its output is
             # already sharded along the intermediate dim on this rank.
@@ -3177,6 +3231,38 @@ def _convert_nemotron_hf_to_neuron_state_dict(
     # Kept for code structure compatibility with the 30B port.
     state_dict, mamba_proj_entries = _split_mamba_projections(state_dict, config)
     new_state_dict.update(mamba_proj_entries)
+
+    # Pad MLP up_proj / down_proj weights on the hidden_size axis when
+    # USE_NKI_MLP=1. Required because nkilib's `mlp` kernel enforces
+    # H % 128 == 0. See NeuronNemotronMLP class docstring for the padding
+    # semantics.
+    if USE_NKI_MLP:
+        h = config.hidden_size
+        align = NeuronNemotronMLP.NKI_H_ALIGN
+        if h % align != 0:
+            padded_h = ((h + align - 1) // align) * align
+            h_pad = padded_h - h
+            logger.info(
+                f"[NKI MLP] Padding hidden_size {h} -> {padded_h} (+{h_pad}) on "
+                f"up_proj / down_proj weights"
+            )
+            for key in list(state_dict.keys()):
+                if ".mixer.up_proj.weight" in key:
+                    # HF up_proj weight shape: (I=intermediate_size, H=hidden_size)
+                    # Pad the H axis (dim=1) with zeros.
+                    t = state_dict[key]
+                    assert t.shape[1] == h, (
+                        f"unexpected up_proj shape {t.shape}, expected (*, {h})"
+                    )
+                    state_dict[key] = F.pad(t, (0, h_pad), value=0.0)
+                elif ".mixer.down_proj.weight" in key:
+                    # HF down_proj weight shape: (H=hidden_size, I=intermediate_size)
+                    # Pad the H axis (dim=0) with zeros.
+                    t = state_dict[key]
+                    assert t.shape[0] == h, (
+                        f"unexpected down_proj shape {t.shape}, expected ({h}, *)"
+                    )
+                    state_dict[key] = F.pad(t, (0, 0, 0, h_pad), value=0.0)
 
     # Remap all remaining keys. For the 4B dense variant this is simply:
     #   backbone.embeddings.weight        -> embed_tokens.weight
