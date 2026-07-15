@@ -107,6 +107,62 @@ issues, no expert-loop instruction-limit issues. Compile and load are dramatical
 At BS=1 the 4B is ~1.4× faster on decode and ~1.7× faster on TTFT despite being the same
 per-token active-parameter count (~3 B).
 
+## NKI kernel status (Task 020, 2026-07-15)
+
+Audit of which nki-lib kernels fire for the 4B in the default compile, and
+which additional ones could be wired in:
+
+| Component | NKI kernel used? | Notes |
+|---|---|---|
+| Attention Softmax (CE) | **YES** (auto) | `NativeToCustomSoftmax` pass replaces 4 softmax ops per CE compile (one per attention layer). |
+| Attention Q/K/V/O matmul | No | Generic matmul. NxDI's `attention_cte`/`qkv_cte`/`output_projection_cte` NKI kernels are not auto-selected -- suspect shape mismatch, not audited further. |
+| Input RMSNorm | No | Runs as generic HLO ops. NKI `rmsnorm` kernel not wired for this pre-norm. |
+| Gated RMSNorm (Mamba layer) | No | Our fixed implementation in Python -- compiled to generic HLO. |
+| Depthwise Conv1d (Mamba prefill) | Off by default | With `USE_NATIVE_CONV1D=1`, SDK 2.31 auto-inserts 15 `NativeNkiKernel-*_Conv1d_depthwise_bf01_oi01_bf01` invocations across the 21 Mamba layers x CE+TG buckets. But this path is **1.5% slower on decode** than the manual weight-loop path, so it stays off by default. Manual loop remains the default. |
+| Mamba SSM step (decode) | No | Head-grouped quadratic scan compiled from our PyTorch code. |
+| Mamba SSD scan (prefill) | Off by default | `USE_CHUNKED_NKI_SCAN=1` invokes our own chunked NKI SSD kernel (`src/nki_kernels/nki_mamba2_ssd_chunked.py`). The upstream nkilib `scan/ssd` kernel is not usable (`n_groups=1` constraint; 4B uses `n_groups=8`). |
+| Dense MLP up_proj / relu2 / down_proj | Blocked | See below. |
+
+### Dense MLP kernel: BLOCKED by hidden_size=3136 not being a multiple of 128
+
+Attempted to wire the 4B's dense MLP through `non_gated_mlp_nkilib`
+(the utility Llama uses for its `mlp_kernel_enabled` path). The kernel supports
+`skip_gate_proj=True` (matches 4B: no gate) and `NormType.NO_NORM`, which
+would allow keeping the external RMSNorm as-is and still fusing
+`up_proj + activation + down_proj + all-reduce` into one HBM-round-trip kernel.
+
+**Blocker**: `nkilib.core.mlp.mlp_parameters` asserts `H % 128 == 0`. The 4B's
+`hidden_size=3136` is not a multiple of 128 (3136/128 = 24.5). The 128-alignment
+is fundamental to how the kernel tiles into SBUF partitions -- confirmed by
+`H // 128` divisions in `mlp_torch.py`, `mlp_tkg_down_projection.py`,
+`mlp_tkg_layernorm.py`, `mlp_tkg_rmsnorm.py`, and `down_projection_mx_shard_H.py`.
+It's not a shallow assert that can just be relaxed.
+
+**Second blocker**: the `ActFnType` enum lacks `SquaredReLU`. The 4B's
+`mlp_hidden_act="relu2"` is not one of the currently-supported activations
+(SiLU/GELU/GELU_Tanh_Approx/Swish/ReLU). Task 015 found upstream/main added
+SquaredReLU to `moe_cte` but not to the generic MLP path.
+
+### Options to unblock (not attempted)
+
+1. **Pad hidden_size 3136 → 3200 (2% overhead)**. Requires modifying up_proj,
+   down_proj, RMSNorm gamma, embeddings, and lm_head all consistently; and
+   adding SquaredReLU to the nkilib. Non-trivial but tractable.
+2. **Write a custom H=3136 MLP kernel**. Substantial NKI work (~1-2 weeks).
+3. **Accept the current baseline**. 4B is already fast (145 tok/s BS=1,
+   6.87 ms TPOT). Expected win from fused MLP is 10-20% decode at best.
+
+Recommend Option 3 for now; revisit if a customer deployment has a concrete
+target that requires the extra perf.
+
+### Coincidental finding: SDK 2.31 auto-inserts NKI Conv1d without ANY code change
+
+If we simply removed the manual conv1d loop and used `F.conv1d(groups=conv_dim)`
+directly, the compiler would auto-insert the NKI Conv1d kernel with no other
+opt-in required. On SDK 2.31 this is fully supported (the TEN404 crash that
+motivated the manual loop for SDK 2.28 is fixed). The reason we keep the manual
+loop is purely a 1.5% decode perf preference, not correctness.
+
 ## GPU comparison (L40S, 1× g6e.4xlarge, vLLM 0.25.1, BF16, TP=1)
 
 Real GPU baseline captured 2026-07-14 in us-east-2 (Task 019). Note: p5.4xlarge
@@ -274,7 +330,9 @@ NEMOTRON_MODEL_PATH=$MODEL_PATH TP_DEGREE=4 BATCH_SIZE=4 \
   by-eye passes; formal token match rate not yet measured.
 - **Higher ctx (4096, 8192, 16384)** with chunked NKI SSD. Kernel supports arbitrary ctx
   (state is 4 MB/layer fixed), so likely works; not yet compiled.
-- **Native F.conv1d** (`USE_NATIVE_CONV1D=1`) not yet tested on 4B. Should work per the
-  30B retest results but slower on decode by ~11% there.
+- **Fused MLP kernel via hidden_size padding**. `hidden_size=3136 → 3200` (2% padding overhead)
+  would unblock `non_gated_mlp_nkilib` for the dense MLP. Also needs SquaredReLU added to
+  nkilib. Estimated ~10-20% decode win but non-trivial to wire up. See "NKI kernel status"
+  section above.
 
-**Last Updated:** 2026-07-14 (Task 019: added L40S GPU baseline; H100 pending capacity)
+**Last Updated:** 2026-07-15 (Task 020: NKI kernel audit; USE_NATIVE_CONV1D retested; fused MLP kernel blocked by H%128 constraint)
