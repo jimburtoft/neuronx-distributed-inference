@@ -2330,6 +2330,17 @@ class NeuronNemotronMLP(nn.Module):
             else:
                 self._nki_activation_fn = act_map.get(act_name, ActFnType.ReLU)
 
+            # Register a persistent zero tensor for normalization_weights.
+            # The kernel requires a non-None normalization_weights_tensor even
+            # when normalization_type=NO_NORM. Making it a registered buffer
+            # ensures it's traced as a constant HBM allocation ONCE, not
+            # allocated per-call inside the traced forward.
+            self.register_buffer(
+                "_nki_norm_weights_zero",
+                torch.zeros(1, self.padded_hidden_size, dtype=dtype),
+                persistent=False,
+            )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -2339,8 +2350,20 @@ class NeuronNemotronMLP(nn.Module):
         **kwargs,
     ):
         if self.use_nki_mlp:
-            from neuronx_distributed_inference.utils.nkilib_mlp_utils import (
-                non_gated_mlp_nkilib,
+            # Call nkilib.mlp directly (NOT through the non_gated_mlp_nkilib
+            # utility wrapper). That wrapper hardcodes `store_fused_add_result=True`
+            # and returns `output + fused_add_result`, i.e. it unconditionally adds
+            # the input hidden to its output as a residual. We don't want that --
+            # the decoder layer already handles the residual add outside this call,
+            # so going through the utility wrapper would double the residual (once
+            # here, once in the decoder layer) and produce garbage output.
+            #
+            # We also pass `fused_add_tensor=None` (skip the add step entirely)
+            # and `up_proj_bias_tensor=None` (no bias), which eliminates two of
+            # the three per-call zero-tensor allocations that the wrapper needed.
+            from nkilib.core.mlp.mlp import mlp as nki_mlp_kernel
+            from neuronx_distributed.parallel_layers.mappings import (
+                reduce_from_tensor_model_parallel_region,
             )
 
             # Pad hidden_states on the H axis from self.hidden_size to
@@ -2350,41 +2373,44 @@ class NeuronNemotronMLP(nn.Module):
             else:
                 hidden_padded = hidden_states
 
-            # The kernel expects zeroed normalization weights when
-            # normalization_type=NO_NORM (we do the RMSNorm externally).
-            # The fused_add_tensor is also zero because our decoder layer
-            # handles the residual add after this call, not the kernel.
-            zero_add = torch.zeros_like(hidden_padded)
-            zero_norm_weights = torch.zeros(
-                (1, self.padded_hidden_size),
-                dtype=hidden_padded.dtype,
-                device=hidden_padded.device,
-            )
-            up_proj_bias = torch.zeros(
-                (1, self.intermediate_size // self._get_tp_group().size()),
-                dtype=hidden_padded.dtype,
-                device=hidden_padded.device,
+            # Call the fused kernel directly. Set store_fused_add_result=False so
+            # the kernel returns just the MLP output (no residual embedded).
+            mlp_output = nki_mlp_kernel[self.logical_nc_config](
+                hidden_tensor=hidden_padded,
+                # skip_gate_proj=True means gate_proj_weights is ignored, but the
+                # kernel's parameter validation still requires a non-None tensor
+                # here. Pass up_proj as a dummy -- the kernel bypasses it.
+                gate_proj_weights_tensor=self.up_proj.weight,
+                up_proj_weights_tensor=self.up_proj.weight,
+                down_proj_weights_tensor=self.down_proj.weight,
+                normalization_weights_tensor=self._nki_norm_weights_zero,
+                normalization_type=self._nki_norm_no_norm,
+                activation_fn=self._nki_activation_fn,
+                skip_gate_proj=True,
+                fused_add_tensor=None,
+                store_fused_add_result=False,
+                up_proj_bias_tensor=None,
+                down_proj_bias_tensor=None,
             )
 
-            result_padded = non_gated_mlp_nkilib(
-                hidden=hidden_padded,
-                up_proj_weight=self.up_proj.weight,
-                down_proj_weight=self.down_proj.weight,
-                logical_nc_config=self.logical_nc_config,
-                tensor_parallel_group=self._get_tp_group(),
-                normalization_type=self._nki_norm_no_norm,
-                normalization_weights=zero_norm_weights,
-                normalization_bias=None,
-                fused_add_tensor=zero_add,
-                up_proj_bias=up_proj_bias,
-                down_proj_bias=None,
-                activation_fn=self._nki_activation_fn,
+            # When store_fused_add_result=False, mlp() returns a single tensor
+            # (or a 1-element list depending on version).
+            if isinstance(mlp_output, (tuple, list)):
+                out_padded = mlp_output[0]
+            else:
+                out_padded = mlp_output
+
+            # All-reduce across TP ranks (RowParallelLinear-style; the kernel does
+            # not include the reduce because it works on already-sharded weights).
+            out_padded = reduce_from_tensor_model_parallel_region(
+                out_padded, process_group=self._get_tp_group(),
             )
+
             # Slice back from padded_hidden_size to hidden_size on the last axis.
             if self.h_pad > 0:
-                result = result_padded[..., : self.hidden_size]
+                result = out_padded[..., : self.hidden_size]
             else:
-                result = result_padded
+                result = out_padded
         else:
             # up_proj is ColumnParallel(gather_output=False), so its output is
             # already sharded along the intermediate dim on this rank.
