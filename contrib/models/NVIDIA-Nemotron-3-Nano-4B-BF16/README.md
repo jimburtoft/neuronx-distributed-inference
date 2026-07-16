@@ -177,36 +177,74 @@ Two attempts to unblock `USE_NKI_MLP=1`:
 | v8 (garbage output) | 41.8 | 115.97 | 8.62 | ❌ garbage |
 | **v9 (this attempt)** | 42.2 | **125.03** | 8.00 | **✅ coherent** |
 
-### Definitive root cause (profile-driven, 2026-07-15/16)
+### Definitive root cause (full-model NKI profile, 2026-07-16)
 
-Standalone MLP microbenchmark (one call, isolated from full model):
+Profiled the full 4B TG (decode-step) NEFF for both `USE_NKI_MLP=0` and
+`USE_NKI_MLP=1` using the `neuron-nki-profiling` skill methodology
+(`NEURON_RT_INSPECT_*` env vars, `neuron-profile view`, parquet ingest via
+`neuron-explorer view`, per-instruction analysis via pandas).
 
-| Metric | Fused NKI | Compiler-fused | Ratio |
+**Per-decode-token TG NEFF:**
+
+| Metric | Baseline | NKI MLP | Delta |
 |---|---|---|---|
-| total_time | 2.214 ms | 2.160 ms | +2.5% (padding overhead only) |
-| tensor_engine_active | 0.17% | 0.19% | ~same (matmul runs on vector engine at BS=1) |
-| vector_engine_active | 85.65% | 85.67% | **identical** |
-| Instruction counts | ACTIVATE: 2115 | ACTIVATE: 2116 | ±1 (identical) |
+| **total_time** | 5.30 ms | 6.27 ms | **+18.3%** |
+| Total instructions | 194,816 | 165,368 | **-15.1%** (fewer!) |
+| Tensor engine active | 27.78 ms (across 4 cores) | 25.49 ms | -8.2% |
+| Vector engine active | 1.32 ms | 1.95 ms | **+47.5%** |
+| Scalar engine active | 1.59 ms | 2.02 ms | +27.2% |
+| GpSimd active | 3.98 ms | 3.28 ms | -17.6% |
+| HBM read | 2071 MB | 2279 MB | +10.0% (padding) |
 
-**The compiler already produces the same instruction pattern from the naive `nn.Linear → relu → nn.Linear` as `nkilib.core.mlp.mlp` does. There is no fusion opportunity to unlock.** At decode-size matmuls (BS=1, seq=1), the tensor engine sits at 0.2% utilization in both paths -- the systolic array doesn't engage for such small matmul shapes; everything runs on the vector engine.
+**NKI does fewer instructions and less tensor work, but takes longer.** Because:
 
-The 14% full-model regression comes from Python/wrapper-level overhead compounded across 17 MLP layers per decode step:
-- `F.pad(hidden_states, (0, 192))` per layer (17 pads per decode token)
-- `out_padded[..., :3136]` slice per layer
-- Explicit `reduce_from_tensor_model_parallel_region(...)` per layer (instead of implicit in `RowParallelLinear`)
-- Buffer materialization on every kernel invocation
+- **Tensor engine is already saturated** at 4-core parallelism (~500% cumulative utilization) doing Mamba-2 matmuls + attention. Adding more tensor work doesn't extend wall time; removing it doesn't shorten it.
+- **Vector and Scalar engines** have slack in the baseline (75% and 70% idle respectively). They're the pipeline critical path.
+- The NKI MLP kernel puts more work on Vector/Scalar engines (SBUF tile management, activation dispatch, inter-tile copies) — which **can't overlap with the concurrent Mamba layers using those same engines**. The extra Vector work adds ~0.63 ms of critical-path time per decode token.
+
+Attribution by source location (from `parquet/Instruction.parquet`,
+grouped by `nki_source_location`):
+
+**NKI MLP ADDS ~6.5 ms of nkilib work:**
+- `mlp_tkg_down_projection.py:151` (matmul): +1.82 ms
+- `mlp_tkg_gate_up_projection.py:197` (matmul): +1.47 ms
+- `torch/nn/modules/module.py:1786`: +1.00 ms
+- `mlp_tkg.py:263` (dispatch): +0.55 ms
+- Various nkilib subkernels: ~1.6 ms
+
+**NKI MLP REMOVES ~7.3 ms of baseline MLP work:**
+- `torch_neuronx/.../custom_op_name.py:603`: -3.48 ms
+- `modeling_nemotron_h.py:2417` (baseline `down_proj(h)`): -3.38 ms
+
+**Net instruction-sum: -0.6 ms.** But wall-clock is +0.97 ms because the ADDED instructions land on Vector/Scalar engines that CAN'T overlap with concurrent Mamba tensor work. The saved instructions were happening in parallel with tensor work; the new ones happen serially.
+
+### Practical implication
+
+**The NKI MLP kernel is designed for matmul-bound workloads where Tensor is the bottleneck.** In the 4B hybrid Mamba-transformer, Tensor is already saturated by Mamba-2 layers. The only speedup opportunity at this shape/architecture is **reducing Vector/Scalar engine work**, which is the opposite of what nkilib's mlp kernel does.
+
+For a hypothetical custom MLP kernel to help, it would need to:
+1. Minimize Vector engine work (SBUF tile management, per-tile activation ops)
+2. Not require the hidden_size padding overhead
+3. Match or reduce the baseline compiler's per-op HBM traffic
+
+Achieving all three at BS=1 seq=1 with H=3136 is unlikely to yield a
+measurable win. The baseline is running at ~145 tok/s (7 ms TPOT) which
+is close to the HBM bandwidth bound for this model (2 GB read per token
+= ~1.2 ms just to read weights at 1.6 TB/s per-core aggregate).
 
 ### Recommendation
 
-**Keep `USE_NKI_MLP=0` (baseline) as the default.**
+**Keep `USE_NKI_MLP=0` (baseline) as the default.** The kernel is not a
+winning strategy at this shape/architecture.
 
-The 14% slowdown is not worth the added complexity of DLAMI nkilib patches + hidden_size padding + custom kernel dispatch. The code path is preserved in the tree (commits `7a1fafc`, `6f56a42`, `08c21b6`, `a9fc690`, `6f2f933`) for reference and future exploration if the underlying constraints change.
+The code path is preserved (commits `7a1fafc`, `6f56a42`, `08c21b6`,
+`a9fc690`, `6f2f933`, `bae149b`) for reference and future exploration
+if the hybrid model architecture changes.
 
-Full profile artifacts + reproducer:
-- `working/Nemotron/results/task020_4b_nki_mlp_profile_2026_07_15/` -- first profile session
-- `working/Nemotron/results/task020_4b_nki_mlp_v2_2026_07_16/` -- refined session after double-residual fix
-
-The only speedup available for the 4B MLP would come from **eliminating the padding entirely** — either via a custom NKI kernel that handles H=3136 natively (with a partial-tile branch), or by changing the model architecture to use `hidden_size=3328` throughout. Neither is worth the effort given the compiler already reaches ~85% Vector engine utilization on the naive path.
+Full profile artifacts + per-instruction analysis:
+- `working/Nemotron/results/task020_4b_nki_mlp_profile_2026_07_15/` — first (microbench) profile session
+- `working/Nemotron/results/task020_4b_nki_mlp_v2_2026_07_16/` — v9 integration attempt
+- `working/Nemotron/results/task020_nki_profile_full_2026_07_16/` — full-model TG NEFF profile (definitive)
 
 ## GPU comparison (L40S, 1× g6e.4xlarge, vLLM 0.25.1, BF16, TP=1)
 
@@ -380,4 +418,4 @@ NEMOTRON_MODEL_PATH=$MODEL_PATH TP_DEGREE=4 BATCH_SIZE=4 \
   nkilib. Estimated ~10-20% decode win but non-trivial to wire up. See "NKI kernel status"
   section above.
 
-**Last Updated:** 2026-07-16 (Task 020 continued: fixed the double-residual bug that was producing garbage output; NKI MLP now produces coherent output but is still 14% slower than baseline due to Python wrapper overhead compounded across 17 MLP layers -- compiler already fuses the naive path optimally)
+**Last Updated:** 2026-07-16 (Task 020 continued: full-model NKI profile reveals Tensor engine is already saturated by Mamba layers, so NKI MLP's extra Vector engine work extends wall-clock; kernel design is wrong for hybrid Mamba-transformer at decode)
