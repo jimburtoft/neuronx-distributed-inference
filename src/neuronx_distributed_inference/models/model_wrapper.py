@@ -578,6 +578,81 @@ class ModelWrapper(torch.nn.Module):
         # This is not the best way to maintain code. But soon kwargs suport will render this irrelevant.
         seq_ids = args[3]
         sampling_params = args[4]
+
+        # Batch bucketing fast path -- bypass the fill-missing-slots + sort +
+        # reorder padding logic below (which was designed for the max_batch_size
+        # case where seq_ids values are assumed to be in [0, max_batch_size)
+        # and are used to place inputs at specific rows of the padded tensor).
+        # With batch bucketing, seq_ids values are absolute slot IDs into the
+        # shared KV cache (up to max_batch_size - 1) which may be outside
+        # [0, target_batch_size) for a smaller bucket. The compiled TKG NEFF
+        # for that bucket accepts a batch dim of `target_batch_size` and uses
+        # seq_ids VALUES to index into the wider KV cache (via the KV cache
+        # manager's batch-bucketing-aware slice path). So we just pad the
+        # tensor batch dim to target_batch_size (repeating the first row for
+        # dummy rows) and pass seq_ids values through unchanged.
+        if (
+            self.is_batch_bucketing
+            and self.tag == TOKEN_GENERATION_MODEL_TAG
+            and not self.is_prefix_caching
+            and not self.neuron_config.tensor_replacement_config
+        ):
+            input_batch_size = seq_ids.shape[0]
+            target_bucket = self.get_target_bucket(*args, strategy="first_fit")
+            if isinstance(target_bucket, list):
+                target_batch_size = target_bucket[0]
+
+                if input_batch_size == target_batch_size:
+                    # Perfect fit -- pass args straight through.
+                    outputs = self._forward(*args)
+                elif input_batch_size < target_batch_size:
+                    def _pad_batch_dim(t, target):
+                        if t is None or not isinstance(t, torch.Tensor):
+                            return t
+                        if t.shape[0] == target:
+                            return t
+                        pad_count = target - t.shape[0]
+                        first_row = t[:1]
+                        # broadcast_to would work but returns a view; contiguous
+                        # for downstream ops.
+                        pad = first_row.expand(pad_count, *t.shape[1:]).contiguous()
+                        return torch.cat([t, pad], dim=0)
+
+                    def _maybe_pad(t):
+                        return t if is_ranked_io(t) else _pad_batch_dim(t, target_batch_size)
+
+                    padded_args_list = [
+                        _maybe_pad(args[0]),
+                        _maybe_pad(args[1]),
+                        _maybe_pad(args[2]),
+                        _pad_batch_dim(seq_ids, target_batch_size),
+                        _pad_batch_dim(sampling_params, target_batch_size),
+                    ]
+                    for extra in args[5:]:
+                        padded_args_list.append(_maybe_pad(extra))
+                    outputs = self._forward(*padded_args_list)
+                else:
+                    # input_batch_size > target_batch_size shouldn't happen
+                    # since first_fit returns the smallest bucket >= input.
+                    outputs = None
+
+                if outputs is not None:
+                    if self.is_neuron():
+                        logits = outputs
+                        if self.async_mode:
+                            return logits
+                        if (
+                            self.neuron_config.enable_fused_speculation
+                            or (
+                                self.neuron_config.on_device_sampling_config is not None
+                                and self.neuron_config.output_logits
+                                and self.neuron_config.is_continuous_batching
+                            )
+                        ):
+                            return [logit[:input_batch_size] for logit in logits]
+                        return logits[:input_batch_size]
+                    logits, *kv_cache = outputs
+                    return [logits[:input_batch_size], *kv_cache]
         if self.is_block_kv_layout:
             medusa_args = None
         elif len(args) > 5 and not self.neuron_config.tensor_replacement_config:

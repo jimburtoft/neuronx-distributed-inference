@@ -533,8 +533,24 @@ class KVCacheManager(nn.Module):
                     scatter_index_new_v = scatter_index_new_k
                 ###############################################################################
                 # Handles the case where the batch size is smaller than the KV cache batch size.
+                # This covers two configurations:
+                #   1. batch_size < kv_cache_batch_size in the compile-time config
+                #      (e.g., a fixed sub-batch NEFF sharing a wider KV cache).
+                #   2. Batch bucketing where seq_ids at runtime has fewer rows
+                #      than kv_cache_batch_size but the compile-time config keeps
+                #      batch_size == kv_cache_batch_size (e.g., a TKG bucket at
+                #      BS=1 sharing a KV cache sized for max_batch_size=64).
+                #      In this case we must still use the padded-scatter path
+                #      below so writes land at the seq_ids-indexed KV slot
+                #      (not row 0 of the cache) and other slots stay untouched.
                 ###############################################################################
-                elif self.batch_size < self.kv_cache_batch_size:
+                elif (
+                    self.batch_size < self.kv_cache_batch_size
+                    or (
+                        self.neuron_config.token_generation_batches is not None
+                        and seq_ids.shape[0] < self.kv_cache_batch_size
+                    )
+                ):
                     assert not self.k_cache_transposed, 'Transposed K cache not yet implemented for batch_size < kv_cache_batch_size'
                     garbage_pos = seq_len - 1
                     updated_latest_kv_shape = k_cache.shape[:1] + latest_k.shape[1:]
