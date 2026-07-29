@@ -119,6 +119,8 @@ class NeuronAttention(nn.Module):
             if kvcache
             else None
         )
+        # Task 012 (POC v4.a): stash seq_len for use in forward's trailing-prefill branch
+        self.seq_len = seq_len
 
     def forward(
         self,
@@ -135,7 +137,20 @@ class NeuronAttention(nn.Module):
 
         if self.cache_k is not None and self.cache_v is not None:
             if seq_len > 1:  # prefill: save all to cache
-                indices = torch.arange(start=0, end=seq_len, dtype=torch.int64, device=q.device)
+                # Task 012 (POC v4.a) -- support "verify-K trailing" mode for the SHORT prefill NEFF.
+                # For the full-length DecoderPrefill (seq_len == n_text_ctx == 448), keep original
+                # write-at-0..seq_len-1 behavior. For the SHORT prefill (seq_len < n_text_ctx), interpret
+                # last_pos as the KV position of the LAST input token, and compute the write range as
+                #   [last_pos - seq_len + 1, ..., last_pos].
+                # When callers pass last_pos = seq_len - 1 (existing Task 011 usage), this reduces to
+                # 0..seq_len-1 (no behavior change). When callers pass last_pos = N + seq_len - 1, the
+                # short NEFF becomes a "chunked verify" NEFF writing at trailing positions N..N+seq_len-1.
+                if seq_len == self.seq_len:
+                    indices = torch.arange(start=0, end=seq_len, dtype=torch.int64, device=q.device)
+                else:
+                    # Short trailing prefill. last_pos is (bsz,) int32; for bsz>=1 broadcast over bsz.
+                    offset = last_pos[0].to(torch.int64) - seq_len + 1  # scalar tensor
+                    indices = offset + torch.arange(start=0, end=seq_len, dtype=torch.int64, device=q.device)
                 indices = indices.view(1, 1, seq_len, 1)
                 indices = indices.expand(bsz, self.n_kv_heads, seq_len, self.head_dim)
             else:  # decode: save only the last token [last_pos] to cache
@@ -396,10 +411,19 @@ class NeuronTextDecoder(nn.Module):
 
         is_prefill = x.shape[1] > 1
         prompt_len = x.shape[1]  # Task 011: actual prefill Q length (<= self.seq_len)
+        # Task 012 (POC v4.a): compute write offset for the trailing-prefill mode.
+        # For the full-length prefill (prompt_len == self.seq_len), offset is 0 (no change).
+        # For the short prefill (prompt_len < self.seq_len), offset = last_pos - prompt_len + 1.
         if is_prefill:
-            # Task 011: slice positional embedding to prompt_len.
-            # Stock returned full [seq_len, n_state] which only broadcasts correctly at seq_len.
-            pe = self.positional_embedding.weight[:prompt_len]
+            if prompt_len == self.seq_len:
+                pe = self.positional_embedding.weight[:prompt_len]
+            else:
+                # Task 012: dynamic trailing slice via torch.index_select.
+                # write_offset = last_pos[0] - prompt_len + 1
+                # positions = write_offset + arange(prompt_len)
+                write_offset_pe = last_pos[0].to(torch.int64) - prompt_len + 1
+                positions = write_offset_pe + torch.arange(prompt_len, device=last_pos.device, dtype=torch.int64)
+                pe = torch.index_select(self.positional_embedding.weight, 0, positions)
         else:
             # BS>1 patch: unsqueeze to (BS, 1, n_state) so it broadcasts correctly
             # against token_embedding(x) shape (BS, 1, n_state). Stock code returns
@@ -412,10 +436,18 @@ class NeuronTextDecoder(nn.Module):
         mask = None
         if is_prefill:
             # Task 011: mask shape [prompt_len (Q), seq_len (K)] to support short prefill.
-            # K dim stays at seq_len because KV cache has seq_len slots (the short prefill
-            # only writes positions 0..prompt_len-1; positions past last_pos are masked
-            # by pad_mask, positions between prompt_len and last_pos are cache zeros).
-            mask = torch.full((prompt_len, self.seq_len), True, device=pad_mask.device).tril(diagonal=0)
+            # Task 012: shift the causal mask by write_offset so Q position i attends to
+            # K positions 0..write_offset+i.
+            if prompt_len == self.seq_len:
+                mask = torch.full((prompt_len, self.seq_len), True, device=pad_mask.device).tril(diagonal=0)
+            else:
+                # Trailing-prefill causal mask: mask[i, j] = (j <= write_offset + i)
+                # write_offset = last_pos[0] - prompt_len + 1
+                write_offset_mask = last_pos[0].to(torch.int64) - prompt_len + 1
+                arange_seq = torch.arange(self.seq_len, device=pad_mask.device, dtype=torch.int64)  # [seq_len]
+                arange_prompt = torch.arange(prompt_len, device=pad_mask.device, dtype=torch.int64)  # [prompt_len]
+                # mask[i, j] = arange_seq[j] <= write_offset + arange_prompt[i]
+                mask = arange_seq.unsqueeze(0) <= (write_offset_mask + arange_prompt.unsqueeze(1))  # [prompt_len, seq_len]
             input_mask = (
                 pad_mask[:, None, None, :].expand(self.batch_size, 1, prompt_len, self.seq_len).to(torch.bool)
             )
@@ -579,7 +611,11 @@ class ModelWrapperWhisperDecoderPrefillShort(ModelWrapper):
             (self.neuron_config.batch_size, prompt_len),
             dtype=torch.int32,
         )
-        last_pos = torch.zeros(self.neuron_config.batch_size, dtype=torch.int32)
+        # Task 012 (POC v4.a): use last_pos = prompt_len - 1 as the dummy trace value so the
+        # trailing-write offset (last_pos - prompt_len + 1) = 0, matching original prefill behavior.
+        # At runtime, callers can pass last_pos in [prompt_len - 1, n_text_ctx - 1] to write at
+        # different trailing positions.
+        last_pos = torch.full((self.neuron_config.batch_size,), prompt_len - 1, dtype=torch.int32)
         pad_mask = torch.zeros(
             (self.neuron_config.batch_size, self.config.dims.n_text_ctx),
             dtype=torch.int32,
