@@ -97,9 +97,15 @@ class VoxtralForCausalLM(NeuronBaseForImageToText):
     # ------------------------------------------------------------------
     @staticmethod
     def convert_hf_to_neuron_state_dict(state_dict, config):
-        """Delegate to NeuronLlamaForCausalLM with text_config."""
+        """Delegate to NeuronLlamaForCausalLM with text_config.
+
+        Under fused speculation the per-sub-model checkpoint loader passes the
+        flat text_config directly (the draft/target LLM configs), so fall back
+        to `config` itself when it has no nested `text_config`.
+        """
+        text_config = config.text_config if hasattr(config, "text_config") else config
         return NeuronLlamaForCausalLM.convert_hf_to_neuron_state_dict(
-            state_dict, config.text_config
+            state_dict, text_config
         )
 
     # ------------------------------------------------------------------
@@ -240,6 +246,50 @@ class VoxtralForCausalLM(NeuronBaseForImageToText):
                 fill_value=self._seq_len - 1,
                 dtype=torch.int32,
             )
+
+        if self.neuron_config.enable_fused_speculation:
+            # Fused speculation: CTE and fused-spec NEFFs are backed by
+            # NeuronFusedSpecModel, whose 13-arg positional layout is:
+            #   0 input_ids, 1 attention_mask, 2 position_ids, 3 seq_ids,
+            #   4 sampling_params, 5 prev_hidden, 6 adapter_ids, 7 slot_mapping,
+            #   8 active_block_table, 9 num_queries, 10 computed_context_lens,
+            #   11 vision_embeddings, 12 vision_mask
+            if self._is_prefill(position_ids):
+                outputs = self.context_encoding_model(
+                    input_ids,
+                    attention_mask,
+                    position_ids,
+                    seq_ids,
+                    sampling_params,
+                    torch.empty(0),  # prev_hidden
+                    torch.empty(0),  # adapter_ids
+                    torch.empty(0),  # slot_mapping
+                    torch.empty(0),  # active_block_table
+                    torch.empty(0),  # num_queries
+                    torch.empty(0),  # computed_context_lens
+                    vision_embeddings,  # audio embeds -> scatter for target + draft
+                    vision_mask,
+                )
+                self.kv_cache_populated = True
+                is_run_on_neuron = self.context_encoding_model.is_neuron()
+            else:
+                outputs = self.fused_spec_model(
+                    input_ids,
+                    attention_mask,
+                    position_ids,
+                    seq_ids,
+                    sampling_params,
+                    torch.empty(0),  # prev_hidden
+                    torch.empty(0),  # adapter_ids
+                    torch.empty(0),  # slot_mapping
+                    torch.empty(0),  # active_block_table
+                    torch.empty(0),  # num_queries
+                    torch.empty(0),  # computed_context_lens
+                    torch.empty(0, dtype=torch.bfloat16),  # vision_embeddings (audio in KV)
+                    torch.empty(0, dtype=torch.bool),      # vision_mask
+                )
+                is_run_on_neuron = self.fused_spec_model.is_neuron()
+            return outputs, is_run_on_neuron
 
         if self._is_prefill(position_ids):
             outputs = self.context_encoding_model(
