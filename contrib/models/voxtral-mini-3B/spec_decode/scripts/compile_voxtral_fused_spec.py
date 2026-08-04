@@ -24,7 +24,7 @@ TARGET = "mistralai/Voxtral-Mini-3B-2507"
 DRAFT = "jburtoft/Voxtral-Mini-3B-2507-draft-4layer"
 
 
-def build_config(target_text, draft_text, K, tp=4, batch=1, seq_len=768, n_pos=768, dtype=torch.bfloat16):
+def build_config(target_text, draft_text, K, tp=4, batch=1, seq_len=768, n_pos=768, dtype=torch.bfloat16, extra_flags=None):
     from modeling_voxtral import VoxtralInferenceConfig, VoxtralForCausalLM
 
     with open(os.path.join(target_text, "config.json")) as f:
@@ -49,6 +49,8 @@ def build_config(target_text, draft_text, K, tp=4, batch=1, seq_len=768, n_pos=7
         nc.enable_fused_speculation = True
         nc.speculation_length = K
         nc.spec_batch_size = batch
+        for k, v in (extra_flags or {}).items():
+            setattr(nc, k, v)
 
     # Draft PixtralInferenceConfig -> use its text_config as the draft_config
     draft_cfg = VoxtralInferenceConfig(
@@ -60,6 +62,8 @@ def build_config(target_text, draft_text, K, tp=4, batch=1, seq_len=768, n_pos=7
     draft_text_cfg.neuron_config.enable_fused_speculation = False
     draft_text_cfg.neuron_config.speculation_length = 0
     draft_text_cfg.neuron_config.spec_batch_size = batch
+    for k, v in (extra_flags or {}).items():
+        setattr(draft_text_cfg.neuron_config, k, v)
 
     from modeling_voxtral import VoxtralTextModel
     fused = FusedSpecNeuronConfig(
