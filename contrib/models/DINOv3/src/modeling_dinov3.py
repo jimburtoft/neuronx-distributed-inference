@@ -291,6 +291,17 @@ def benchmark_dataparallel(
         dim=0,
     )
 
+    # CRITICAL: torch_neuronx.DataParallel defaults num_workers to 2 regardless
+    # of core count. When device IDs are consecutive, _load_modules() batch-loads
+    # into a single module object and sets num_workers = 2 * 1 = 2, so
+    # parallel_apply()'s ThreadPoolExecutor serializes all but 2 core dispatches.
+    # Measured on inf2.24xlarge with ViT-L over 12 cores:
+    #   num_workers=2 (default) -> 155.7 img/s  (2.39x single-core)
+    #   num_workers=12 (fixed)  -> 806.2 img/s (12.38x single-core)  = 5.18x
+    # num_workers is NOT a constructor argument; it must be set after init.
+    # Raising it above num_cores gives no further benefit (16 -> 802.7 img/s).
+    model_dp.num_workers = num_cores
+
     results = {}
     for bs in batch_sizes:
         dp_input = torch.randn(bs, 3, img_size, img_size)
