@@ -168,20 +168,45 @@ The kernel remains in `src/nki_gelu_trace.py` as a **reference implementation** 
 `nki_jit` calling convention for `torch_neuronx.trace()` -- it is not wired into
 `trace_dinov3()` and should not be enabled without re-measuring.
 
-### Alternative: PyTorch Native is ~2x faster for ViT-only BF16 inference
+### Alternative: PyTorch Native -- faster for ViT, SLOWER for ConvNeXt
 
-`torch.compile(backend="neuron")` (PyTorch Native) was evaluated on inf2 as an alternative
-to `torch_neuronx.trace()`. It is **1.90-2.28x faster** single-core at BF16, with
-**5-10x faster compiles**, and is numerically sound (cos_sim 0.999996 vs CPU FP32):
+`torch.compile(backend="neuron")` (PyTorch Native, Beta 6 / SDK 2.32) was measured against
+`torch_neuronx.trace()` on inf2. It is numerically sound (cos_sim 0.999996 vs CPU FP32) and
+**the verdict splits by architecture** -- do not assume the ViT result generalizes.
 
-| Model | trace (FP32 + matmult) | PyTorch Native (BF16) | Speedup |
-|-------|-----------------------:|----------------------:|--------:|
-| ViT-S/16 | 416.2 img/s | **949.2** | 2.28x |
-| ViT-B/16 | 213.1 img/s | **433.7** | 2.04x |
-| ViT-L/16 | 71.8 img/s | **136.2** | 1.90x |
+Per-instance, **inf2.24xlarge (12 NeuronCores)**, each side at its own best batch size:
 
-**The gain is a compilation-path effect that only appears in BF16**, which is worth knowing
-before trying to chase it from the trace side:
+| Model | trace (FP32 + matmult) | PyTorch Native (BF16) | Ratio | Use |
+|-------|----------------------:|----------------------:|------:|-----|
+| ViT-S/16 | 5,151.7 | **8,118.1** | 1.58x | **Native** |
+| ViT-B/16 | 2,562.8 | **4,176.3** | 1.63x | **Native** |
+| ViT-L/16 | 940.4 | **1,542.3** | 1.64x | **Native** |
+| ConvNeXt-T | **3,192.2** | 2,550.9 | 0.80x | **trace** |
+| ConvNeXt-B | **1,716.3** | 1,320.1 | 0.77x | **trace** |
+
+**ConvNeXt is 1.25-1.30x FASTER on the traced path.** Batching does not rescue it on Native
+(ConvNeXt-T: 2,335.7 / 2,529.4 / 2,550.9 img/s at BS=1/4/8 -- still short of trace's 3,192.2).
+The conv lowering evidently does not benefit from `torch.compile` the way the transformer
+ops do.
+
+#### Native multi-core scaling is essentially perfect
+
+ViT-L BF16 BS=1, independent worker processes, one per core:
+
+| Cores | img/s | Scaling | Efficiency | p50 (ms) |
+|------:|------:|--------:|-----------:|---------:|
+| 1 | 103.8 | 1.00x | 100.0% | 10.84 |
+| 2 | 206.5 | 1.99x | 99.5% | 10.90 |
+| 4 | 413.3 | 3.98x | 99.5% | 10.87 |
+| 8 | 825.4 | 7.95x | 99.4% | 10.96 |
+| **12** | **1,237.5** | **11.92x** | **99.3%** | 10.90 |
+
+**99.3% efficiency at 12 cores with latency flat at ~10.9 ms.** Per-core replicas are fully
+independent, so per-instance throughput is just (per-core rate) x (core count).
+
+#### The gain is a compilation-path effect that only appears in BF16
+
+Single core, ViT-L / ViT-B:
 
 | | ViT-L | ViT-B |
 |---|---:|---:|
@@ -189,18 +214,19 @@ before trying to chase it from the trace side:
 | trace BF16 -> Native BF16 (matched precision) | **1.70x** | **1.99x** |
 | trace FP32 -> Native FP32 | **0.73x** | **0.86x** |
 
-So tracing BF16 weights is **not** a substitute -- it only buys 2-12%, because
-`--auto-cast=matmult` already runs the matmuls in bf16. And at FP32, Native is *slower*
-than trace.
+So tracing BF16 weights is **not** a shortcut to the same gain -- it only buys 2-12%, because
+`--auto-cast=matmult` already runs the matmuls in bf16. And at FP32, Native is *slower* than
+trace.
 
-**This contrib intentionally stays on `torch_neuronx.trace()`:**
+#### This contrib intentionally stays on `torch_neuronx.trace()`
+
 - **ViT-7B has no Native path here.** TP uses `neuronx-distributed` ModelBuilder, which is **not present on SDK 2.32**, and trace+NxD measured 1.83x *faster* than Native for ViT-7B TP elsewhere. Switching would regress the largest model and lose the max-model-size result.
-- PyTorch Native is **beta software in a private container** whose `:latest` tag has repointed three times.
-- ConvNeXt and ViT-H+ were not tested on Native.
+- **ConvNeXt would regress 1.25-1.30x** (measured above).
+- PyTorch Native is **beta software in a private ECR container** whose `:latest` tag has repointed three times.
+- ViT-H+ was not tested on Native.
 
-Use PyTorch Native if you need ViT-S/B/L BF16 throughput and can accept beta tooling;
-otherwise the traced path here is the supported option.
-
+Use PyTorch Native for **ViT-S/B/L BF16** when a ~1.6x matters and beta tooling is
+acceptable. Use the traced path for ConvNeXt, ViT-7B, and anything needing a released SDK.
 
 ### Critical: `torch_neuronx.DataParallel` defaults to 2 worker threads
 
@@ -234,14 +260,15 @@ With the fix, `DataParallel` (806.2 img/s) comes within **14%** of independent w
 
 1. **`--auto-cast=matmult` is critical**: FP32 models get 50-60% speedup with matmult bf16 autocast, consistent with SigLIP and MoLFormer results
 2. **Inferentia2 runs the entire DINOv3 family**, including ViT-7B at TP=2 -- and all of it fits on a single **inf2.xlarge** (see "Maximum model size on Inferentia2")
-3. **A custom NKI GELU kernel does NOT help** -- 13 of 14 model/batch configurations regress 5-15%, despite being numerically exact. The compiler already fuses GELU into the surrounding GEMMs (see "Tested and rejected: NKI exact-erf GELU kernel")
-4. **`DataParallel` needs `num_workers = num_cores`.** The library default of 2 costs **5.18x** on 12 inf2 cores (155.7 -> 806.2 img/s) and **1.82-1.87x** on 4 trn2 cores. Single largest configuration issue found -- it also invalidated the previous trn2 table, which was understated 4.2-5.4x
-5. **Inline weights into the NEFF.** `inline_weights=False` costs **6.8x** on inf2 (ViT-L 56.9 -> 8.4 img/s)
-6. **Optimal batch size is model-dependent**: small models (ViT-S/B, ConvNeXt-T) peak at BS=1; large models must batch -- **ViT-H+ gains 6.8x from BS=1 -> BS=4**
-7. **inf2.xlarge delivers essentially full per-core performance** (0.83-0.99x of inf2.24xlarge). Buy cores for throughput, not efficiency
-8. **ViT-H+ is not fundamentally bandwidth-starved.** Its poor BS=1 number (5.1 img/s/core) is mostly a batching artifact: BS=4 reaches 34.6 img/s on one core
-9. **ViT-7B requires TP>=2 on inf2**: at TP=1 the runtime reaches 15.95 GB of the 16 GB core and OOMs. TP must be a power of 2
-10. **ConvNeXt is now competitive.** The older claim that "ViT is 1.7x faster than ConvNeXt" no longer holds on SDK 2.31. At the only near-matched pair (ViT-B 85.7M vs ConvNeXt-B 87.6M) **ViT-B is 1.53x faster** on inf2.xlarge (421.4 vs 275.7 img/s) -- ViT still wins at equal size, but by less than before
+3. **PyTorch Native is 1.58-1.64x faster for ViT but 1.25-1.30x SLOWER for ConvNeXt.** The verdict splits by architecture -- do not generalize from one. Native multi-core scaling is 99.3% efficient at 12 cores
+4. **A custom NKI GELU kernel does NOT help** -- 13 of 14 model/batch configurations regress 5-15%, despite being numerically exact. The compiler already fuses GELU into the surrounding GEMMs (see "Tested and rejected: NKI exact-erf GELU kernel")
+5. **`DataParallel` needs `num_workers = num_cores`.** The library default of 2 costs **5.18x** on 12 inf2 cores (155.7 -> 806.2 img/s) and **1.82-1.87x** on 4 trn2 cores. Single largest configuration issue found -- it also invalidated the previous trn2 table, which was understated 4.2-5.4x
+6. **Inline weights into the NEFF.** `inline_weights=False` costs **6.8x** on inf2 (ViT-L 56.9 -> 8.4 img/s)
+7. **Optimal batch size is model-dependent**: small models (ViT-S/B, ConvNeXt-T) peak at BS=1; large models must batch -- **ViT-H+ gains 6.8x from BS=1 -> BS=4**
+8. **inf2.xlarge delivers essentially full per-core performance** (0.83-0.99x of inf2.24xlarge). Buy cores for throughput, not efficiency
+9. **ViT-H+ is not fundamentally bandwidth-starved.** Its poor BS=1 number (5.1 img/s/core) is mostly a batching artifact: BS=4 reaches 34.6 img/s on one core
+10. **ViT-7B requires TP>=2 on inf2**: at TP=1 the runtime reaches 15.95 GB of the 16 GB core and OOMs. TP must be a power of 2
+11. **ConvNeXt is now competitive.** The older claim that "ViT is 1.7x faster than ConvNeXt" no longer holds on SDK 2.31. At the only near-matched pair (ViT-B 85.7M vs ConvNeXt-B 87.6M) **ViT-B is 1.53x faster** on inf2.xlarge (421.4 vs 275.7 img/s) -- ViT still wins at equal size, but by less than before
 
 ### Benchmark: Trainium2 (trn2.3xlarge, SDK 2.31)
 
