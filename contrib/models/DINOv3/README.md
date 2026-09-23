@@ -168,6 +168,40 @@ The kernel remains in `src/nki_gelu_trace.py` as a **reference implementation** 
 `nki_jit` calling convention for `torch_neuronx.trace()` -- it is not wired into
 `trace_dinov3()` and should not be enabled without re-measuring.
 
+### Alternative: PyTorch Native is ~2x faster for ViT-only BF16 inference
+
+`torch.compile(backend="neuron")` (PyTorch Native) was evaluated on inf2 as an alternative
+to `torch_neuronx.trace()`. It is **1.90-2.28x faster** single-core at BF16, with
+**5-10x faster compiles**, and is numerically sound (cos_sim 0.999996 vs CPU FP32):
+
+| Model | trace (FP32 + matmult) | PyTorch Native (BF16) | Speedup |
+|-------|-----------------------:|----------------------:|--------:|
+| ViT-S/16 | 416.2 img/s | **949.2** | 2.28x |
+| ViT-B/16 | 213.1 img/s | **433.7** | 2.04x |
+| ViT-L/16 | 71.8 img/s | **136.2** | 1.90x |
+
+**The gain is a compilation-path effect that only appears in BF16**, which is worth knowing
+before trying to chase it from the trace side:
+
+| | ViT-L | ViT-B |
+|---|---:|---:|
+| trace FP32 -> trace BF16 | 1.12x | 1.02x |
+| trace BF16 -> Native BF16 (matched precision) | **1.70x** | **1.99x** |
+| trace FP32 -> Native FP32 | **0.73x** | **0.86x** |
+
+So tracing BF16 weights is **not** a substitute -- it only buys 2-12%, because
+`--auto-cast=matmult` already runs the matmuls in bf16. And at FP32, Native is *slower*
+than trace.
+
+**This contrib intentionally stays on `torch_neuronx.trace()`:**
+- **ViT-7B has no Native path here.** TP uses `neuronx-distributed` ModelBuilder, which is **not present on SDK 2.32**, and trace+NxD measured 1.83x *faster* than Native for ViT-7B TP elsewhere. Switching would regress the largest model and lose the max-model-size result.
+- PyTorch Native is **beta software in a private container** whose `:latest` tag has repointed three times.
+- ConvNeXt and ViT-H+ were not tested on Native.
+
+Use PyTorch Native if you need ViT-S/B/L BF16 throughput and can accept beta tooling;
+otherwise the traced path here is the supported option.
+
+
 ### Critical: `torch_neuronx.DataParallel` defaults to 2 worker threads
 
 **`torch_neuronx.DataParallel` sets `num_workers = 2` regardless of how many NeuronCores you give it.** When device IDs are consecutive (the default), `_load_modules()` batch-loads into a single module object and sets `num_workers = 2 * 1 = 2`, so `parallel_apply()`'s `ThreadPoolExecutor` serializes all but two core dispatches.
