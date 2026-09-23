@@ -235,7 +235,7 @@ With the fix, `DataParallel` (806.2 img/s) comes within **14%** of independent w
 1. **`--auto-cast=matmult` is critical**: FP32 models get 50-60% speedup with matmult bf16 autocast, consistent with SigLIP and MoLFormer results
 2. **Inferentia2 runs the entire DINOv3 family**, including ViT-7B at TP=2 -- and all of it fits on a single **inf2.xlarge** (see "Maximum model size on Inferentia2")
 3. **A custom NKI GELU kernel does NOT help** -- 13 of 14 model/batch configurations regress 5-15%, despite being numerically exact. The compiler already fuses GELU into the surrounding GEMMs (see "Tested and rejected: NKI exact-erf GELU kernel")
-4. **`DataParallel` needs `num_workers = num_cores`.** The library default of 2 costs **5.18x** on 12 cores (155.7 -> 806.2 img/s). This is the single largest configuration issue found
+4. **`DataParallel` needs `num_workers = num_cores`.** The library default of 2 costs **5.18x** on 12 inf2 cores (155.7 -> 806.2 img/s) and **1.82-1.87x** on 4 trn2 cores. Single largest configuration issue found -- it also invalidated the previous trn2 table, which was understated 4.2-5.4x
 5. **Inline weights into the NEFF.** `inline_weights=False` costs **6.8x** on inf2 (ViT-L 56.9 -> 8.4 img/s)
 6. **Optimal batch size is model-dependent**: small models (ViT-S/B, ConvNeXt-T) peak at BS=1; large models must batch -- **ViT-H+ gains 6.8x from BS=1 -> BS=4**
 7. **inf2.xlarge delivers essentially full per-core performance** (0.83-0.99x of inf2.24xlarge). Buy cores for throughput, not efficiency
@@ -243,26 +243,65 @@ With the fix, `DataParallel` (806.2 img/s) comes within **14%** of independent w
 9. **ViT-7B requires TP>=2 on inf2**: at TP=1 the runtime reaches 15.95 GB of the 16 GB core and OOMs. TP must be a power of 2
 10. **ConvNeXt is now competitive.** The older claim that "ViT is 1.7x faster than ConvNeXt" no longer holds on SDK 2.31. At the only near-matched pair (ViT-B 85.7M vs ConvNeXt-B 87.6M) **ViT-B is 1.53x faster** on inf2.xlarge (421.4 vs 275.7 img/s) -- ViT still wins at equal size, but by less than before
 
-### Benchmark: Trainium2 (trn2.3xlarge, LNC=2)
+### Benchmark: Trainium2 (trn2.3xlarge, SDK 2.31)
 
-Retained for reference. These are historical numbers from SDK 2.28/2.29 and use
-`torch_neuronx.DataParallel`, so the DP=4 column understates the hardware for the same
-reason described above.
+Re-measured 2026-09-23 with independent worker processes and a batch-size sweep.
+trn2.3xlarge is one Trainium2 device: LNC=2 (default) gives 4 logical cores at 24 GB each,
+LNC=1 gives 8 at 12 GB.
 
-| Model | Compile Time | 1-Core (img/s) | DP=4 Peak (img/s) |
-|-------|-------------:|----------------:|-------------------:|
-| ViT-S/16 | 84s | 367 | 722.8 |
-| ViT-B/16 | 89s | 214.4 | 422.9 |
-| ViT-L/16 | 123s | 87.6 | 174.7 |
-| ViT-H+/16 | 688s | 5.2 | 10.5 |
-| ViT-7B/16 | 5.9s | OOM | 38.8 (TP=4) |
-| ConvNeXt-T | 34s | 264.4 | 522.6 |
-| ConvNeXt-B | 63s | 130 | 257.8 |
+| Model | LNC=2 (4 cores) | LNC=1 (8 cores) | Best | Winner |
+|-------|----------------:|----------------:|-----:|--------|
+| ViT-S/16 | 3,780.4 | **3,893.7** | 3,893.7 | LNC=1 |
+| ConvNeXt-T | 2,310.9 | **2,401.8** | 2,401.8 | LNC=1 |
+| ViT-B/16 | 1,930.5 | **1,969.5** | 1,969.5 | LNC=1 |
+| ConvNeXt-B | 1,285.6 | 1,298.6 | 1,298.6 | tie |
+| ViT-L/16 | 348.8 | **739.7** | 739.7 | **LNC=1 (2.12x)** |
 
-*ViT-S/L/H+/7B and ConvNeXt-B from SDK 2.28; ViT-B and ConvNeXt-T validated on SDK 2.29.*
+**LNC=1 is the better default on trn2 for every model tested.** The margin is small
+(1.0-1.04x) except for **ViT-L, where LNC=1 is 2.12x faster** -- consistent with the earlier
+finding that ViT-L is memory-bandwidth bound and benefits from the smaller per-core NEFF.
 
-On trn2, **LNC=1 outperforms LNC=2 for ViT-L** (207.6 vs 114.7 img/s peak, 1.81x) because
-the model is memory-bandwidth bound and the LNC=1 NEFF is smaller (468 MB vs 935 MB).
+#### These numbers supersede the previous trn2 table, which was understated 4.2-5.4x
+
+The prior table reported DP=4 peaks of ViT-S 722.8 / ViT-B 422.9 / ViT-L 174.7 /
+ConvNeXt-T 522.6 / ConvNeXt-B 257.8 img/s. Those were measured with
+`torch_neuronx.DataParallel` at its **broken `num_workers=2` default** and at **BS=1 only**.
+Re-measured properly they are **4.23x to 5.39x higher**.
+
+The `num_workers` defect reproduces on trn2 exactly as on inf2 (LNC=2, 4 cores, BS=1):
+
+| Model | `num_workers=2` (default) | `num_workers=4` (fixed) | Gain |
+|-------|--------------------------:|------------------------:|-----:|
+| ViT-S/16 | 651.4 img/s | 1,216.0 | 1.87x |
+| ViT-B/16 | 400.1 img/s | 726.8 | 1.82x |
+| ViT-L/16 | 164.4 img/s | 305.8 | 1.86x |
+
+Note ViT-L's broken-default figure (164.4) closely reproduces the old table's 174.7 --
+confirming the historical numbers were measured with the defect.
+
+#### Setting LNC on trn2: `NEURON_CC_FLAGS` is NOT enough
+
+`trace_dinov3()` passes an explicit `compiler_args` list to `torch_neuronx.trace()`, which
+**overrides the `NEURON_CC_FLAGS` environment variable**. Exporting
+`NEURON_CC_FLAGS="--lnc=1"` therefore has no effect -- the NEFF compiles at the default
+`--lnc=2` and the runtime rejects it at load:
+
+```
+NRT:nrt_load_util  Mismatch detected between Runtime configuration and NEFF.
+    Runtime currently configured with `NEURON_LOGICAL_NC_CONFIG=1`
+    but NEFF ... was compiled with `--lnc=2`.
+```
+
+Pass the target through `compiler_args` instead, alongside the runtime variable:
+
+```python
+compiler_args = COMPILER_ARGS_VIT + ["--logical-nc-config", "1"]   # compile-time
+# and export NEURON_LOGICAL_NC_CONFIG=1                            # runtime
+```
+
+ViT-H+ and ViT-7B were not re-measured on trn2 in this round; their SDK 2.28 figures were
+ViT-H+ 10.5 img/s (DP=4, BS=1 -- understated for the same two reasons) and ViT-7B 38.8 img/s
+(TP=4).
 
 ## Compatibility
 
