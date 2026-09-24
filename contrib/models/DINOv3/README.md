@@ -275,7 +275,7 @@ With the fix, `DataParallel` (806.2 img/s) comes within **14%** of independent w
 2. **Inferentia2 runs the entire DINOv3 family**, including ViT-7B at TP=2 -- and all of it fits on a single **inf2.xlarge** (see "Maximum model size on Inferentia2")
 3. **PyTorch Native is faster for every ViT (1.58-1.64x, and 9.2x for ViT-H+ at BS=1) but 1.25-1.30x SLOWER for ConvNeXt.** The verdict splits by architecture. Native multi-core scaling is 99.3% efficient at 12 cores
 4. **A custom NKI GELU kernel does NOT help** -- 13 of 14 model/batch configurations regress 5-15%, despite being numerically exact. The compiler already fuses GELU into the surrounding GEMMs (see "Tested and rejected: NKI exact-erf GELU kernel")
-5. **`DataParallel` needs `num_workers = num_cores`.** The library default of 2 costs **5.18x** on 12 inf2 cores (155.7 -> 806.2 img/s) and **1.82-1.87x** on 4 trn2 cores. Single largest configuration issue found -- it also invalidated the previous trn2 table, which was understated 4.2-5.4x
+5. **`DataParallel` needs `num_workers = num_cores`.** The library default of 2 costs **1.82-1.87x** on 4 trn2 cores and **5.18x** on 12 inf2 cores (the penalty scales with core count, since the default caps concurrency at 2). This is an API fix for anyone using `DataParallel` -- it does not affect the tables in this README, which all use independent worker processes
 6. **Inline weights into the NEFF.** `inline_weights=False` costs **6.8x** on inf2 (ViT-L 56.9 -> 8.4 img/s)
 7. **Optimal batch size is model-dependent**: small models (ViT-S/B, ConvNeXt-T) peak at BS=1; large models must batch -- **ViT-H+ gains 6.8x from BS=1 -> BS=4**
 8. **inf2.xlarge delivers essentially full per-core performance** (0.83-0.99x of inf2.24xlarge). Buy cores for throughput, not efficiency
@@ -304,11 +304,26 @@ finding that ViT-L is memory-bandwidth bound and benefits from the smaller per-c
 #### These numbers supersede the previous trn2 table, which was understated 4.2-5.4x
 
 The prior table reported DP=4 peaks of ViT-S 722.8 / ViT-B 422.9 / ViT-L 174.7 /
-ConvNeXt-T 522.6 / ConvNeXt-B 257.8 img/s. Those were measured with
-`torch_neuronx.DataParallel` at its **broken `num_workers=2` default** and at **BS=1 only**.
-Re-measured properly they are **4.23x to 5.39x higher**.
+ConvNeXt-T 522.6 / ConvNeXt-B 257.8 img/s, measured with `torch_neuronx.DataParallel` at
+its **broken `num_workers=2` default** and at **BS=1 only**. Re-measured properly they are
+**4.23x to 5.39x higher**.
 
-The `num_workers` defect reproduces on trn2 exactly as on inf2 (LNC=2, 4 cores, BS=1):
+**Two independent causes were at work, and their relative weight differs sharply by model** --
+worth knowing, because the fix differs. Decomposing ViT-L:
+
+| Step | img/s | Factor |
+|------|------:|-------:|
+| old published (DP, `num_workers=2`, BS=1) | 174.7 | -- |
+| re-measured, same config | 164.4 | reproduces the old value |
+| + `num_workers=4` | 305.8 | **1.86x** |
+| + independent processes and batch sweep | 348.8 | 1.14x |
+
+For **ViT-L the `num_workers` defect is the dominant term** (1.86x of a 2.00x gap). For
+**ViT-H+ it contributes nothing**: BS=1 re-measures at 11.2 against an old value of 10.5,
+and the entire 10.7x comes from batching (see below). Do not read the 4.2-5.4x range as a
+single effect.
+
+The `num_workers` defect itself reproduces on trn2 as on inf2 (LNC=2, 4 cores, BS=1):
 
 | Model | `num_workers=2` (default) | `num_workers=4` (fixed) | Gain |
 |-------|--------------------------:|------------------------:|-----:|
