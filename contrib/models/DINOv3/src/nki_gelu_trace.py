@@ -13,11 +13,11 @@ STATUS: REFERENCE IMPLEMENTATION ONLY -- MEASURED SLOWER, DO NOT ENABLE.
     calling convention for torch_neuronx.trace() -- see the five API differences
     documented below, which are not covered in the public NKI docs.
 
-This is a rewrite of dinov3_native_training/src/nki/gelu_fused.py using the
-OLDER NKI calling convention that `torch_neuronx.trace()` actually supports.
+Written against the OLDER NKI calling convention, which is what
+`torch_neuronx.trace()` supports.
 
-Why the rewrite was necessary. The training project's kernel targets the
-standalone `nki` wheel and the PyTorch-Native dispatch path:
+Why that matters: the same kernel written for the standalone `nki` wheel does NOT
+work here. That form looks like:
     import nki                    # standalone wheel
     @nki.jit
     def gelu_fwd(input_hbm):

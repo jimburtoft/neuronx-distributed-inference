@@ -8,8 +8,8 @@ Why this is worth testing even though a prior attempt regressed 24%:
   - neuronx-cc lowers exact erf-GELU as 1664 matmuls + 256 reciprocals + 2816
     vector ops; the kernel does it in 26 activation ops.
   - The prior -24% inference result used a DIFFERENT kernel (tanh approximation)
-    through a DIFFERENT dispatch path (wrap_nki HOP under torch.compile) with
-    F.pad-to-128. The training project's direct kernel gave +6% forward-positive.
+    through a DIFFERENT dispatch path with F.pad-to-128, so it does not settle
+    the exact-erf question on this path.
 
 Three gates, in order. Stop at the first failure.
   Gate 1: does `nl.gelu` exist and produce exact results on gen2 (inf2)?
@@ -49,7 +49,7 @@ def build_kernel():
 
     See nki_gelu_trace.py for why the older nki_jit convention
     (neuronxcc.nki + output-as-parameter + nl.load/nl.store) is required
-    instead of the training project's standalone-nki / shared_hbm-return form.
+    instead of the standalone-nki / shared_hbm-return form.
     """
     from nki_gelu_trace import NkiGELU, nki_gelu
     return nki_gelu
