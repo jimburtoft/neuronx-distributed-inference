@@ -91,7 +91,22 @@ def _nki_kernel_triangular_attn(q, k, v, tri_bias, mask, scale):
     q_nki = q[0].permute(0, 2, 1, 3).contiguous().reshape(N, N, Hd)
     k_nki = k[0].permute(0, 2, 1, 3).contiguous().reshape(N, N, Hd)
     v_nki = v[0].permute(0, 2, 1, 3).contiguous().reshape(N, N, Hd)
-    bias_nki = tri_bias[0, 0].permute(1, 2, 0).contiguous()
+    bias_nki = tri_bias[0, 0].permute(1, 2, 0).contiguous()  # [I(query), J(key), H]
+
+    # Padding correctness: the NKI attention kernel consumes ONLY `bias`, not `mask`, so
+    # padded KEY positions would otherwise receive softmax weight and leak into real tokens.
+    # Fold the key-padding mask into the additive bias (large negative on pad keys -> ~0
+    # softmax weight). `mask` is [B, I, 1, 1, J], 1 = real key, 0 = pad key.
+    #
+    # IMPORTANT: apply this UNCONDITIONALLY (no data-dependent Python `if`). Under
+    # torch_neuronx.trace the graph is captured once with the compile-time (all-ones) mask;
+    # a Python-level `if (key_mask==0).any()` would bake in "no masking" and the runtime
+    # padded mask could never re-enable it. Adding `(1 - key_mask) * neg` is a mathematical
+    # no-op when the mask is all-ones (offset 0), so it is always safe to include in the graph.
+    if mask is not None:
+        key_mask = mask[0, :, 0, 0, :].amax(dim=0).to(bias_nki.dtype)  # [J], 1=real 0=pad
+        neg = torch.tensor(-30000.0, dtype=bias_nki.dtype)  # bf16-safe large negative
+        bias_nki = bias_nki + (1.0 - key_mask).view(1, N, 1) * neg
 
     out_nki = triangular_attention_fwd(q_nki, k_nki, v_nki, bias_nki, scale)
 
@@ -184,6 +199,55 @@ def patch_boltz2_with_nki_kernels():
 # ========================================================================
 # Pairformer layer wrapper
 # ========================================================================
+
+
+# ========================================================================
+# Sequence-length alignment padding
+# ========================================================================
+#
+# The NKI triangular kernels tile the sequence axis at P_MAX=128 and REQUIRE N to
+# be a multiple of 128 (they assert `N % 128 == 0`). Boltz-2 runs ragged at the
+# native token count N, so any non-128 N must be padded up to the next multiple of
+# 128 before the pairformer can run.
+#
+# Correctness: pad tokens are made inert two ways -- the tri-mul kernel masks pad
+# COLUMNS via `mask`, and the tri-attention kernel (which reads only `bias`) has the
+# key-padding mask folded into its additive bias in _nki_kernel_triangular_attn
+# above. Extending mask/pair_mask with ZEROS drives both. Validated: padded 186->256
+# matches the CPU reference (s_cos/z_cos > 0.99).
+
+KERNEL_ALIGN = 128
+
+
+def next_aligned_n(n: int, align: int = KERNEL_ALIGN) -> int:
+    """Round token count `n` up to the next multiple of `align` (default 128).
+
+    128 is REQUIRED by this port's NKI triangular kernels (they assert
+    `N % 128 == 0`). Do not pass a smaller alignment for the pairformer path.
+    """
+    if align <= 1:
+        return n
+    return ((n + align - 1) // align) * align
+
+
+def pad_pairformer_inputs(s, z, mask, pair_mask, target_n=None, align=KERNEL_ALIGN):
+    """Pad pairformer inputs from native N up to a tile-aligned length.
+
+    Zero-pads the token axes of s/z and extends mask/pair_mask with ZEROS so the pad
+    tokens are inert. Returns (s_p, z_p, mask_p, pair_mask_p, n_real).
+    """
+    n_real = s.shape[1]
+    tgt = target_n if target_n is not None else next_aligned_n(n_real, align)
+    if tgt < n_real:
+        raise ValueError(f"target_n={tgt} < real N={n_real}")
+    pad = tgt - n_real
+    if pad == 0:
+        return s, z, mask, pair_mask, n_real
+    s_p = F.pad(s, (0, 0, 0, pad))
+    z_p = F.pad(z, (0, 0, 0, pad, 0, pad))
+    mask_p = F.pad(mask, (0, pad))
+    pair_mask_p = F.pad(pair_mask, (0, pad, 0, pad))
+    return s_p, z_p, mask_p, pair_mask_p, n_real
 
 
 class SinglePairformerLayerWrapper(torch.nn.Module):
@@ -291,7 +355,7 @@ def compile_pairformer_weight_replaced(model, N, target="trn2"):
     return traced_layers, compile_time, total_swap_time
 
 
-def run_pairformer_layers(traced_layers, s, z, mask, pair_mask):
+def run_pairformer_layers(traced_layers, s, z, mask, pair_mask, pad_align=KERNEL_ALIGN):
     """Run all traced pairformer layers sequentially.
 
     Args:
@@ -300,11 +364,21 @@ def run_pairformer_layers(traced_layers, s, z, mask, pair_mask):
         z: [1, N, N, 128] pair representation, bfloat16
         mask: [1, N] padding mask, float32
         pair_mask: [1, N, N] pair padding mask, float32
+        pad_align: round N up to this multiple (default 128, REQUIRED by the NKI
+            kernels), pad, run, and slice outputs back to the real N. The layers must
+            be compiled at the resulting padded N. Set 0/1 to disable (only valid if
+            N is already a multiple of 128).
 
     Returns:
-        s_out, z_out: final pairformer outputs
+        s_out, z_out: final pairformer outputs, sliced back to the real N
         total_time: total inference time in seconds
     """
+    n_real = s.shape[1]
+    if pad_align and pad_align > 1:
+        s, z, mask, pair_mask, n_real = pad_pairformer_inputs(
+            s, z, mask, pair_mask, align=pad_align
+        )
+
     s_curr = s.to(torch.bfloat16)
     z_curr = z.to(torch.bfloat16)
 
@@ -314,5 +388,9 @@ def run_pairformer_layers(traced_layers, s, z, mask, pair_mask):
         s_curr = s_curr.to(torch.bfloat16)
         z_curr = z_curr.to(torch.bfloat16)
     total_time = time.time() - t0
+
+    if s_curr.shape[1] != n_real:
+        s_curr = s_curr[:, :n_real]
+        z_curr = z_curr[:, :n_real, :n_real]
 
     return s_curr, z_curr, total_time

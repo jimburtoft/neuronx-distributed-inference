@@ -1,5 +1,7 @@
 from .modeling_boltz2 import (
     compile_pairformer_weight_replaced,
+    next_aligned_n,
+    pad_pairformer_inputs,
     patch_boltz2_with_nki_kernels,
     run_pairformer_layers,
     SinglePairformerLayerWrapper,

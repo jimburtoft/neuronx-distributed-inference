@@ -149,6 +149,42 @@ s_out, z_out, latency = run_pairformer_layers(traced_layers, s, z, mask, pair_ma
 print(f"Inference: {latency:.1f}s ({latency/64*1000:.0f}ms/layer)")
 ```
 
+### Sequence-Length Alignment (automatic padding)
+
+The NKI triangular kernels tile the sequence axis at `P_MAX=128` and **require `N` to be a
+multiple of 128** (they assert `N % 128 == 0`). Boltz-2 runs ragged at the native token count,
+so any non-128 `N` must be padded up to the next multiple of 128 before the pairformer can run.
+
+`run_pairformer_layers()` does this automatically (`pad_align=128` by default): it pads the
+inputs up to the next multiple of 128, runs, and slices the outputs back to the real `N`.
+
+```python
+N_real = 186
+traced_layers, *_ = compile_pairformer_weight_replaced(
+    model, N=next_aligned_n(N_real, 128), target="trn2"   # 256
+)
+s = torch.randn(1, N_real, 384, dtype=torch.bfloat16) * 0.1
+z = torch.randn(1, N_real, N_real, 128, dtype=torch.bfloat16) * 0.1
+mask = torch.ones(1, N_real, dtype=torch.float32)
+pair_mask = torch.ones(1, N_real, N_real, dtype=torch.float32)
+
+# pad_align=128 (default): 186 -> 256 internally, outputs sliced back to 186.
+s_out, z_out, latency = run_pairformer_layers(traced_layers, s, z, mask, pair_mask)
+assert s_out.shape[1] == N_real
+```
+
+**Correctness:** pad tokens are inert. The tri-mul kernel masks pad columns via `mask`; the
+tri-attention kernel (which reads only the additive `bias`) has the key-padding mask folded
+into its bias inside `_nki_kernel_triangular_attn`, so padded keys get ~0 softmax weight. This
+masking is applied unconditionally so it is captured in the traced graph (a Python `if` on the
+mask would bake in the compile-time all-ones case). **Validated** on inf2 (SDK 2.28, 1 layer,
+N=186->256) against a CPU reference: `s_cos=0.999754, z_cos=0.999101` (control at native N=256:
+`0.999838 / 0.999831`). `pad_align=0` disables padding (only valid when `N` is already 128-aligned).
+
+Note: on the full Boltz-2 pipeline the non-kernel diffusion/atom stages benefit from finer
+alignment (down to 64), but this pairformer-kernel port's hard requirement is 128.
+
+
 ## Compatibility Matrix
 
 | Instance | SDK 2.28 | SDK 2.27 |
