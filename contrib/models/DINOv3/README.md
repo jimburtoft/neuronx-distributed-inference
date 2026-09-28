@@ -115,6 +115,13 @@ similarity margin is **0.00046**, versus **0.0038** when they agree -- an 8x dif
 only near-ties flip. With genuinely distinct images the margin rises to 0.011 and recall@1
 reaches **0.9844**. Report margin-aware metrics or neighbour-set overlap instead.
 
+## Reproducing these numbers
+
+Every table below was produced by a script in [`benchmark/`](benchmark/).
+**[benchmark/README.md](benchmark/README.md)** maps each table to its script, gives the exact
+command, lists the setup steps (DLAMI, swap, model source), and documents the methodology
+traps that will otherwise make your numbers disagree with these.
+
 ### Benchmark: inf2.xlarge -- maximum throughput (2 NeuronCores, SDK 2.31)
 
 inf2.xlarge is the smallest and cheapest Inferentia2 instance: **1 Inferentia2 device, 2 NeuronCores, 4 vCPU, 16 GB host RAM**. Each config below is the best of a (workers x batch size) sweep, so these are **maximum achievable** throughput, not single-point samples.
