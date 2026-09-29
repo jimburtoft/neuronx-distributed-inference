@@ -305,6 +305,7 @@ With the fix, `DataParallel` (806.2 img/s) comes within **14%** of independent w
 10. **BF16 weights are worth only 1.01-1.09x at best batch** on every other model, so FP32 + `--auto-cast=matmult` remains the default. `--auto-cast=matmult` is a no-op once weights are BF16
 11. **ViT-7B requires TP>=2 on inf2**: at TP=1 the runtime reaches 15.95 GB of the 16 GB core and OOMs. TP must be a power of 2
 12. **ConvNeXt is now competitive.** The older claim that "ViT is 1.7x faster than ConvNeXt" no longer holds on SDK 2.31. At the only near-matched pair (ViT-B 85.7M vs ConvNeXt-B 87.6M) **ViT-B is 1.53x faster** on inf2.xlarge (421.4 vs 275.7 img/s) -- ViT still wins at equal size, but by less than before
+13. **Precompute RoPE out of the traced graph -- 2.76x on ViT.** The reference-repo ViT computes 2D-axial RoPE (`torch.arange` / `torch.meshgrid` / `torch.cos` / `torch.sin` over `[H*W, D]`) *inside* `forward()` on every call; Neuron traces these poorly and they dominate the step. Baking the RoPE tables as constants (`trace_dinov3(..., precompute_rope_tables=True)`, default on) took ViT-L from **58.9 -> 162.6 img/s (2.76x)** on inf2 at FP32+matmult, closing ~90% of the gap to a hand-ported HF-arch model. **This was discovered by comparing against an NxDI autoport that precomputed RoPE by construction.** ⚠️ **LIMITATION: precomputing pins the compiled NEFF to a single image size** -- the in-graph RoPE supports variable resolution; precomputing trades that for the speedup. Compile one NEFF per resolution, or pass `precompute_rope_tables=False` for dynamic-resolution inference. ConvNeXt has no RoPE and is unaffected. dtype is a *minor* lever by comparison (BF16 vs FP32+matmult is ~1.0-1.6x and mostly an accuracy tradeoff) -- RoPE placement, not precision, was the dominant factor.
 
 ### Benchmark: Trainium2 (trn2.3xlarge, SDK 2.31)
 
@@ -434,10 +435,14 @@ from modeling_dinov3 import load_dinov3_model, trace_dinov3, validate_accuracy, 
 # Load model
 model = load_dinov3_model("dinov3_vitb16", repo_dir="/mnt/models/dinov3")
 
-# Compile for Neuron
+# Compile for Neuron (RoPE precomputed by default -> 2.76x; pins the NEFF to img_size=224)
 model_neuron = trace_dinov3(model, is_convnext=False, save_path="/tmp/dinov3_vit_b.pt")
 
-# Validate accuracy
+# For VARIABLE input resolution instead, keep RoPE in-graph (slower, but any H x W):
+#   model_neuron = trace_dinov3(model, is_convnext=False, precompute_rope_tables=False)
+# Or compile one NEFF per resolution you serve, passing img_size to trace_dinov3.
+
+# Validate accuracy (uses the SAME img_size the model was traced at)
 metrics = validate_accuracy(model, model_neuron)
 print(f"Cosine similarity: {metrics['cosine_sim']:.6f}")
 

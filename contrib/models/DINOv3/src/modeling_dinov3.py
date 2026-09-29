@@ -8,6 +8,10 @@ Supports two compilation paths:
 All models are encoder-only with static input shapes -- ideal for torch_neuronx.trace().
 FP32 by default; --auto-cast=matmult is critical for performance.
 
+For ViT, RoPE tables are precomputed and baked as constants by default
+(trace_dinov3(..., precompute_rope_tables=True)) -- 2.76x faster than the reference repo's
+in-graph RoPE, at the cost of pinning the NEFF to one image size. See precompute_rope().
+
 Architecture:
   - ViT: patch size 16, CLS + register/storage tokens, 2D axial RoPE, SwiGLU FFN, LayerScale
   - ConvNeXt: hierarchical conv backbone (Conv2d, GroupNorm, GELU, LayerScale)
@@ -135,6 +139,49 @@ def load_dinov3_model(hub_name: str, repo_dir: str = "/mnt/models/dinov3"):
     return model
 
 
+def precompute_rope(model: nn.Module, img_size: int = IMG_SIZE) -> bool:
+    """Hoist the ViT 2D-axial RoPE out of the traced forward (Neuron perf optimization).
+
+    The dinov3 reference-repo ViT computes RoPE INSIDE forward() on every call
+    (`rope_embed.forward` runs torch.arange / torch.meshgrid / torch.cos / torch.sin over
+    [H*W, D]). Those ops trace poorly on Neuron -- they materialize as CPU-side / vector-engine
+    work that dominates the step. Measured cost (inf2, ViT-L, FP32+matmult): leaving RoPE in-graph
+    is **2.76x slower** than precomputing it (58.9 -> 162.6 img/s).
+
+    This helper computes (sin, cos) ONCE on CPU for the given image size and replaces
+    `model.rope_embed.forward` so that the tracer bakes the RoPE tables in as constants -- no
+    in-graph arange/meshgrid/trig. Call this BEFORE trace_dinov3(..., precompute_rope=True).
+
+    ⚠️ LIMITATION -- FIXED IMAGE SIZE: baking the RoPE tables pins the compiled model to a single
+    (H, W). The in-graph RoPE the reference repo ships supports *variable* input resolution
+    (it recomputes coords for any H, W); precomputing trades that flexibility for the 2.76x speedup.
+    Compile a separate NEFF per resolution you need to serve, or keep RoPE in-graph if you require
+    dynamic-resolution inference. ConvNeXt models have no RoPE and are unaffected.
+
+    Returns True if RoPE was precomputed, False if the model has no `rope_embed` (e.g. ConvNeXt).
+    """
+    rope_embed = getattr(model, "rope_embed", None)
+    if rope_embed is None:
+        return False
+
+    patch = getattr(getattr(model, "patch_embed", None), "patch_size", None)
+    patch_size = patch[0] if isinstance(patch, (tuple, list)) else (patch or 16)
+    h = w = img_size // patch_size
+
+    with torch.no_grad():
+        sin, cos = rope_embed(H=h, W=w)  # real tables for this resolution
+    sin_c = sin.detach().clone()
+    cos_c = cos.detach().clone()
+
+    def _const_rope(*args, **kwargs):
+        # Ignore H/W: tables are pinned to img_size (see LIMITATION above).
+        return (sin_c, cos_c)
+
+    rope_embed.forward = _const_rope
+    print(f"  RoPE precomputed for {img_size}x{img_size} (H=W={h}); pinned image size.")
+    return True
+
+
 def trace_dinov3(
     model: nn.Module,
     is_convnext: bool = False,
@@ -142,6 +189,7 @@ def trace_dinov3(
     batch_size: int = BATCH_SIZE,
     save_path: Optional[str] = None,
     inline_weights: bool = True,
+    precompute_rope_tables: bool = True,
 ) -> torch.jit.ScriptModule:
     """Trace a DINOv3 model for Neuron via torch_neuronx.trace().
 
@@ -152,11 +200,19 @@ def trace_dinov3(
         batch_size: Batch size for tracing (default: 1)
         save_path: Optional path to save compiled model
         inline_weights: Whether to inline weights into NEFF (default: True)
+        precompute_rope_tables: For ViT, hoist RoPE out of the traced graph (2.76x faster,
+            but pins the compiled model to `img_size` -- see precompute_rope()). No-op for
+            ConvNeXt (no RoPE). Default True; set False to keep in-graph variable-resolution RoPE.
 
     Returns:
         Compiled Neuron model
     """
     compiler_args = COMPILER_ARGS_CONVNEXT if is_convnext else COMPILER_ARGS_VIT
+
+    # PERF: bake RoPE tables as constants for ViT (2.76x on inf2 ViT-L). Fixed image size.
+    if precompute_rope_tables and not is_convnext:
+        precompute_rope(model, img_size=img_size)
+
     example_input = torch.randn(batch_size, 3, img_size, img_size)
 
     print(f"  Tracing with compiler_args={compiler_args}")
