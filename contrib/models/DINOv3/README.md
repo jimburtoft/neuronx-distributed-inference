@@ -175,11 +175,12 @@ ViT-L 940.4 / ViT-H+ 413.7 img/s.
 
 TP=2 and TP=4 are within noise of each other; TP=8 is ~27% faster than TP=2. Compile time is dominated by the TP sharding path and is fast (6-9s) because each rank compiles a smaller graph.
 
-### Tested and rejected: NKI exact-erf GELU kernel
+### Tested and rejected: single-op NKI exact-erf GELU kernel
 
 A custom NKI kernel replacing `nn.GELU` with a single Scalar/activation-engine op was
-built, validated, and **rejected on measurement**. Recording it here so it is not
-re-attempted.
+built, validated, and **rejected on measurement**. Recording it here so a *single-op*
+GELU kernel is not re-attempted on this path. This is a result about one kernel shape --
+see the scope note at the end of this section before generalizing from it.
 
 The rationale was sound on paper: `neuronx-cc` lowers exact erf-GELU as **1664 matmuls +
 256 reciprocals + 2816 vector ops** where the kernel emits ~26 activation-table ops, and
@@ -209,13 +210,24 @@ baseline until it converges before claiming a kernel win.**
 
 Root cause of the regression: the compiler already fuses GELU into the surrounding MLP
 GEMMs, so a standalone kernel adds an HBM round-trip per call (load -> activate -> store)
-that outweighs the cheaper transcendental. This matches a prior independent finding that
-a fused-MLP NKI kernel also regressed ~23%, and the general rule that kernel *boundary
-count* dominates kernel *content* on this path.
+that outweighs the cheaper transcendental. A separate fused-MLP NKI attempt (fc1 -> GELU
+-> fc2 in one kernel) also regressed ~23%, so fusing more ops is not automatically a win.
 
 The kernel remains in `src/nki_gelu_trace.py` as a **reference implementation** of the NKI
 `nki_jit` calling convention for `torch_neuronx.trace()` -- it is not wired into
 `trace_dinov3()` and should not be enabled without re-measuring.
+
+> **Scope -- this does not show that NKI kernels cannot help DINOv3.** It shows that a
+> *single-op* kernel inserted between compiler-scheduled GEMMs loses to the compiler's own
+> fusion, because it creates a kernel boundary the compiler had already eliminated.
+> Separate work fusing whole transformer blocks into NKI -- attention + residual +
+> LayerNorm, and FFN + residual + next LayerNorm, keeping the fp32 residual stream on-chip
+> across the block -- has measured **1.5-3.4x over the compiler** on DINOv3 ViTs, with
+> *lower* numerical error than the compiler's bf16 path. That work used a different
+> compilation path and Trainium2, and has **not** been ported to `torch_neuronx.trace()`
+> or measured on Inferentia2; the five calling-convention differences documented in
+> `src/nki_gelu_trace.py` would apply to any such port. The practical rule is that kernel
+> *boundary count* dominates kernel *content*: a kernel must remove boundaries, not add one.
 
 ### Optional: BF16 weights instead of FP32 + `--auto-cast=matmult`
 
@@ -296,7 +308,7 @@ With the fix, `DataParallel` (806.2 img/s) comes within **14%** of independent w
 1. **`--auto-cast=matmult` is critical**: FP32 models get 50-60% speedup with matmult bf16 autocast, consistent with SigLIP and MoLFormer results
 2. **`torch_neuronx.trace()` miscompiles the HuggingFace `transformers` DINOv3 port** (cos 0.47-0.62 even at `--auto-cast=none`, while CPU `torch.jit.trace` is exactly 1.0). Use the `dinov3` reference-repo architecture and remap the published checkpoints into it -- see "With real pretrained weights"
 3. **Inferentia2 runs the entire DINOv3 family**, including ViT-7B at TP=2 -- and all of it fits on a single **inf2.xlarge** (see "Maximum model size on Inferentia2")
-4. **A custom NKI GELU kernel does NOT help** -- 13 of 14 model/batch configurations regress 5-15%, despite being numerically exact. The compiler already fuses GELU into the surrounding GEMMs (see "Tested and rejected: NKI exact-erf GELU kernel")
+4. **A single-op NKI GELU kernel does NOT help on this path** -- 13 of 14 model/batch configurations regress 5-15%, despite being numerically exact, because it adds a kernel boundary the compiler had already fused away. This is not a ceiling on NKI: whole-block fused kernels that *remove* boundaries have measured 1.5-3.4x on DINOv3 ViTs elsewhere, but have not been ported to this path or to Inferentia2 (see "Tested and rejected: single-op NKI exact-erf GELU kernel")
 5. **`DataParallel` needs `num_workers = num_cores`.** The library default of 2 costs **1.82-1.87x** on 4 trn2 cores and **5.18x** on 12 inf2 cores (the penalty scales with core count, since the default caps concurrency at 2). This is an API fix for anyone using `DataParallel` -- it does not affect the tables in this README, which all use independent worker processes
 6. **Inline weights into the NEFF.** `inline_weights=False` costs **6.8x** on inf2 (ViT-L 56.9 -> 8.4 img/s)
 7. **Optimal batch size is model-dependent**: small models (ViT-S/B, ConvNeXt-T) peak at BS=1; large models must batch -- **ViT-H+ gains 6.8x from BS=1 -> BS=4**. **NOTE (precompute-RoPE path, now default for ViT):** with `precompute_rope_tables=True` the ViT batch curve changes -- ViT-S/B/L peak at **BS=2** and then decline sharply past BS=4-6 (measured ViT-B BS=2 570.9 -> BS=8 299 -> BS=16 159 img/s; ViT-L BS=2 199.7 -> BS=8 36). Serve the precompute-RoPE ViT path at **BS=2**, do NOT batch to 8+. The in-graph-RoPE path (`precompute_rope_tables=False`) is instead flat across small batch (ViT-B ~215 img/s BS=1-4) with no such peak -- the batch sensitivity is a side effect of removing the RoPE bottleneck.
