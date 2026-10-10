@@ -43,7 +43,11 @@ export DINOV3_CONTRIB_SRC=$PWD/../src
 
 | README table | Script | Command |
 |---|---|---|
-| **inf2.xlarge max throughput** | `bench_max_throughput.py` | `--models vit_s,vit_b,vit_l,convnext_tiny,convnext_base --workers 2 --batch-sizes 1,4,8,16 --n-cores 2` |
+| **inf2.xlarge best config per model** (headline table, BF16 cliff tables) | `sweep_best.py` | 3 phases -- see [Best config sweep](#best-config-sweep) below |
+| **ViT-7B tuning (BS, RoPE, -O level)** | `bench_vit7b_tune.py` | `NEURON_RT_VISIBLE_CORES=0-1 python bench_vit7b_tune.py vit7b --tp 2 --bs 8 --rope precompute --opt=-O1` |
+| **HF-port miscompile root cause** | `repro_hf_rootcause.py` | no args; needs an approved HF token |
+| **Rejected fused residual+LN kernel** | `gate_fused_port.py`, `diag_fused_overhead.py` | no args; 1 core |
+| inf2.xlarge quick throughput (older single-pass harness) | `bench_max_throughput.py` | `--models vit_s,vit_b,vit_l,convnext_tiny,convnext_base --workers 2 --batch-sizes 1,2,4,8,16 --n-cores 2` |
 | **inf2 single-core + accuracy + artifact size** | `bench_inf2.py` | `--models vit_s,vit_b,vit_l,vit_h_plus,convnext_tiny,convnext_base --dp-cores 12` |
 | **Maximum model size / ViT-7B TP** | `bench_vit7b_tp_inf2.py` | `NEURON_RT_NUM_CORES=8 python bench_vit7b_tp_inf2.py --tp 2,4,8` |
 | **trn2 LNC=2 / LNC=1** | `bench_trn2.py` | see [trn2](#trn2) below |
@@ -57,25 +61,47 @@ export DINOV3_CONTRIB_SRC=$PWD/../src
 
 Supporting modules (not run directly): `hf_to_repo_weights.py` remaps HuggingFace
 checkpoints into the reference-repo architecture; `test_nki_gelu_inf2.py` is the 3-gate
-harness for the NKI kernel.
+harness for the NKI GELU kernel; `nki_res_ln_trace.py` is the ported fused residual+LayerNorm
+kernel used by `gate_fused_port.py`.
 
 ## Headline numbers and how to get them
 
-### inf2.xlarge (2 NeuronCores) -- maximum throughput
+<a id="best-config-sweep"></a>
+### inf2.xlarge best config per model -- `sweep_best.py`
+
+This is the harness behind the headline table. It exists because simpler harnesses produced
+wrong numbers in four distinct ways during this work (see Methodology notes). It runs in three
+separate phases so compilation never overlaps timing:
 
 ```bash
-python bench_max_throughput.py \
-    --models vit_s,vit_b,vit_l,convnext_tiny,convnext_base \
-    --workers 2 --batch-sizes 1,4,8,16 --n-cores 2 \
-    --out results_max.json
+# Phase 1 -- compile every config to a saved NEFF (torch.jit.save). Slow; RAM-hungry.
+#   On an inf2.24xlarge (96 vCPU / 369 GB) run 10 compiles in parallel:
+python sweep_best.py phase1 --models vit_s,vit_b,vit_l,convnext_tiny,convnext_base \
+    --batch-sizes 1,2,4,8,16 --out-dir neffs --jobs 10 --cores-avail 12
+#   On an inf2.xlarge use --jobs 1 (one compile at a time, swap required).
+
+# Phase 2 -- accuracy gate: every NEFF vs CPU FP32 on identical seeded weights.
+python sweep_best.py phase2 --out-dir neffs
+
+# Phase 3 -- timing on inf2.xlarge. 2 worker processes LOAD the saved NEFFs (no compile).
+python sweep_best.py phase3 --out-dir neffs --cores 2 --iters 60 --warmup 120 --repeats 4
 ```
-Reports the best (workers x batch) per model. Expect ViT-S ~832, ConvNeXt-T ~502,
-ViT-B ~421, ConvNeXt-B ~276, ViT-L ~131 img/s.
 
-### inf2.24xlarge (12 NeuronCores)
+NEFFs are portable between inf2 sizes (same NeuronCore-v2, same SDK), so phase 1 can run on a
+large instance and phase 3 on an inf2.xlarge. Phase 3 reports every repeat, a convergence flag
+(last two within 3%), and `last2_mean`, which is what the README tables quote.
 
-Same script with `--workers 12 --n-cores 12`. Expect ViT-S ~5,152, ConvNeXt-T ~3,192,
-ViT-B ~2,563, ConvNeXt-B ~1,716, ViT-L ~940 img/s.
+The sweep covers dtype (FP32 + `--auto-cast=matmult` | BF16) x `--model-type=transformer` on/off
+x BS 1/2/4/8/16, RoPE precompute always on -- 80 configs for the five models above, plus
+`--models vit_h_plus --batch-sizes 1,2,4,8` for 16 more. ViT-H+ at BS=1-2 needs
+`--warmup 400 --repeats 5` to converge.
+
+Expected best results (inf2.xlarge, 2 cores): ViT-S **~2,661**, ViT-B **~1,120**,
+ConvNeXt-T **~550**, ViT-L **~382**, ConvNeXt-B **~292**, ViT-H+ **~162** img/s, all BF16.
+
+**inf2.24xlarge (12 cores):** per-core throughput does not depend on instance size, so expect
+**6x** the inf2.xlarge numbers (verified to within 0.8% for ViT-S and ViT-B with
+`bench_max_throughput.py --workers 12 --n-cores 12`).
 
 ### ViT-7B with tensor parallelism
 
@@ -162,8 +188,16 @@ These are not incidental. Each one produced a materially wrong result during thi
 6. **Keep `inline_weights=True`** (the default). Disabling it costs 6.8x on inf2 -- weights
    are re-fed from the host on every call.
 
-7. **Optimal batch size is per-model.** Small models (ViT-S/B, ConvNeXt-T) peak at BS=1-4;
-   ViT-H+ must be batched (or run in BF16). Sweep it rather than assuming.
+7. **Optimal batch size depends on dtype as well as model.** BF16 ViT has a sharp device-side
+   cliff at BS=8 (ViT-L 381.8 -> 72.1 img/s); FP32 does not. Sweep batch size **per dtype**.
+   A recommendation measured in one dtype does not transfer to the other.
+
+8. **`torch_neuronx` must be imported before `torch.jit.load` of a saved traced model.** It
+   registers the `__torch__.torch.classes.neuron.Model` custom class the saved NEFF
+   references; without it every load fails with a TorchScript class-resolution error.
+
+9. **Accuracy-gate every config, not just one.** Phase 2 of `sweep_best.py` checks all of
+   them. A batch-dependent miscompile would otherwise slip through a spot check.
 
 ## Expected run times
 

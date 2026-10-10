@@ -45,7 +45,7 @@ Inferentia2 HBM: **32 GB per device, 16 GB per NeuronCore** (2 cores per device)
 | **ViT-7B/16** | **6,716M** | **TP=2 (1 device)** | **14.72 GB of 16 GB** | **Fits, TP>=2 required** |
 | ViT-7B/16 | 6,716M | TP=1 | **15.95 GB -> OOM** | Does not fit |
 
-Because TP=2 fits within a single Inferentia2 device, **inf2.xlarge is sufficient for every DINOv3 model** -- verified at 11.4 img/s for ViT-7B on inf2.xlarge.
+Because TP=2 fits within a single Inferentia2 device, **inf2.xlarge is sufficient for every DINOv3 model** -- verified at 22.1 img/s for ViT-7B on inf2.xlarge (TP=2, BF16, BS=8; 15.1 img/s at the BS=1 default).
 
 
 **The binding constraint is per-core HBM, and ViT-7B at TP=2 is right at the edge**: 14.72 GB of the 16 GB core (92%), of which 14.51 GB is tensors. At TP=1 the runtime reaches 15.95 GB and then fails to allocate the next 64 MB block (`TDRV:dmem_alloc_internal Failed to allocate DEVICE memory`).
@@ -81,17 +81,33 @@ init. 64 samples, embeddings compared per-sample against a CPU FP32 reference:
 reference's true nearest neighbour is always within the compiled model's **top 3**.
 
 > **⚠️ `torch_neuronx.trace()` MISCOMPILES the HuggingFace `transformers` DINOv3 port.**
-> The checkpoints ship in transformers format, but tracing `AutoModel` directly gives
-> **cos_sim 0.47-0.62** -- even with `--auto-cast=none`, and even though plain
-> `torch.jit.trace` of the same module on CPU gives exactly **1.0**. The whole output tensor
-> is wrong, not just the CLS token (patch tokens 0.619, CLS 0.500).
+> The checkpoints ship in `transformers` format, but tracing `AutoModel` directly gives
+> **cos_sim 0.50** with the real ViT-S weights -- even with `--auto-cast=none`.
 >
-> **Use the `dinov3` reference repo architecture** (`dinov3.hub.backbones`), which this
-> contrib traces and which compiles correctly (cos 0.9999999 with random weights). To use the
-> published checkpoints, remap the HF `state_dict` into the repo module --
-> `benchmark/hf_to_repo_weights.py` does this and self-verifies the remap on CPU
-> (`remap_cos` must be ~1.0 before any accuracy number is meaningful). Measured on SDK 2.31;
-> not yet reported upstream.
+> **Root cause: `torch.split()` on dim -2 of a 4D tensor.** HF's `apply_rotary_pos_emb` splits
+> the prefix (CLS + register) tokens from the patch tokens with
+> `q.split((num_prefix_tokens, num_patches), dim=-2)` on a `[B, heads, tokens, head_dim]`
+> tensor, and `neuronx-cc` miscompiles that on Inferentia2:
+>
+> | Test (SDK 2.31, `--auto-cast=none`) | cos_sim vs CPU |
+> |---|---:|
+> | split + rotate + cat alone, **no model**, `torch.split(dim=-2)` | **0.167** |
+> | same op, index slicing `q[:, :, :n, :]` | **1.000001** |
+> | full HF model, real weights, stock | **0.502** |
+> | full HF model, real weights, `apply_rotary_pos_emb` patched to index slicing | **1.000000** |
+>
+> Every other submodule (embeddings, both LayerNorms, both LayerScales, the MLP) compiles
+> correctly in isolation; only `attention` diverges. The `dinov3` reference repo already uses
+> index slicing in `Attention.apply_rope`, which is why the architecture this contrib traces is
+> unaffected. **Any HF model that applies RoPE to a token subset via `split(dim=-2)` is likely
+> affected.**
+>
+> **Two workarounds:** (1) use the reference-repo architecture and remap the published
+> checkpoints into it -- `benchmark/hf_to_repo_weights.py` does this and self-verifies on CPU
+> (`remap_cos` must be ~1.0 before any accuracy number is meaningful); or (2) keep the HF model
+> and monkey-patch `transformers.models.dinov3_vit.modeling_dinov3_vit.apply_rotary_pos_emb` with
+> an index-slicing version before tracing. Reproducer: `benchmark/repro_hf_rootcause.py`.
+> Measured on SDK 2.31 (neuronx-cc 2.26.6360).
 
 #### Architecture check with random weights
 
@@ -122,47 +138,73 @@ Every table below was produced by a script in [`benchmark/`](benchmark/).
 command, lists the setup steps (DLAMI, swap, model source), and documents the methodology
 traps that will otherwise make your numbers disagree with these.
 
-### Benchmark: inf2.xlarge -- maximum throughput (2 NeuronCores, SDK 2.31)
+### Benchmark: inf2.xlarge -- best configuration per model (2 NeuronCores, SDK 2.31)
 
-inf2.xlarge is the smallest and cheapest Inferentia2 instance: **1 Inferentia2 device, 2 NeuronCores, 4 vCPU, 16 GB host RAM**. Each config below is the best of a (workers x batch size) sweep, so these are **maximum achievable** throughput, not single-point samples.
+inf2.xlarge is the smallest and cheapest Inferentia2 instance: **1 Inferentia2 device, 2
+NeuronCores, 4 vCPU, 16 GB host RAM**. Each number is the **best of a full sweep** --
+dtype (FP32 + `--auto-cast=matmult` vs BF16 weights) x `--model-type=transformer` on/off x
+batch size 1/2/4/8/16 -- with RoPE precompute on (the default). **96 configurations were
+measured; every one passed an accuracy gate vs CPU FP32 (worst cos_sim 0.99996).**
 
-| Model | Params | **Max img/s** | Workers | Batch | p50 (ms) | p99 (ms) |
-|-------|-------:|--------------:|--------:|------:|---------:|---------:|
-| ViT-S/16 | 21.6M | **832.4** | 2 | 1 | 2.35 | 4.38 |
-| ConvNeXt-T | 27.8M | **501.9** | 2 | 1 | 3.97 | 4.27 |
-| ViT-B/16 | 85.7M | **421.4** | 2 | 1 | 4.72 | 5.14 |
-| ConvNeXt-B | 87.6M | **275.7** | 2 | 16 | 115.33 | 124.26 |
-| ViT-L/16 | 303.2M | **130.8** | 2 | 4 | 56.99 | 79.26 |
-| ViT-H+/16 | 840.6M | **69.1** | 2 | 4 | 115.73 | 116.36 |
-| ViT-7B/16 | 6,716M | **11.4** | 1 (TP=2) | 1 | 83.19 | 118.52 |
+| Model | Params | **Best img/s** | Config | p50 (ms) | Default config | Gain |
+|-------|-------:|---------------:|--------|---------:|---------------:|-----:|
+| ViT-S/16 | 21.6M | **2,661.0** | BF16, BS=4 | 3.00 | 1,984.6 | 1.34x |
+| ViT-B/16 | 85.7M | **1,119.6** | BF16, BS=2 | 3.57 | 909.7 | 1.23x |
+| ConvNeXt-T | 27.8M | **549.6** | BF16, BS=16 | 58.23 | 534.0 | 1.03x |
+| ViT-L/16 | 303.2M | **381.8** | BF16, BS=2 | 10.48 | 328.9 | 1.16x |
+| ConvNeXt-B | 87.6M | **291.9** | BF16, BS=8 | 54.80 | 286.6 | 1.02x |
+| ViT-H+/16 | 840.6M | **162.2** | BF16, BS=1 | 12.48 | 158.1 | 1.03x |
+| ViT-7B/16 | 6,716M | **22.1** | BF16, TP=2, BS=8 | -- | 15.1 | 1.46x |
 
-**The entire DINOv3 family -- including the 6.7B ViT-7B -- runs on a single inf2.xlarge.** ViT-7B uses both cores as one TP=2 replica.
+"Default config" is what `trace_dinov3()` produces out of the box (FP32 + `--auto-cast=matmult`,
+`--model-type=transformer` for ViT) at its own best batch size. Every ViT best config uses
+`--model-type=transformer` (+1-6% over the same config without it). All ViT-7B rows are BF16 because
+`compile_vit7b_tp()` is BF16-only; its "default" is BS=1 with in-graph RoPE.
 
-#### Two rules for picking batch size
+Each cell is the mean of the last two of four converged timed repeats (last two within 3%),
+taken with **2 independent worker processes pinned one per NeuronCore**, after 120 warmup
+iterations. NEFFs were compiled ahead of time and only loaded on the inf2.xlarge, so no
+compilation ever ran alongside a timed loop.
 
-Optimal batch size depends on whether the model is dispatch-bound or bandwidth-bound:
+**The entire DINOv3 family -- including the 6.7B ViT-7B -- runs on a single inf2.xlarge.**
+ViT-7B uses both cores as one TP=2 replica.
 
-- **Small models (ViT-S/B, ConvNeXt-T) peak at BS=1 or BS=4.** Per-call overhead is already amortized; larger batches only add latency. ViT-B: 421.4 img/s at BS=1 vs 294.9 at BS=16.
-- **Large models (ViT-L, ViT-H+, ConvNeXt-B) need batching.** **ViT-H+ gains 6.8x: 5.1 img/s at BS=1 -> 34.6 at BS=4** (single worker). For ViT-H+ specifically the cause is FP32 SwiGLU lowering, not weight-load bandwidth -- BF16 fixes it without batching (see "The exception: ViT-H+ at batch 1").
+**Versus the previous version of this table** (FP32, RoPE computed in-graph), ViTs are
+**3.2x (ViT-S), 2.7x (ViT-B), 2.9x (ViT-L), 2.3x (ViT-H+) and 1.9x (ViT-7B)** faster. Almost
+all of that is RoPE precompute; BF16 and batch tuning add the rest. ConvNeXt has no RoPE and
+moved only 1.06-1.10x.
+
+#### Picking batch size -- the BF16 cliff
+
+**With BF16 weights, ViT throughput falls off a cliff at BS=8.** FP32 degrades gently instead:
+
+| ViT-L/16, 2 cores | BS=1 | BS=2 | BS=4 | BS=8 | BS=16 |
+|-------------------|-----:|-----:|-----:|-----:|------:|
+| **BF16** | 369.6 | **381.8** | 314.5 | **72.1** | 107.8 |
+| FP32 + matmult | **328.9** | 321.9 | 258.9 | 252.5 | 239.1 |
+
+| ViT-B/16, 2 cores | BS=1 | BS=2 | BS=4 | BS=8 | BS=16 |
+|-------------------|-----:|-----:|-----:|-----:|------:|
+| **BF16** | 1,041.1 | **1,119.6** | 1,071.0 | 590.0 | 318.1 |
+| FP32 + matmult | **909.7** | 809.6 | 828.5 | 551.5 | 558.2 |
+
+The cliff is **device-side, not host-side**: a single-core timing loop with no worker processes
+reproduces it exactly (ViT-L BF16 170.9 img/s/core at BS=2, 161.0 at BS=4, 36.2 at BS=8), and
+NEFF size is unchanged across batch sizes (~495-506 MB), so it is not a weight-loading effect.
+It is reproducible run to run -- the four BF16 BS=8 repeats were 72.1 / 72.2 / 72.1 / 72.1.
+
+**Rules:**
+- **BF16 ViT: serve at BS=2-4 (BS=1-2 for ViT-L and ViT-H+). Never BS=8+** -- ViT-L loses 5.3x.
+- **FP32 ViT: BS=1 is best**, and larger batches cost little. Use FP32 if you must batch to 8+.
+- **ConvNeXt: batching helps slightly** in both dtypes (best at BS=8-16) and has no cliff.
+- **ViT-7B (BF16, TP=2): BS=8 is best** (22.1 img/s vs 15.4 at BS=1); it declines at 16+.
 
 #### Scaling to larger inf2 instances
 
-inf2.xlarge delivers **essentially the same per-core throughput as inf2.24xlarge**, so a
-larger instance buys you cores, not efficiency. Per-core, best-batch on each:
-
-| Model | inf2.xlarge (2 cores) | inf2.24xlarge (12 cores) | Ratio |
-|-------|----------------------:|-------------------------:|------:|
-| ViT-S/16 | 416.2 | 429.3 | 0.97x |
-| ViT-B/16 | 210.7 | 213.6 | 0.99x |
-| ConvNeXt-T | 250.9 | 266.0 | 0.94x |
-| ConvNeXt-B | 137.8 | 143.0 | 0.96x |
-| ViT-L/16 | 65.4 | 78.4 | 0.83x |
-
-4 vCPU is sufficient to feed 2 NeuronCores. **Estimate larger instances as
-(per-core rate) x (core count)** and choose instance size on cost and required
-aggregate throughput. For reference, the measured 12-core inf2.24xlarge peaks are
-ViT-S 5,151.7 / ViT-B 2,562.8 / ConvNeXt-T 3,192.2 / ConvNeXt-B 1,716.3 /
-ViT-L 940.4 / ViT-H+ 413.7 img/s.
+Per-replica throughput is independent of instance size -- each worker is one process on one
+NeuronCore -- so **estimate a larger inf2 as (2-core figure / 2) x (core count)**. That
+prediction was verified to within 0.1-0.8% on inf2.24xlarge (12 cores) for ViT-S and ViT-B.
+Choose instance size on cost and required aggregate throughput, not efficiency.
 
 #### ViT-7B tensor parallelism on inf2
 
@@ -173,9 +215,26 @@ ViT-L 940.4 / ViT-H+ 413.7 img/s.
 | 4 | 1,682M | 7.1s | 11.9 | 79.7 | -- |
 | 8 | 843M | 6.5s | **15.9** | 70.5 | -- |
 
-TP=2 and TP=4 are within noise of each other; TP=8 is ~27% faster than TP=2. Compile time is dominated by the TP sharding path and is fast (6-9s) because each rank compiles a smaller graph.
+TP=2 and TP=4 are within noise of each other; TP=8 is ~27% faster than TP=2. Compile time is dominated by the TP sharding path and is fast (6-9s) because each rank compiles a smaller graph. (TP sweep measured BS=1, in-graph RoPE, on inf2.24xlarge.)
 
-### Tested and rejected: single-op NKI exact-erf GELU kernel
+**Tuning ViT-7B at TP=2 on inf2.xlarge** (BF16, RoPE precompute, converged):
+
+| Config | img/s |
+|--------|------:|
+| BS=1, in-graph RoPE, `-O1` (`compile_vit7b_tp()` default) | 15.1 |
+| BS=1, RoPE precompute, `-O1` | 15.4 |
+| BS=1, RoPE precompute, `-O2` | 16.1 |
+| BS=2 | 17.6 |
+| BS=4 (`-O1` or `-O2`, identical) | 18.9 |
+| **BS=8** | **22.1** |
+| BS=16 | 19.2 |
+| BS=32 | 17.4 |
+
+Unlike the smaller ViTs, **RoPE precompute is worth only +2% on ViT-7B** -- at 6.7B parameters
+the 40 transformer layers dominate and the RoPE table is a rounding error. **Batch size is the
+lever: BS=8 is 1.46x BS=1.** `-O2` helps only at BS=1 (+4%) and is identical from BS=4 on.
+
+### Tested and rejected: NKI kernels on the traced path
 
 A custom NKI kernel replacing `nn.GELU` with a single Scalar/activation-engine op was
 built, validated, and **rejected on measurement**. Recording it here so a *single-op*
@@ -217,63 +276,83 @@ The kernel remains in `src/nki_gelu_trace.py` as a **reference implementation** 
 `nki_jit` calling convention for `torch_neuronx.trace()` -- it is not wired into
 `trace_dinov3()` and should not be enabled without re-measuring.
 
-> **Scope -- this does not show that NKI kernels cannot help DINOv3.** It shows that a
-> *single-op* kernel inserted between compiler-scheduled GEMMs loses to the compiler's own
-> fusion, because it creates a kernel boundary the compiler had already eliminated.
-> Separate work fusing whole transformer blocks into NKI -- attention + residual +
-> LayerNorm, and FFN + residual + next LayerNorm, keeping the fp32 residual stream on-chip
-> across the block -- has measured **1.5-3.4x over the compiler** on DINOv3 ViTs, with
-> *lower* numerical error than the compiler's bf16 path. That work used a different
-> compilation path and Trainium2, and has **not** been ported to `torch_neuronx.trace()`
-> or measured on Inferentia2; the five calling-convention differences documented in
-> `src/nki_gelu_trace.py` would apply to any such port. The practical rule is that kernel
-> *boundary count* dominates kernel *content*: a kernel must remove boundaries, not add one.
+#### Fused residual + LayerNorm kernel (ported from the whole-block fused path) -- also rejected
 
-### Optional: BF16 weights instead of FP32 + `--auto-cast=matmult`
+Separate work fusing whole transformer blocks into NKI -- attention + residual + LayerNorm, and
+FFN + residual + next LayerNorm, keeping the fp32 residual stream on-chip -- measured **1.5-3.4x
+over the compiler** on DINOv3 ViTs, but on a different compilation path and on Trainium2. Its
+simplest kernel, the fused residual-add + LayerNorm, was ported to `torch_neuronx.trace()` and
+tested on inf2.xlarge as a feasibility gate for the rest.
 
-The contrib traces **FP32 weights + `--auto-cast=matmult`**. Tracing **BF16 weights** instead
-is accuracy-neutral and slightly faster, but the size of the win depends entirely on the
-model. Measured on inf2.24xlarge, 12 cores, batch-swept best on both sides:
+It fits comfortably in gen2 SBUF (13-43% of the 180 KB usable per partition across ViT-S..H+),
+**compiles on Inferentia2, and is exact** (cos_sim 1.000001-1.000004, max abs err <= 1.7e-4) --
+but it is **slower inside a real DINOv3 block**, replacing `x + ls1(attn(...))` and `norm2(...)`:
 
-| Model | FP32 + matmult | BF16 | Gain | cos_sim (BF16) |
-|-------|---------------:|-----:|-----:|---------------:|
-| ViT-S/16 | 5,157.1 | 5,540.9 | 1.07x | 0.999997 |
-| ViT-B/16 | 2,558.2 | 2,603.9 | 1.02x | 0.999997 |
-| ViT-L/16 | 940.7 | 953.3 | 1.01x | 0.999997 |
-| ConvNeXt-T | 3,194.5 | 3,273.1 | 1.02x | 0.999971 |
-| ConvNeXt-B | 1,685.3 | 1,740.7 | 1.03x | 0.999968 |
-| ViT-H+/16 | 395.0 | 430.9 | 1.09x | 0.999997 |
+| Model, one block | Compiler | Fused (padded) | Fused (lean) |
+|------------------|---------:|---------------:|-------------:|
+| ViT-S/16 | 3,568.6 it/s | 0.807x | 0.870x |
+| ViT-B/16 | 2,251.3 it/s | 0.927x | 0.917x |
+| ViT-L/16 | 1,768.3 it/s | 0.911x | 0.929x |
 
-**At best batch the gain is only 1.01-1.09x, so the FP32 default stays.** `--auto-cast=matmult`
-is already capturing nearly all of the available benefit for these models.
+"Lean" removes all wrapper overhead -- no host-side padding of the 201-token sequence to 256
+(the last tile is masked instead) and the LayerNorm gamma/beta folded into the kernel. It
+recovers ~6 points on ViT-S and nothing on ViT-B/L, so **the remaining loss is the kernel
+boundary itself**: it forces the attention output through HBM and stops the compiler fusing
+LN2 into the following fc1 GEMM. All six arms converged (last two repeats within 3%).
 
-#### The exception: ViT-H+ at batch 1 is 4.87x faster in BF16
+**This is why the rest of the fused-block path was not ported.** The attention+LN and MLP+LN
+kernels each introduce the same boundary, and are far larger ports (the attention kernels
+depend on `nkilib` and use `nl.program_id` LNC sharding that has no inf2 equivalent). On the
+traced path, the compiler's own fusion across block boundaries is already better than
+anything a hand kernel can recover by fusing within one.
 
-| Model, BS=1 | FP32 + matmult | BF16 | Gain |
-|-------------|---------------:|-----:|-----:|
-| ViT-S/16 | 5,025.4 | 5,243.8 | 1.04x |
-| ViT-B/16 | 2,518.7 | 2,585.2 | 1.03x |
-| ViT-L/16 | 940.7 | 953.3 | 1.01x |
-| **ViT-H+/16** | **60.6** | **294.9** | **4.87x** |
+> **Scope.** These results are specific to `torch_neuronx.trace()` on Inferentia2. They do not
+> show that NKI cannot help DINOv3 in general -- the whole-block kernels win on Trainium2 on a
+> different compilation path, where the whole block is the kernel. The rule that holds on
+> both paths: kernel *boundary count* dominates kernel *content*. A kernel must remove
+> boundaries, not add one.
 
-**`neuronx-cc` lowers SwiGLU badly in FP32 at low batch.** ViT-H+ is the only model in the
-registry using SwiGLU, and at BS=1 it falls off a cliff (60.6 img/s on 12 cores). Batching
-hides it -- FP32 recovers to 395.0 at BS=4 -- and BF16 fixes it directly.
+### BF16 weights vs FP32 + `--auto-cast=matmult`
 
-**If you serve ViT-H+ at batch 1, use BF16 weights:**
+`trace_dinov3()` traces **FP32 weights + `--auto-cast=matmult`** by default. Tracing **BF16
+weights** (`--auto-cast=none`) is accuracy-neutral (cos_sim >= 0.999996 on ViT, >= 0.99996 on
+ConvNeXt vs CPU FP32) and, **at the right batch size**, faster. inf2.xlarge, 2 cores, each
+dtype at its own best batch size:
+
+| Model | FP32 + matmult | BF16 | Gain |
+|-------|---------------:|-----:|-----:|
+| ViT-S/16 | 1,984.6 (BS=2) | **2,661.0** (BS=4) | **1.34x** |
+| ViT-B/16 | 909.7 (BS=1) | **1,119.6** (BS=2) | **1.23x** |
+| ViT-L/16 | 328.9 (BS=1) | **381.8** (BS=2) | **1.16x** |
+| ViT-H+/16 | 158.1 (BS=1) | **162.2** (BS=1) | 1.03x |
+| ConvNeXt-T | 534.0 (BS=8) | **549.6** (BS=16) | 1.03x |
+| ConvNeXt-B | 286.6 (BS=16) | **291.9** (BS=8) | 1.02x |
+
+**BF16 is the faster choice for every model, but only at small batch** -- see "Picking batch
+size -- the BF16 cliff" above. At BS=8 BF16 is *slower* than FP32 on ViT-L (72.1 vs 252.5).
+The FP32 default is kept because it is safe at any batch size; switch to BF16 when you
+control the batch size and will keep it at 1-4.
 
 ```python
-model = load_dinov3_model("dinov3_vith16plus", repo_dir=REPO).to(torch.bfloat16)
-example = torch.randn(1, 3, 224, 224, dtype=torch.bfloat16)
+model = load_dinov3_model("dinov3_vitl16", repo_dir=REPO)
+precompute_rope(model, img_size=224)
+model = model.to(torch.bfloat16)
+example = torch.randn(2, 3, 224, 224, dtype=torch.bfloat16)        # BS=2 for ViT-L
 model_neuron = torch_neuronx.trace(model, example,
                                    compiler_args=["--auto-cast", "none",
                                                   "--model-type", "transformer"],
                                    inline_weights_to_neff=True)
 ```
 
-`--auto-cast=matmult` becomes a **no-op once the weights are BF16** -- `bf16_matmult` and
-`bf16_none` measured within noise of each other on all five models (e.g. ConvNeXt-B 1,740.7
-vs 1,740.4 img/s), confirming the flag only casts FP32 matmuls.
+`--auto-cast=matmult` is a **no-op once the weights are BF16**: `bf16_matmult` and `bf16_none`
+measured within noise of each other on all five models (e.g. ConvNeXt-B 1,740.7 vs 1,740.4
+img/s), confirming the flag only casts FP32 matmuls.
+
+> **Correction.** A previous version of this section said "ViT-H+ at batch 1 is 4.87x faster in
+> BF16" because `neuronx-cc` lowers SwiGLU badly in FP32 at low batch (60.6 -> 294.9 img/s on 12
+> cores). That was measured with RoPE computed in-graph. **With RoPE precompute (now the default),
+> ViT-H+ FP32 BS=1 runs at 158.1 img/s on 2 cores and BF16 adds only 3%.** The "FP32 SwiGLU cliff"
+> was really the in-graph RoPE; precompute removes it for both dtypes.
 
 ### Critical: `torch_neuronx.DataParallel` defaults to 2 worker threads
 
@@ -305,19 +384,18 @@ With the fix, `DataParallel` (806.2 img/s) comes within **14%** of independent w
 
 ### Key Findings
 
-1. **`--auto-cast=matmult` is critical**: FP32 models get 50-60% speedup with matmult bf16 autocast, consistent with SigLIP and MoLFormer results
-2. **`torch_neuronx.trace()` miscompiles the HuggingFace `transformers` DINOv3 port** (cos 0.47-0.62 even at `--auto-cast=none`, while CPU `torch.jit.trace` is exactly 1.0). Use the `dinov3` reference-repo architecture and remap the published checkpoints into it -- see "With real pretrained weights"
-3. **Inferentia2 runs the entire DINOv3 family**, including ViT-7B at TP=2 -- and all of it fits on a single **inf2.xlarge** (see "Maximum model size on Inferentia2")
-4. **A single-op NKI GELU kernel does NOT help on this path** -- 13 of 14 model/batch configurations regress 5-15%, despite being numerically exact, because it adds a kernel boundary the compiler had already fused away. This is not a ceiling on NKI: whole-block fused kernels that *remove* boundaries have measured 1.5-3.4x on DINOv3 ViTs elsewhere, but have not been ported to this path or to Inferentia2 (see "Tested and rejected: single-op NKI exact-erf GELU kernel")
-5. **`DataParallel` needs `num_workers = num_cores`.** The library default of 2 costs **1.82-1.87x** on 4 trn2 cores and **5.18x** on 12 inf2 cores (the penalty scales with core count, since the default caps concurrency at 2). This is an API fix for anyone using `DataParallel` -- it does not affect the tables in this README, which all use independent worker processes
-6. **Inline weights into the NEFF.** `inline_weights=False` costs **6.8x** on inf2 (ViT-L 56.9 -> 8.4 img/s)
-7. **Optimal batch size is model-dependent**: small models (ViT-S/B, ConvNeXt-T) peak at BS=1; large models must batch -- **ViT-H+ gains 6.8x from BS=1 -> BS=4**. **NOTE (precompute-RoPE path, now default for ViT):** with `precompute_rope_tables=True` the ViT batch curve changes -- ViT-S/B/L peak at **BS=2** and then decline sharply past BS=4-6 (measured ViT-B BS=2 570.9 -> BS=8 299 -> BS=16 159 img/s; ViT-L BS=2 199.7 -> BS=8 36). Serve the precompute-RoPE ViT path at **BS=2**, do NOT batch to 8+. The in-graph-RoPE path (`precompute_rope_tables=False`) is instead flat across small batch (ViT-B ~215 img/s BS=1-4) with no such peak -- the batch sensitivity is a side effect of removing the RoPE bottleneck.
-8. **inf2.xlarge delivers essentially full per-core performance** (0.83-0.99x of inf2.24xlarge). Buy cores for throughput, not efficiency
-9. **ViT-H+ at BS=1 needs either batching or BF16.** `neuronx-cc` lowers SwiGLU badly in FP32 at low batch -- it is the only SwiGLU model in the registry. On 12 inf2 cores BS=1 gives 60.6 img/s in FP32; batching to BS=4 reaches 395.0 (6.5x) and switching to **BF16 at BS=1 reaches 294.9 (4.87x)**. Not a bandwidth limit
-10. **BF16 weights are worth only 1.01-1.09x at best batch** on every other model, so FP32 + `--auto-cast=matmult` remains the default. `--auto-cast=matmult` is a no-op once weights are BF16
-11. **ViT-7B requires TP>=2 on inf2**: at TP=1 the runtime reaches 15.95 GB of the 16 GB core and OOMs. TP must be a power of 2
-12. **ConvNeXt is now competitive.** The older claim that "ViT is 1.7x faster than ConvNeXt" no longer holds on SDK 2.31. At the only near-matched pair (ViT-B 85.7M vs ConvNeXt-B 87.6M) **ViT-B is 1.53x faster** on inf2.xlarge (421.4 vs 275.7 img/s) -- ViT still wins at equal size, but by less than before
-13. **Precompute RoPE out of the traced graph -- 2.76x on ViT.** The reference-repo ViT computes 2D-axial RoPE (`torch.arange` / `torch.meshgrid` / `torch.cos` / `torch.sin` over `[H*W, D]`) *inside* `forward()` on every call; Neuron traces these poorly and they dominate the step. Baking the RoPE tables as constants (`trace_dinov3(..., precompute_rope_tables=True)`, default on) took ViT-L from **58.9 -> 162.6 img/s (2.76x)** on inf2 at FP32+matmult; at BF16 the precompute-RoPE ViT trace matches or exceeds a hand-ported HF-architecture model. **This was discovered by comparing against an NxDI autoport that precomputed RoPE by construction.** ⚠️ **LIMITATION: precomputing pins the compiled NEFF to a single image size** -- the in-graph RoPE supports variable resolution; precomputing trades that for the speedup. Compile one NEFF per resolution, or pass `precompute_rope_tables=False` for dynamic-resolution inference. ConvNeXt has no RoPE and is unaffected. dtype is a *minor* lever by comparison (BF16 vs FP32+matmult is ~1.0-1.6x and mostly an accuracy tradeoff) -- RoPE placement, not precision, was the dominant factor. **Serve the precompute-RoPE ViT path at BS=2** (see Finding #7) -- it peaks there and degrades past BS=4-6.
+1. **Precompute RoPE out of the traced graph -- the single largest lever, ~2.0x per core.** The reference-repo ViT computes 2D-axial RoPE (`torch.arange` / `torch.meshgrid` / `torch.cos` / `torch.sin` over `[H*W, D]`) *inside* `forward()` on every call, and Neuron traces these poorly. Baking the tables as constants (`trace_dinov3(..., precompute_rope_tables=True)`, default on) is accuracy-neutral (cos_sim 1.000000) and, measured single-core FP32 with converged baselines on both arms, worth **2.14x (ViT-S), 1.64x (ViT-B), 2.04x (ViT-L)**. It also removes what had looked like an FP32 SwiGLU problem on ViT-H+. It is worth only +2% on ViT-7B, where the 40 layers dominate. ⚠️ **It pins the compiled NEFF to one image size** -- compile one NEFF per resolution, or pass `precompute_rope_tables=False` for variable-resolution inference. ConvNeXt has no RoPE and is unaffected. *(An earlier figure of 2.76x was measured against an unconverged in-graph baseline: ViT-L in-graph climbs 48.6 -> 78.8 img/s over ~7 repeats, and the 2.76x used 58.9.)*
+2. **BF16 weights add 1.16-1.34x on ViT -- but only at small batch.** BF16 has a sharp device-side cliff at BS=8 (ViT-L 381.8 at BS=2 -> 72.1 at BS=8); FP32 degrades gently. Serve BF16 ViT at **BS=1-4** and never BS=8+. FP32 + `--auto-cast=matmult` remains the default because it is safe at any batch size. See "Picking batch size -- the BF16 cliff".
+3. **`--model-type=transformer` is a small net win on ViT: +1-6% at each model's best config.** It is not uniformly positive -- across 36 matched (dtype, BS) pairs it ranged 0.87x to 1.18x and lost in 5 -- but every model's best configuration uses it. Keep it (the default). Not applicable to ConvNeXt.
+4. **`torch_neuronx.trace()` miscompiles the HuggingFace `transformers` DINOv3 port** (cos_sim 0.50 with real weights, even at `--auto-cast=none`). Root cause: `apply_rotary_pos_emb` uses `torch.split(..., dim=-2)` on a 4D tensor, which `neuronx-cc` miscompiles on Inferentia2; a no-model micro-repro of just that op gives cos 0.17. **Replacing that one function with index slicing restores cos 1.000000.** Use the `dinov3` reference-repo architecture (which already uses index slicing) and remap the published checkpoints into it -- see "With real pretrained weights".
+5. **Inferentia2 runs the entire DINOv3 family**, including the 6.7B ViT-7B at TP=2 -- and all of it fits on a single **inf2.xlarge** (see "Maximum model size on Inferentia2").
+6. **ViT-7B: batch size is the lever.** At TP=2, BS=8 gives 22.1 img/s vs 15.4 at BS=1 (1.46x). RoPE precompute (+2%) and `-O2` (+4% at BS=1 only) are marginal.
+7. **Hand-written NKI kernels do not help on this path.** A single-op GELU kernel regressed 13 of 14 configs (-5 to -15%). A port of the fused residual+LayerNorm kernel from the whole-block fused path also regressed (-4 to -13% inside a real block) even after removing all wrapper overhead (no padding, LN affine folded in), because the kernel boundary itself blocks the compiler's fusion of LN2 into the following GEMM. See "Tested and rejected: NKI kernels on the traced path".
+8. **`DataParallel` needs `num_workers = num_cores`.** The library default of 2 costs **1.82-1.87x** on 4 trn2 cores and **5.18x** on 12 inf2 cores (the penalty scales with core count, since the default caps concurrency at 2). This is an API fix for anyone using `DataParallel` -- it does not affect the tables in this README, which all use independent worker processes.
+9. **Inline weights into the NEFF.** `inline_weights=False` costs **6.8x** on inf2 (ViT-L 56.9 -> 8.4 img/s).
+10. **Per-core throughput is independent of inf2 instance size.** One worker per NeuronCore scales linearly: the 12-core inf2.24xlarge reproduced 6x the 2-core inf2.xlarge figure to within 0.1-0.8% (ViT-S, ViT-B). Buy cores for throughput, not efficiency.
+11. **ViT-7B requires TP>=2 on inf2**: at TP=1 the runtime reaches 15.95 GB of the 16 GB core and OOMs. TP must be a power of 2.
+12. **With RoPE precompute, ViT is far ahead of ConvNeXt at equal size.** At the only near-matched pair (ViT-B 85.7M vs ConvNeXt-B 87.6M), ViT-B is **3.8x faster** on inf2.xlarge (1,119.6 vs 291.9 img/s). ConvNeXt does not benefit from RoPE precompute (it has no RoPE).
 
 ### Benchmark: Trainium2 (trn2.3xlarge, SDK 2.31)
 
@@ -447,7 +525,7 @@ from modeling_dinov3 import load_dinov3_model, trace_dinov3, validate_accuracy, 
 # Load model
 model = load_dinov3_model("dinov3_vitb16", repo_dir="/mnt/models/dinov3")
 
-# Compile for Neuron (RoPE precomputed by default -> 2.76x; pins the NEFF to img_size=224)
+# Compile for Neuron (RoPE precomputed by default -> ~2x per core; pins the NEFF to img_size=224)
 model_neuron = trace_dinov3(model, is_convnext=False, save_path="/tmp/dinov3_vit_b.pt")
 
 # For VARIABLE input resolution instead, keep RoPE in-graph (slower, but any H x W):
@@ -534,7 +612,7 @@ Required (clone separately):
 - All models use `pretrained=False` (random weights) for architecture validation. Replace with pretrained weights for production use.
 - `--model-type=transformer` compiler flag is used for ViT models only (not ConvNeXt).
 - ConvNeXt models exercise different Neuron ops (Conv2d, depthwise conv, GroupNorm) -- good diversity test for Neuron compiler.
-- ViT-H+ traces successfully but is slow at BS=1 in FP32 (5.1 img/s per core). This is **not** an HBM-bandwidth limit -- it scales ~12x across 12 cores, and either batching (6.8x) or BF16 weights (4.87x at BS=1) recovers it. `neuronx-cc` lowers SwiGLU poorly in FP32 at low batch.
+- ViT-H+ runs at 158-162 img/s on an inf2.xlarge with RoPE precompute (both dtypes, BS=1). With RoPE computed in-graph it was 10.2 img/s at BS=1 in FP32 -- that slowdown, earlier attributed to FP32 SwiGLU lowering, was the in-graph RoPE.
 - **Keep `inline_weights=True` (the default) on inf2.** Disabling it costs 6.8x throughput -- see "Critical: always inline weights into the NEFF on inf2". A prior recommendation to set `inline_weights=False` at BS>=4 came from a trn2/SDK 2.30 async XLA error and does not apply to inf2 on SDK 2.31.
 - **Older SDKs miscompiled RoPE on Inferentia2.** `torch.Tensor.split()` on dim>=2 of a 4D tensor was compiled incorrectly by neuronx-cc 2.25.3371, collapsing ViT-L cosine similarity to 0.13 on inf2. Current upstream DINOv3 uses index slicing in `Attention.apply_rope`, and **cosine similarity is 1.000000 on inf2 with SDK 2.31** -- verified, no workaround needed. If you pin an older DINOv3 commit that still uses `split()`, replace it with index slicing or `.narrow()`.
 - DINOv3 License is not Apache/MIT -- review before redistribution.
