@@ -1,7 +1,7 @@
 """Correctness + speedup test for fused-spec Voxtral.
 
 Compares the fused-spec model's transcription output against the baseline
-(target-only) Voxtral on real customer audio clips.
+(target-only) Voxtral on the audio clips listed in --manifest.
 
 Uses:
   - Audio encoder: reuse the traced audio_encoder.pt from the baseline compile.

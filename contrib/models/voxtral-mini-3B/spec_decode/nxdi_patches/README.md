@@ -13,11 +13,9 @@ lets a draft trained on audio-conditioned inputs reach its real acceptance rate.
 
 ## Result
 
-With these patches + the 4-layer distilled draft
-(`jburtoft/Voxtral-Mini-3B-2507-draft-4layer`), Voxtral-Mini-3B fused spec-decode
-on trn2.3xlarge (K=3, TP=4, SDK 2.31) delivers **1.159x mean speedup** (1.193x on
-clips >=40 tokens, 1.39x max) with **17/18 byte-identical** greedy transcripts on
-an 18-file TED audio benchmark. See `../reports/task003_working_result.md`.
+Used with the 4-layer distilled draft (`jburtoft/Voxtral-Mini-3B-2507-draft-4layer`)
+on trn2.3xlarge (TP=4, SDK 2.31). Results on public benchmarks to be added.
+Implementation notes: `../reports/fused_spec_notes.md`.
 
 ## Files (modified vs stock NxDI 0.10.0)
 

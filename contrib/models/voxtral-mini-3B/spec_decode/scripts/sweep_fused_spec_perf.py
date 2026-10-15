@@ -1,7 +1,7 @@
 """Performance sweep for fused-spec Voxtral: K values + async + ODS.
 
 For each config variant: compile (if needed), then measure mean speedup +
-byte-identical rate on the customer clips vs the target-only baseline.
+byte-identical rate on the clips in --manifest vs the target-only baseline.
 
 Run with:
     PYTHONPATH=/home/ubuntu/nxdi_edit python sweep_fused_spec_perf.py

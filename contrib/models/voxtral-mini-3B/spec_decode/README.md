@@ -10,8 +10,7 @@ Training methodology, dataset, reproduction scripts, and detailed measurements a
 
 - Draft shares audio encoder, projector, tokenizer, and `lm_head` with the target. Only the LLM decoder is shrunk from 30 layers to 4 (kept: indices `[0, 10, 20, 29]`).
 - Trained via distillation on public LibriSpeech pseudo-labels (~2000 clips, ~230 min audio).
-- Achieves ~66.67% top-1 argmax agreement with the target on a held-out English audio benchmark; expected 1.3x-1.6x mean speedup in a correctly-implemented spec-decode wrapper.
-- Draft is ~4.4x faster per generated token than the target on GPU L40S.
+- Top-1 agreement with the target and expected tokens per iteration on held-out public audio (LibriSpeech `dev-other`) are on the HF model card.
 
 ## Download
 

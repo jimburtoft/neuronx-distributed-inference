@@ -1,4 +1,4 @@
-"""Task 003 preparation: extract text-only weights for both target and draft.
+"""Preparation: extract text-only weights for both target and draft.
 
 For each model we save `text_only/` with just the LLM decoder (VoxtralForConditionalGeneration.language_model),
 plus tokenizer/processor files. That's the input to NxDI's NeuronApplicationVoxtral.
